@@ -84,19 +84,36 @@ func nvString(name, val string) nvPair {
 }
 
 // nvNVList returns an nvPair holding a nested nvlist.
+//
+// The data slice carries the inner XDR sequence: the BE [version,
+// nvflags] header followed by the pair stream. decodeInnerNVList
+// (the corresponding decoder) consumes exactly that shape.
 func nvNVList(name string, inner nvList) nvPair {
-	b := encodeNVList(inner)
-	// For NVList type: nelem = 1, data = encoded inner list
+	b := encodeInnerNVList(inner)
+	// For NVList type: nelem = 1, data = inner-header + encoded list
 	return nvPair{name: name, typ: nvDataTypeNVList, nelem: 1, data: b}
 }
 
-// nvNVListArray returns an nvPair holding an array of nvlists.
+// nvNVListArray returns an nvPair holding an array of nvlists. Each
+// element is prefixed with its own inner [version, nvflags] BE header,
+// matching the decoder loop in parsedNVPair.nvlistArrayValue().
 func nvNVListArray(name string, lists []nvList) nvPair {
 	var all []byte
 	for _, l := range lists {
-		all = append(all, encodeNVList(l)...)
+		all = append(all, encodeInnerNVList(l)...)
 	}
 	return nvPair{name: name, typ: nvDataTypeNVListArray, nelem: int32(len(lists)), data: all}
+}
+
+// encodeInnerNVList encodes a single nested NVList: the 8-byte BE
+// [version, nvflags] header (NV_VERSION=0, NV_UNIQUE_NAME=1) followed
+// by the pair body produced by encodeNVList. The decoder's
+// decodeInnerNVList strips the first 8 bytes before walking pairs.
+func encodeInnerNVList(pairs nvList) []byte {
+	inner := make([]byte, 8)
+	binary.BigEndian.PutUint32(inner[0:4], 0) // nvl_version = 0
+	binary.BigEndian.PutUint32(inner[4:8], 1) // nvl_nvflag = NV_UNIQUE_NAME=1
+	return append(inner, encodeNVList(pairs)...)
 }
 
 // nvUint64Array returns an nvPair holding an array of uint64.
@@ -146,18 +163,28 @@ func encodeNVPair(p nvPair) []byte {
 	return out
 }
 
-// encodeNVListFull encodes an nvList with the 8-byte outer header.
+// encodeNVListFull encodes an nvList with the spec-compliant 4-byte
+// outer header (encoding | endian | reserved | reserved), followed by
+// the inner [version, nvflags] BE header and the XDR-encoded pairs.
+//
+// Per OpenZFS sys/nvpair_impl.h (nvs_header_t):
+//
+//	struct nvs_header_t {
+//	    uchar_t nvh_encoding;   // NV_ENCODE_*
+//	    uchar_t nvh_endian;     // NV_BIG_ENDIAN / NV_LITTLE_ENDIAN
+//	    uchar_t nvh_reserved1;
+//	    uchar_t nvh_reserved2;
+//	};
+//
+// Earlier versions of this encoder emitted two LE uint32s (8 bytes)
+// instead of the 4 bytes above; that produced labels rejected by zdb /
+// zpool import / any third-party reader. The lib's own decoder
+// (decodeNVList in nvparse.go) has always read the spec-compliant
+// 4-byte shape — the writer is the side that needed correcting.
 func encodeNVListFull(pairs nvList) []byte {
-	// 8-byte header: encode (LE int32) + endian (LE int32)
-	hdr := make([]byte, 8)
-	binary.LittleEndian.PutUint32(hdr[0:4], nvEncodeXDR)
-	binary.LittleEndian.PutUint32(hdr[4:8], nvEndianLE)
-	// Inner nvlist version + nvflags (NV_VERSION=0, NV_UNIQUE_NAME=1)
-	inner := make([]byte, 8)
-	binary.BigEndian.PutUint32(inner[0:4], 0) // nvl_version = 0
-	binary.BigEndian.PutUint32(inner[4:8], 1) // nvl_nvflag = NV_UNIQUE_NAME=1
-	body := encodeNVList(pairs)
-	return append(append(hdr, inner...), body...)
+	// 4-byte spec-compliant outer header (nvs_header_t).
+	hdr := []byte{nvEncodeXDR, nvEndianLE, 0, 0}
+	return append(hdr, encodeInnerNVList(pairs)...)
 }
 
 func encodeXDRString(s string) []byte {
