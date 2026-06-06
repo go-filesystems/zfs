@@ -39,14 +39,14 @@ package filesystem_zfs
 //     re-insert + slot reuse paths under load, which is the real
 //     interesting thing — not "fill 28 slots once").
 //
-//   - WriteFile lays out the whole payload into ONE block via
-//     alloc.alloc(paddedSize); multi-block indirect block pointers are
-//     not exercised by the writer today. The large-file test still
-//     drives the allocator + I/O path with a single 64 MiB block,
-//     which is a useful smoke for both even though it does NOT yet
-//     hit the indirect-BP code on the write side. The reader side's
-//     indirect-BP code is exercised by the RAID fixtures, where real
-//     `zpool create` produced indirect-block files.
+//   - WriteFile splits payloads larger than 128 KiB into 128-KiB
+//     data blocks addressed through indirect block pointers
+//     (writeBlockTree, up to L6). Small files (<= 128 KiB) still go
+//     through a single 4-KiB direct BP for compactness. The
+//     large-file test exercises BOTH paths depending on -stress.file-mb.
+//     The reader side's indirect-BP code (findDataBP) is exercised by
+//     both this lib's own writer output and the real `zpool create`
+//     RAID fixtures.
 
 import (
 	"crypto/rand"
@@ -268,10 +268,12 @@ func TestStress_ConcurrentRW(t *testing.T) {
 	fs := newStressFS(t, poolSize, "stress_concurrent")
 
 	var (
-		writes  atomic.Int64
-		reads   atomic.Int64
-		deletes atomic.Int64
-		errs    atomic.Int64
+		writes      atomic.Int64
+		reads       atomic.Int64
+		deletes     atomic.Int64
+		errs        atomic.Int64
+		opsPostGrow atomic.Int64 // ops successfully completed after the mid-run grow
+		grown       atomic.Bool  // set true once the mid-run Grow has returned
 	)
 
 	stop := make(chan struct{})
@@ -303,6 +305,9 @@ func TestStress_ConcurrentRW(t *testing.T) {
 						continue
 					}
 					writes.Add(1)
+					if grown.Load() {
+						opsPostGrow.Add(1)
+					}
 					// Read back and verify.
 					got, err := fs.ReadFile(name)
 					if err != nil {
@@ -324,18 +329,170 @@ func TestStress_ConcurrentRW(t *testing.T) {
 		}(w)
 	}
 
+	// Mid-run grow: at the halfway mark, expand the pool by 50% and
+	// confirm workers keep operating after the call returns. The grow
+	// path takes the same FS mutex that WriteFile / ReadFile / Delete
+	// use, so this exercises lock ordering + label rewrite under live
+	// concurrent load. The post-grow ops counter MUST be non-zero (for
+	// any non-trivial duration) or the test fails — a regression would
+	// be Grow somehow wedging the workers (e.g. by resetting the bump
+	// pointer back over already-allocated extents, which the pre-fix
+	// initAllocator-based grow path would have done).
+	growTimer := time.AfterFunc(duration/2, func() {
+		curSize, err := fs.f.Size()
+		if err != nil {
+			t.Errorf("mid-run grow: Size: %v", err)
+			grown.Store(true)
+			return
+		}
+		newSize := curSize + curSize/2
+		// Cap at +1 GiB so dialling -stress.duration way up doesn't
+		// blow temp disk. Even a small bump validates the grow path.
+		if newSize > curSize+1024*1024*1024 {
+			newSize = curSize + 1024*1024*1024
+		}
+		if err := fs.Grow(newSize); err != nil {
+			t.Errorf("mid-run Grow(%d): %v", newSize, err)
+		}
+		grown.Store(true)
+	})
+	defer growTimer.Stop()
+
 	time.AfterFunc(duration, func() { close(stop) })
 	wg.Wait()
 	elapsed := time.Since(start)
 
 	totalOps := writes.Load() + reads.Load() + deletes.Load()
-	t.Logf("stress concurrent RW: workers=%d duration=%s writes=%d reads=%d deletes=%d errs=%d total=%d ops/s=%.0f",
+	t.Logf("stress concurrent RW: workers=%d duration=%s writes=%d reads=%d deletes=%d errs=%d total=%d ops/s=%.0f opsPostGrow=%d",
 		workers, elapsed, writes.Load(), reads.Load(), deletes.Load(), errs.Load(),
-		totalOps, float64(totalOps)/elapsed.Seconds())
+		totalOps, float64(totalOps)/elapsed.Seconds(), opsPostGrow.Load())
 
 	if totalOps == 0 {
 		t.Fatalf("no operations completed in %s", elapsed)
 	}
+	// The mid-run grow fires at duration/2, so workers should produce
+	// some ops afterwards before the stop signal. For very short
+	// durations (testing.Short default = 200 ms) the grow may land too
+	// close to stop for any post-grow ops to be observed; require
+	// post-grow progress only at >= 1 s budgets.
+	if grown.Load() && duration >= time.Second && opsPostGrow.Load() == 0 {
+		t.Errorf("workers stopped making progress after mid-run grow (duration=%s, totalOps=%d)", duration, totalOps)
+	}
+}
+
+// TestStress_AllocReclaim verifies the allocator reclaims space on
+// Delete (and on WriteFile-over-existing) so that long write/delete
+// cycles do NOT monotonically exhaust the pool. Regression for the
+// bump-pointer-never-reclaims bug.
+//
+// Strategy: a small pool, a tight write/delete loop on a single name,
+// many more iterations than the pool would hold without reclaim. Pool
+// occupancy (nextFree − dataStart) is sampled after each iteration; if
+// it grows past one allocation's worth of overhead the test fails
+// (real ZFS bumps slightly per txg but reclaim keeps it bounded).
+func TestStress_AllocReclaim(t *testing.T) {
+	// 4 MiB pool. WriteFile padded to one 4 KiB block per call. Without
+	// reclaim, 256+ iterations exhausts the data area; we run 2_000.
+	const (
+		poolBytes = 4 * 1024 * 1024
+		iters     = 2_000
+	)
+	fs := newStressFS(t, poolBytes, "stress_allocreclaim")
+	startBump := fs.alloc.nextFree
+	const payload = "alloc-reclaim sentinel"
+
+	// One write to seed nextFree past format overhead.
+	if err := fs.WriteFile("/r.txt", []byte(payload), 0o644); err != nil {
+		t.Fatalf("seed WriteFile: %v", err)
+	}
+	bumpAfterFirst := fs.alloc.nextFree
+
+	for i := 0; i < iters; i++ {
+		// Overwrite (in-place) — should reuse the previous extent via
+		// the free-list (WriteFile frees the previous BP first).
+		if err := fs.WriteFile("/r.txt", []byte(payload), 0o644); err != nil {
+			t.Fatalf("iter %d: overwrite: %v", i, err)
+		}
+		// Bump pointer must not grow monotonically across overwrites.
+		if fs.alloc.nextFree != bumpAfterFirst {
+			t.Fatalf("iter %d: bump pointer grew on overwrite: was %d, now %d (alloc reclaim broken)",
+				i, bumpAfterFirst, fs.alloc.nextFree)
+		}
+	}
+
+	// Now exercise the Delete-then-Write cycle: same property.
+	for i := 0; i < iters; i++ {
+		if err := fs.DeleteFile("/r.txt"); err != nil {
+			t.Fatalf("iter %d: DeleteFile: %v", i, err)
+		}
+		if err := fs.WriteFile("/r.txt", []byte(payload), 0o644); err != nil {
+			t.Fatalf("iter %d: post-delete WriteFile: %v", i, err)
+		}
+		// Allocator should be cycling the same block — bump stays put.
+		if fs.alloc.nextFree > bumpAfterFirst {
+			t.Fatalf("iter %d: bump pointer grew via delete+write: was %d, now %d",
+				i, bumpAfterFirst, fs.alloc.nextFree)
+		}
+	}
+	t.Logf("stress alloc-reclaim: %d overwrites + %d delete+write cycles; "+
+		"bump went %d → %d (delta=%d bytes; reclaim works)",
+		iters, iters, startBump, fs.alloc.nextFree, fs.alloc.nextFree-startBump)
+}
+
+// TestStress_AllocReclaim_ConcurrentRW asserts that a 30-second-ish
+// concurrent write/delete burst keeps allocator occupancy bounded —
+// the integration of the alloc fix with the FS-level locking and the
+// dnode reclaim walker. Short-mode runs 1s.
+func TestStress_AllocReclaim_ConcurrentRW(t *testing.T) {
+	duration := stressDuration(t)
+	const (
+		poolBytes  = 8 * 1024 * 1024
+		workers    = 4
+		hotPerWork = 3
+	)
+	fs := newStressFS(t, poolBytes, "stress_allocreclaim_rw")
+	startNextFree := fs.alloc.nextFree
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	start := time.Now()
+	for w := 0; w < workers; w++ {
+		go func(workerID int) {
+			defer wg.Done()
+			rng := mrand.New(mrand.NewSource(int64(workerID) + start.UnixNano()))
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				name := fmt.Sprintf("/w%dh%d", workerID, rng.Intn(hotPerWork))
+				payload := makeSeededPayload(rng.Uint64(), 32+rng.Intn(128))
+				_ = fs.WriteFile(name, payload, 0o644)
+				if rng.Intn(3) == 0 {
+					_ = fs.DeleteFile(name)
+				}
+			}
+		}(w)
+	}
+	time.AfterFunc(duration, func() { close(stop) })
+	wg.Wait()
+
+	// The pool started with startNextFree bytes used; after a burst of
+	// writes/deletes, the bump pointer is allowed to have advanced by
+	// at most the size of the live working set (workers * hotPerWork
+	// files × poolBlockSize) plus some slack for overhead. If reclaim
+	// is broken the bump pointer will have walked to or past the pool
+	// limit (4 MiB above start; the allocator would have OOM'd).
+	delta := fs.alloc.nextFree - startNextFree
+	maxAcceptable := int64(workers*hotPerWork*poolBlockSize*8) + 64*1024 // generous slack
+	if delta > maxAcceptable {
+		t.Fatalf("alloc bump grew by %d bytes (live working set fits in %d) — reclaim broken",
+			delta, maxAcceptable)
+	}
+	t.Logf("stress alloc-reclaim concurrent: duration=%s workers=%d bump-delta=%d (cap %d)",
+		duration, workers, delta, maxAcceptable)
 }
 
 // ── 2. large file ────────────────────────────────────────────────────────────
@@ -354,17 +511,18 @@ func TestStress_LargeFile(t *testing.T) {
 		t.Skip("stress: -short: large-file test skipped at file-mb > 8")
 	}
 	fileMB := stressFileMB(t)
-	// Hard ceiling at 30 MiB: WriteFile writes the entire payload as
-	// ONE block (no indirection on the write side), and the BP's
-	// psize field is 16-bit sectors → max ~32 MiB per block. Above
-	// that the reader's readBlock truncates and ReadFile fails with
-	// "SA size > data block". When the writer grows true indirect-BP
-	// support, lift this cap.
-	const writerSingleBlockCapMiB = 30
-	if fileMB > writerSingleBlockCapMiB {
-		t.Logf("stress: capping file-mb at %d (writer single-block limit; was %d)",
-			writerSingleBlockCapMiB, fileMB)
-		fileMB = writerSingleBlockCapMiB
+	// WriteFile now splits payloads larger than 128 KiB into
+	// 128-KiB-blocks addressed through indirect block pointers
+	// (writeBlockTree, up to 6 levels). With indblkshift=17 and
+	// 128 KiB data blocks, the cap is bpsPerIndir^5 × 128 KiB ≈
+	// 144 PiB — well past anything the stress suite drives. We still
+	// keep a sanity ceiling far above realistic test sizes so a
+	// fat-fingered -stress.file-mb doesn't exhaust the temp FS.
+	const writerCapMiB = 256
+	if fileMB > writerCapMiB {
+		t.Logf("stress: capping file-mb at %d MiB (sanity ceiling; was %d)",
+			writerCapMiB, fileMB)
+		fileMB = writerCapMiB
 	}
 	// Pool must comfortably hold the payload + format overhead +
 	// label area. 2x the payload + 8 MiB headroom is plenty.
@@ -718,18 +876,20 @@ func TestStress_FaultInjection(t *testing.T) {
 // ── 7. RAID profile sweep (read-only concurrent fixtures) ───────────────────
 
 // TestStress_RAIDProfileSweep hammers the RAID fixtures
-// (testdata/raid/*) with concurrent readers. For layouts the lib
-// can already open in-tree (today: none of them open end-to-end via
-// OpenDataset due to the on-disk parser gap documented in
-// raid_smoke_test.go), this becomes a no-op for the layout but
-// records the open-failure category so we don't lose the signal
-// when the parser is later fixed.
+// (testdata/raid/*) with concurrent readers, exercising BOTH the
+// single-leg OpenDataset path (which works for single + each mirror
+// leg) and the multi-leg OpenFromDevices path (which is the only way
+// raidz reads succeed). Both paths run side-by-side so each layout's
+// open-failure mode is captured precisely:
 //
-// As the read path lands, this test will start producing real
-// concurrent-read assertions on the fixtures. Today it primarily
-// validates extractRAIDFixture is concurrency-safe (each goroutine
-// extracts into its own t.TempDir via the existing helper) and that
-// the open-failure mode is stable.
+//   - single  → single-leg open is the canonical path (multi-leg n/a).
+//   - mirror  → single-leg per leg + multi-leg both must succeed.
+//   - raidz*  → multi-leg must succeed; single-leg is expected to fail
+//     because raidz scatters data across legs.
+//
+// When a failure mode regresses (e.g. multi-leg raidz starts failing
+// the way Bug 4's earlier report described), the per-layout
+// diagnostic surfaces exactly which path broke.
 func TestStress_RAIDProfileSweep(t *testing.T) {
 	readers := stressRAIDReaders(t)
 	layouts := []string{"single", "mirror", "raidz1", "raidz2", "raidz3"}
@@ -743,51 +903,110 @@ func TestStress_RAIDProfileSweep(t *testing.T) {
 				t.Skipf("no fixture images for %s", layout)
 			}
 			exp := raidLayoutInfo(layout)
+			isRAIDZ := layout == "raidz1" || layout == "raidz2" || layout == "raidz3"
 
 			var (
-				wg       sync.WaitGroup
-				opens    atomic.Int64
-				openErrs atomic.Int64
-				reads    atomic.Int64
-				readErrs atomic.Int64
+				wg                sync.WaitGroup
+				singleOpens       atomic.Int64
+				singleOpenErrs    atomic.Int64
+				multiOpens        atomic.Int64
+				multiOpenErrs     atomic.Int64
+				reads             atomic.Int64
+				readErrs          atomic.Int64
+				lastSingleErr     atomic.Pointer[string]
+				lastMultiOpenErr  atomic.Pointer[string]
+				lastMultiReadErr  atomic.Pointer[string]
 			)
 			wg.Add(readers)
 			start := time.Now()
 			for r := 0; r < readers; r++ {
 				go func() {
 					defer wg.Done()
-					// Single-leg open path works for single + each leg
-					// of mirror (mirrors store identical bytes per leg).
-					// Multi-leg raidz needs OpenFromDevices — skip here
-					// because every goroutine would need its own backend
-					// set, multiplying file descriptors; the existing
-					// raid_smoke_test already covers the open path.
-					img := imgs[0]
-					fs, err := OpenDataset(img, -1, exp.dataset)
+					// Single-leg path.
+					singleFS, err := OpenDataset(imgs[0], -1, exp.dataset)
 					if err != nil {
-						openErrs.Add(1)
-						return
-					}
-					opens.Add(1)
-					_, err = fs.ReadFile("/hello.txt")
-					if err != nil {
-						readErrs.Add(1)
+						singleOpenErrs.Add(1)
+						s := err.Error()
+						lastSingleErr.Store(&s)
 					} else {
-						reads.Add(1)
+						singleOpens.Add(1)
+						if _, err := singleFS.ReadFile("/hello.txt"); err != nil {
+							readErrs.Add(1)
+						} else {
+							reads.Add(1)
+						}
+						_ = singleFS.Close()
 					}
-					_, err = fs.ReadFile("/blob.bin")
-					if err != nil {
-						readErrs.Add(1)
-					} else {
-						reads.Add(1)
+
+					// Multi-leg path — open every leg as a backend and
+					// route via OpenFromDevices. This is the path that
+					// raidz strictly requires.
+					if len(imgs) >= 1 {
+						backends := make([]BlockBackend, 0, len(imgs))
+						files := make([]*os.File, 0, len(imgs))
+						openOK := true
+						for _, p := range imgs {
+							f, err := os.OpenFile(p, os.O_RDWR, 0o600)
+							if err != nil {
+								openOK = false
+								break
+							}
+							files = append(files, f)
+							backends = append(backends, &osFileBackend{f: f})
+						}
+						if !openOK {
+							for _, f := range files {
+								_ = f.Close()
+							}
+						} else {
+							multiFS, err := OpenFromDevices(backends, -1, exp.dataset)
+							if err != nil {
+								multiOpenErrs.Add(1)
+								s := err.Error()
+								lastMultiOpenErr.Store(&s)
+								for _, f := range files {
+									_ = f.Close()
+								}
+							} else {
+								multiOpens.Add(1)
+								if _, err := multiFS.ReadFile("/hello.txt"); err != nil {
+									readErrs.Add(1)
+									s := err.Error()
+									lastMultiReadErr.Store(&s)
+								} else {
+									reads.Add(1)
+								}
+								_ = multiFS.Close()
+							}
+						}
 					}
-					_ = fs.Close()
 				}()
 			}
 			wg.Wait()
-			t.Logf("stress raid %s: readers=%d opens=%d openErrs=%d reads=%d readErrs=%d elapsed=%s",
-				layout, readers, opens.Load(), openErrs.Load(),
+			t.Logf("stress raid %s: readers=%d single-opens=%d single-errs=%d "+
+				"multi-opens=%d multi-errs=%d reads=%d readErrs=%d elapsed=%s",
+				layout, readers, singleOpens.Load(), singleOpenErrs.Load(),
+				multiOpens.Load(), multiOpenErrs.Load(),
 				reads.Load(), readErrs.Load(), time.Since(start))
+
+			// Failure-mode invariants — fail loudly on regression so the
+			// "Bug 4" multi-leg raidz path doesn't silently re-break.
+			if isRAIDZ && multiOpens.Load() == 0 {
+				diag := "<no error captured>"
+				if p := lastMultiOpenErr.Load(); p != nil {
+					diag = *p
+				}
+				t.Errorf("multi-leg %s: every OpenFromDevices failed (Bug 4 regressed). "+
+					"Last error: %s", layout, diag)
+			}
+			if !isRAIDZ && singleOpens.Load() == 0 {
+				diag := "<no error captured>"
+				if p := lastSingleErr.Load(); p != nil {
+					diag = *p
+				}
+				t.Errorf("%s: every single-leg OpenDataset failed. Last error: %s",
+					layout, diag)
+			}
 		})
 	}
 }

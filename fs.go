@@ -203,43 +203,81 @@ func (fs *zfsFS) WriteFile(path string, data []byte, perm os.FileMode) error {
 	// Check if file already exists
 	existingObjNum, _ := fs.zplDS.lookupEntry(fs.f, fs.partOffset, parentObjNum, name)
 
+	// On overwrite, return the previous dnode's data extents to the
+	// allocator before reallocating. Without this, every WriteFile to
+	// an existing path leaks the old data block(s) — a problem for
+	// long-running write loops with the same key set
+	// (TestStress_ConcurrentRW exercises exactly this).
+	if existingObjNum != 0 {
+		if prev, err := fs.zplDS.zplOS.readObject(existingObjNum); err == nil {
+			fs.freeDnodeData(prev)
+		}
+	}
+
 	now := uint64(time.Now().Unix())
 	mode := uint64(0o0100000 | (uint16(perm) & 0o7777))
 
-	// Build data block if non-empty
-	var dataBP blkptr
-	var dataOff int64
-	if len(data) > 0 {
-		// Align data to block size
-		bsz := poolBlockSize
-		paddedSize := int(alignUp(int64(len(data)), int64(bsz)))
-		paddedData := make([]byte, paddedSize)
-		copy(paddedData, data)
-		var err2 error
-		dataOff, err2 = fs.alloc.alloc(paddedSize)
-		if err2 != nil {
-			return fmt.Errorf("zfs: WriteFile: %w", err2)
-		}
-		if _, err2 = fs.f.WriteAt(paddedData, fs.partOffset+dataOff); err2 != nil {
-			return fmt.Errorf("zfs: WriteFile: write data: %w", err2)
-		}
-		dataBP = makeBlkptr(dataOff, paddedSize, paddedSize, zcompressOff, dmotPlainFileContents, 0, fs.curTxg)
+	// Pick a per-file data block size. Small files keep the historic 4
+	// KiB block (avoids wasting an entire 128 KiB record for a 32-byte
+	// sentinel). Anything larger jumps to 128 KiB so we can address up
+	// to several GiB through 1024-BP indirect blocks (indblkshift=17).
+	const largeFileThreshold = 128 * 1024
+	bsz := poolBlockSize
+	if len(data) > largeFileThreshold {
+		bsz = 128 * 1024
 	}
 
-	// Build dnode
-	attrs := &saAttrs{
+	// Lay out the payload as N data blocks. The last block is padded
+	// out to bsz; the read side trims back to attrs.size via ReadFile.
+	nBlocks := 0
+	if len(data) > 0 {
+		nBlocks = int(alignUp(int64(len(data)), int64(bsz)) / int64(bsz))
+	}
+	dataBPs := make([]blkptr, nBlocks)
+	for i := 0; i < nBlocks; i++ {
+		// Slice this block's logical payload out of data.
+		start := i * bsz
+		end := start + bsz
+		if end > len(data) {
+			end = len(data)
+		}
+		block := make([]byte, bsz) // zero-padded tail
+		copy(block, data[start:end])
+		off, err := fs.alloc.alloc(bsz)
+		if err != nil {
+			// Roll back already-allocated blocks so a mid-allocation
+			// failure doesn't permanently leak space.
+			for j := 0; j < i; j++ {
+				fs.alloc.free(dataBPs[j].dvaOffset(0), int(dataBPs[j].psize()))
+			}
+			return fmt.Errorf("zfs: WriteFile: alloc data block %d/%d: %w", i, nBlocks, err)
+		}
+		if _, err := fs.f.WriteAt(block, fs.partOffset+off); err != nil {
+			return fmt.Errorf("zfs: WriteFile: write data block %d: %w", i, err)
+		}
+		dataBPs[i] = makeBlkptr(off, bsz, bsz, zcompressOff, dmotPlainFileContents, 0, fs.curTxg)
+	}
+
+	// Build the dnode. nblkptr=1 by default — multi-block files route
+	// through one or more indirect blocks (see writeBlockTree).
+	saBonus := writeSABonus(&saAttrs{
 		mode: mode, size: uint64(len(data)),
 		gen: 1, uid: 0, gid: 0,
 		parent: parentObjNum, links: 1,
 		atime: [2]uint64{now, 0}, mtime: [2]uint64{now, 0},
 		ctime: [2]uint64{now, 0}, crtime: [2]uint64{now, 0},
-	}
-	saBonus := writeSABonus(attrs, fs.zplDS.saLayout)
+	}, fs.zplDS.saLayout)
 	fileDN := newDnode(dmotPlainFileContents, 1, dmotSA, uint16(len(saBonus)))
-	fileDN.datablkszsec = uint16(poolBlockSize / 512)
-	if len(data) > 0 {
-		fileDN.setBlkptrAt(0, dataBP)
-		fileDN.maxblkid = 0
+	fileDN.datablkszsec = uint16(bsz / 512)
+	fileDN.indblkshift = 17 // 128 KiB indirect blocks (1024 BPs each)
+	if nBlocks > 0 {
+		rootBP, nlevels, err := fs.writeBlockTree(dataBPs, bsz, 1<<17)
+		if err != nil {
+			return fmt.Errorf("zfs: WriteFile: build indirect tree: %w", err)
+		}
+		fileDN.setBlkptrAt(0, rootBP)
+		fileDN.maxblkid = uint64(nBlocks - 1)
+		fileDN.nlevels = uint8(nlevels)
 	}
 	bonusStart := dnodeHdrSize + blkptrSize
 	copy(fileDN.raw[bonusStart:], saBonus)
@@ -345,6 +383,117 @@ func (fs *zfsFS) MkDir(path string, perm os.FileMode) error {
 	return fs.commitUberblock()
 }
 
+// writeBlockTree assembles an indirect-block tree above a slice of
+// level-0 (data) block pointers and returns the root blkptr that the
+// dnode's first slot should point at, together with the resulting
+// `nlevels` value (1 if the tree fits in a single direct BP, 2 if it
+// needs one indirect level, 3 for two levels, etc.).
+//
+// dataBlockSize is the level-0 data block size in bytes (e.g. 4 KiB or
+// 128 KiB). indirBlockSize is the byte size of each non-leaf node
+// (matches dn.indblkshift; the writer uses 128 KiB → 1024 BPs each).
+// Each indirect block is written into the data area through the
+// allocator so DeleteFile's freeDnodeData walker reclaims it.
+//
+// The on-disk shape exactly matches what findDataBP / readDataBlock
+// already decode: an indirect block is a flat array of `blkptrSize`
+// entries, padded with zero BPs at the tail to fill indirBlockSize.
+//
+// nlevels is capped at 6 (the OpenZFS hard limit, same as the
+// reader's findDataBP). Files needing deeper trees are rejected.
+func (fs *zfsFS) writeBlockTree(dataBPs []blkptr, dataBlockSize, indirBlockSize int) (blkptr, int, error) {
+	if len(dataBPs) == 0 {
+		return blkptr{}, 0, fmt.Errorf("zfs: writeBlockTree: no data blocks")
+	}
+	if len(dataBPs) == 1 {
+		// Single block — no indirection needed.
+		return dataBPs[0], 1, nil
+	}
+	bpsPerIndir := indirBlockSize / blkptrSize
+	currentBPs := dataBPs
+	nlevels := 1
+	// indirLogicalSize: each indirect block at level L "covers" a
+	// span of logical bytes equal to bpsPerIndir^L * dataBlockSize.
+	// We record an indirect BP with lsize=psize=indirBlockSize.
+	for len(currentBPs) > 1 {
+		if nlevels >= 6 {
+			return blkptr{}, 0, fmt.Errorf("zfs: writeBlockTree: tree exceeds 6 levels (got %d data blocks, bps/indir=%d)",
+				len(dataBPs), bpsPerIndir)
+		}
+		// Group currentBPs into chunks of bpsPerIndir; each chunk
+		// becomes one indirect block.
+		nextBPs := make([]blkptr, 0, (len(currentBPs)+bpsPerIndir-1)/bpsPerIndir)
+		for chunkStart := 0; chunkStart < len(currentBPs); chunkStart += bpsPerIndir {
+			chunkEnd := chunkStart + bpsPerIndir
+			if chunkEnd > len(currentBPs) {
+				chunkEnd = len(currentBPs)
+			}
+			indirBuf := make([]byte, indirBlockSize)
+			for i, bp := range currentBPs[chunkStart:chunkEnd] {
+				encodeBlkptr(bp, indirBuf[i*blkptrSize:(i+1)*blkptrSize])
+			}
+			off, err := fs.alloc.alloc(indirBlockSize)
+			if err != nil {
+				return blkptr{}, 0, fmt.Errorf("zfs: writeBlockTree: alloc indirect: %w", err)
+			}
+			if _, err := fs.f.WriteAt(indirBuf, fs.partOffset+off); err != nil {
+				return blkptr{}, 0, fmt.Errorf("zfs: writeBlockTree: write indirect: %w", err)
+			}
+			// Indirect BPs carry level = nlevels (so the immediate
+			// parent of dataBPs is level=1, etc.).
+			indirBP := makeBlkptr(off, indirBlockSize, indirBlockSize,
+				zcompressOff, dmotPlainFileContents, uint8(nlevels), fs.curTxg)
+			nextBPs = append(nextBPs, indirBP)
+		}
+		currentBPs = nextBPs
+		nlevels++
+	}
+	return currentBPs[0], nlevels, nil
+}
+
+// freeDnodeData walks every non-null, non-embedded data extent and
+// indirect-block extent reachable from the dnode's blkptrs and returns
+// them to the allocator. Safe to call on dnodes with nlevels == 0 or
+// nblkptr == 0 (no-op).
+//
+// Gang blocks are intentionally skipped (the read path also rejects
+// them); they would need traversal of the gang header to enumerate
+// their members, which the writer never emits.
+func (fs *zfsFS) freeDnodeData(dn *dnode) {
+	if fs.alloc == nil || dn == nil || dn.nblkptr == 0 {
+		return
+	}
+	for i := 0; i < int(dn.nblkptr); i++ {
+		fs.freeBlkptr(dn.blkptrAt(i))
+	}
+}
+
+// freeBlkptr returns the extent covered by bp (and any indirect-block
+// extents underneath it) to the allocator. Null / embedded / gang BPs
+// are skipped.
+func (fs *zfsFS) freeBlkptr(bp blkptr) {
+	if bp.isNull() || bp.isEmbedded() {
+		return
+	}
+	if bp.dvaGang(0) {
+		return
+	}
+	off := bp.dvaOffset(0)
+	psize := bp.psize()
+	// If this BP points at an indirect block, recursively walk the
+	// pointers it contains before freeing the indirect block itself.
+	if bp.level() > 0 {
+		raw, err := readBlock(fs.f, fs.partOffset, bp)
+		if err == nil {
+			for i := 0; i+blkptrSize <= len(raw); i += blkptrSize {
+				child := parseBlkptr(raw[i : i+blkptrSize])
+				fs.freeBlkptr(child)
+			}
+		}
+	}
+	fs.alloc.free(off, int(psize))
+}
+
 // ── DeleteFile ───────────────────────────────────────────────────────────────
 
 // DeleteFile removes the file at path.
@@ -376,6 +525,12 @@ func (fs *zfsFS) DeleteFile(path string) error {
 	if dn.typ == dmotDirContents {
 		return fmt.Errorf("zfs: DeleteFile %q: is a directory", path)
 	}
+
+	// Reclaim every data / indirect extent referenced by the dnode
+	// before zeroing it out. Without this the bump-pointer allocator
+	// leaks pool space on every DeleteFile and long write/delete loops
+	// (see TestStress_ManyFiles) exhaust the pool monotonically.
+	fs.freeDnodeData(dn)
 
 	// Zero out the dnode (marks it free)
 	if err := fs.writeDnode(objNum, &dnode{raw: make([]byte, dnodeMinSize)}); err != nil {
@@ -434,6 +589,10 @@ func (fs *zfsFS) DeleteDir(path string) error {
 		return &os.PathError{Op: "rmdir", Path: path, Err: errNotEmpty}
 	}
 
+	// Reclaim the directory's ZAP block (and any indirect extents)
+	// before zeroing the dnode.
+	fs.freeDnodeData(dn)
+
 	if err := fs.writeDnode(objNum, &dnode{raw: make([]byte, dnodeMinSize)}); err != nil {
 		return fmt.Errorf("zfs: DeleteDir %q: zero dnode: %w", path, err)
 	}
@@ -483,6 +642,9 @@ func (fs *zfsFS) Rename(oldPath, newPath string) error {
 		if dstDN != nil && dstDN.typ == dmotDirContents {
 			return fmt.Errorf("zfs: Rename: destination is a directory")
 		}
+		// Return the destination's data extents to the allocator
+		// before zeroing the dnode; same reasoning as DeleteFile.
+		fs.freeDnodeData(dstDN)
 		_ = fs.writeDnode(dstObj, &dnode{raw: make([]byte, dnodeMinSize)})
 		_ = fs.updateDirZAP(newParentObj, newName, 0, true)
 	}

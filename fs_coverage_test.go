@@ -1351,3 +1351,118 @@ func TestInitAllocator_LimitLessThanNext(t *testing.T) {
 		t.Fatal("expected allocator")
 	}
 }
+
+// ── multi-block writes (Bug 3 regression) ────────────────────────────────────
+
+// TestWriteFile_MultiBlock_L1 writes a payload that requires two
+// 128-KiB data blocks (256 KiB) — one level of indirection. The dnode
+// nlevels must be 2 and ReadFile must round-trip the entire payload.
+func TestWriteFile_MultiBlock_L1(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pool.img")
+	ifs, err := Format(path, 8*1024*1024, FormatConfig{PoolName: "multiblk"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	fs := ifs.(*zfsFS)
+	t.Cleanup(func() { fs.Close() })
+
+	const sz = 256 * 1024
+	payload := make([]byte, sz)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	if err := fs.WriteFile("/multi.bin", payload, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	objNum, err := fs.zplDS.lookupPath(fs.f, fs.partOffset, "/multi.bin")
+	if err != nil {
+		t.Fatalf("lookupPath: %v", err)
+	}
+	dn, err := fs.zplDS.zplOS.readObject(objNum)
+	if err != nil {
+		t.Fatalf("readObject: %v", err)
+	}
+	if dn.nlevels < 2 {
+		t.Fatalf("dn.nlevels = %d, want >= 2 (multi-block file should use indirection)", dn.nlevels)
+	}
+	if got := dn.dataBlockSize(); got != 128*1024 {
+		t.Fatalf("dn.dataBlockSize = %d, want 131072 (large-file class)", got)
+	}
+
+	got, err := fs.ReadFile("/multi.bin")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if len(got) != sz {
+		t.Fatalf("ReadFile len = %d, want %d", len(got), sz)
+	}
+	for i := range got {
+		if got[i] != payload[i] {
+			t.Fatalf("ReadFile byte %d = %d, want %d", i, got[i], payload[i])
+		}
+	}
+}
+
+// TestWriteFile_MultiBlock_PreservesSmallFiles asserts that small
+// files still use the 4-KiB-block layout (datablkszsec = 8) and a
+// single direct BP. This is the path the existing stress / format
+// tests cover; the multi-block change must not regress it.
+func TestWriteFile_MultiBlock_PreservesSmallFiles(t *testing.T) {
+	fs := newTestFS(t)
+	const payload = "small-file sentinel"
+	if err := fs.WriteFile("/s.txt", []byte(payload), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	objNum, err := fs.zplDS.lookupPath(fs.f, fs.partOffset, "/s.txt")
+	if err != nil {
+		t.Fatalf("lookupPath: %v", err)
+	}
+	dn, err := fs.zplDS.zplOS.readObject(objNum)
+	if err != nil {
+		t.Fatalf("readObject: %v", err)
+	}
+	if dn.dataBlockSize() != poolBlockSize {
+		t.Fatalf("small file data block size = %d, want %d (small-file class)", dn.dataBlockSize(), poolBlockSize)
+	}
+	if dn.nlevels != 1 {
+		t.Fatalf("small file nlevels = %d, want 1 (no indirection)", dn.nlevels)
+	}
+}
+
+// TestWriteFile_MultiBlock_FreesIndirect verifies the indirect-block
+// extents are also handed back to the allocator on DeleteFile, not
+// just the data blocks themselves. Sentinel: after a write + delete
+// cycle the bump pointer doesn't grow.
+func TestWriteFile_MultiBlock_FreesIndirect(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pool.img")
+	ifs, err := Format(path, 16*1024*1024, FormatConfig{PoolName: "multifree"})
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	fs := ifs.(*zfsFS)
+	t.Cleanup(func() { fs.Close() })
+
+	const sz = 1024 * 1024 // 1 MiB → 8 data blocks + 1 indirect at L1
+	payload := make([]byte, sz)
+	for i := range payload {
+		payload[i] = byte(i % 17)
+	}
+	if err := fs.WriteFile("/multi.bin", payload, 0o644); err != nil {
+		t.Fatalf("seed WriteFile: %v", err)
+	}
+	bumpAfterFirst := fs.alloc.nextFree
+
+	for i := 0; i < 16; i++ {
+		if err := fs.DeleteFile("/multi.bin"); err != nil {
+			t.Fatalf("iter %d: DeleteFile: %v", i, err)
+		}
+		if err := fs.WriteFile("/multi.bin", payload, 0o644); err != nil {
+			t.Fatalf("iter %d: WriteFile: %v", i, err)
+		}
+		if fs.alloc.nextFree > bumpAfterFirst {
+			t.Fatalf("iter %d: bump grew (was %d, now %d) — indirect blocks not freed",
+				i, bumpAfterFirst, fs.alloc.nextFree)
+		}
+	}
+}
