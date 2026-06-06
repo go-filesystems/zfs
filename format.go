@@ -312,16 +312,20 @@ func encodeUberblock(version, txg, guidSum, ts uint64, rootBP blkptr) []byte {
 // ── Vdev label ───────────────────────────────────────────────────────────────
 
 // buildLabel constructs a 256 KiB vdev label.
-// Layout:
+// Layout (matches OpenZFS sys/vdev_label.h VDEV_PAD_SIZE / VDEV_PHYS_SIZE):
 //
-//	[0..4K)       boot block (zeroed)
-//	[4K..4K+108K) nvlist
-//	[4K+108K..128K) padding
-//	[128K..256K)  uberblock ring (128 × 1KiB slots, ub in slot 0)
+//	[0x00000 .. 0x02000)  vl_pad1         (8 KiB, zeroed)
+//	[0x02000 .. 0x04000)  vl_pad2 / boot  (8 KiB, zeroed)
+//	[0x04000 .. 0x20000)  vl_vdev_phys    (112 KiB, XDR nvlist)
+//	[0x20000 .. 0x40000)  vl_uberblock    (128 KiB, 128 × 1 KiB slots)
 func buildLabel(nvBuf, ub []byte) []byte {
 	label := make([]byte, vdevLabelSize)
-	// nvlist at offset 4K, max 112K (boot block is 4K, uberblock region at 128K)
-	nvOff := 4 * 1024
+	// vdev_phys (XDR nvlist) at offset 0x4000, max 112 KiB. Real ZFS
+	// has 8 KiB pad1 (0x0000..0x2000) plus 8 KiB pad2/boot
+	// (0x2000..0x4000) before the nvlist; the older comment that
+	// described a "4K boot block" was wrong and produced an off-by-8KiB
+	// nvlist position rejected by zdb / zpool import.
+	const nvOff = 16 * 1024 // = 0x4000
 	if len(nvBuf) > 112*1024 {
 		nvBuf = nvBuf[:112*1024]
 	}

@@ -71,6 +71,15 @@ func ProbeLabel(r io.ReaderAt, partOff int64) (*LabelInfo, error) {
 	out.Type = string(tree.typ)
 	out.NParity = tree.nparity
 	out.Ashift = tree.ashift
+	// ashift is recorded on each leaf vdev; a non-leaf root inherits
+	// it from its children. Surface the first leaf's ashift when the
+	// node itself doesn't carry one so callers (and conformance tests)
+	// see the pool's actual block-size shift instead of a 0.
+	if out.Ashift == 0 {
+		if leaf := firstLeafAshift(tree); leaf != 0 {
+			out.Ashift = leaf
+		}
+	}
 	if !tree.isLeaf() {
 		out.LeafGUIDs = make([]uint64, 0, len(tree.children))
 		for _, c := range tree.children {
@@ -83,4 +92,21 @@ func ProbeLabel(r io.ReaderAt, partOff int64) (*LabelInfo, error) {
 func mustNVListValue(p *parsedNVPair) parsedNVList {
 	v, _ := p.nvlistValue()
 	return v
+}
+
+// firstLeafAshift returns the ashift of the first leaf reached in a
+// depth-first walk of v, or 0 if no leaf has a non-zero ashift.
+func firstLeafAshift(v *vdev) uint64 {
+	if v == nil {
+		return 0
+	}
+	if v.isLeaf() {
+		return v.ashift
+	}
+	for _, c := range v.children {
+		if a := firstLeafAshift(c); a != 0 {
+			return a
+		}
+	}
+	return 0
 }
