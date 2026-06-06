@@ -119,12 +119,16 @@ func TestZfsResize_NoOp(t *testing.T) {
 	}
 }
 
-// TestZfsResize_ShrinkUnsupported is the headline contract test: the
-// ZFS driver MUST return filesystem.ErrShrinkUnsupported when asked
-// to shrink, mirroring OpenZFS's own refusal to shrink pools. The
-// error must be unwrappable via errors.Is so callers can branch on
-// it portably.
-func TestZfsResize_ShrinkUnsupported(t *testing.T) {
+// TestZfsResize_ShrinkRoute exercises the post-shrink-support Resize
+// contract: when newSize < current the dispatcher routes to the
+// Shrink path (Auto mode) and the operation succeeds. The historical
+// "returns ErrShrinkUnsupported" contract no longer applies — our
+// writer ships its own Rebuild/InPlace shrink modes; see resize.go.
+//
+// Grow / GrowTo still reject shrink with the wrapped sentinel — see
+// TestZfsGrow_ShrinkRejected — so callers that target the grow-only
+// surface keep their legacy contract intact.
+func TestZfsResize_ShrinkRoute(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "zfs-resize-shrink.img")
 	size := int64(16 * 1024 * 1024)
 	fs, err := Format(path, size, FormatConfig{})
@@ -133,12 +137,16 @@ func TestZfsResize_ShrinkUnsupported(t *testing.T) {
 	}
 	defer fs.Close()
 
-	err = fs.Resize(size - 4*1024*1024)
-	if err == nil {
-		t.Fatalf("Resize shrink: expected error, got nil")
+	newSize := size - 4*1024*1024
+	if err := fs.Resize(newSize); err != nil {
+		t.Fatalf("Resize shrink: %v", err)
 	}
-	if !errors.Is(err, filesystem.ErrShrinkUnsupported) {
-		t.Fatalf("Resize shrink: error %v does not wrap ErrShrinkUnsupported", err)
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if st.Size() != newSize {
+		t.Fatalf("post-shrink size = %d, want %d", st.Size(), newSize)
 	}
 }
 

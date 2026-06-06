@@ -122,15 +122,15 @@ var (
 
 // FS is the public interface returned by Open. Extends
 // filesystem.Filesystem with ZFS-specific operations (Info,
-// PartitionOffset, GrowTo / Grow / Resize).
+// PartitionOffset, GrowTo / Grow / Resize / Shrink / ShrinkWithMode).
 //
-// GrowTo, Grow and Resize all map to the same on-disk operation; the
-// three spellings exist so callers using the historical Grower
-// interface, the newer filesystem.Resizer, or the bare verb all reach
-// the same code path. Resize is the only entry point that returns
-// filesystem.ErrShrinkUnsupported for shrink attempts — Grow / GrowTo
-// reject shrink with a wrapped error too, so errors.Is is reliable in
-// either direction.
+// GrowTo, Grow are the grow-only entry points; they reject shrink
+// targets with a wrapped filesystem.ErrShrinkUnsupported so callers
+// branching on grow-only contracts still see the sentinel. Resize is
+// bidirectional — newSize > current routes to Grow, newSize <
+// current routes to Shrink (in Auto mode). Shrink and ShrinkWithMode
+// expose the shrink path with explicit mode control (see ShrinkMode
+// in resize.go for the Rebuild / InPlace / Auto contract).
 type FS interface {
 	filesystem.Filesystem
 	Info() Info
@@ -138,6 +138,8 @@ type FS interface {
 	GrowTo(newSizeBytes int64) error
 	Grow(newSizeBytes int64) error
 	Resize(newSize int64) error
+	Shrink(newSize int64) error
+	ShrinkWithMode(newSize int64, mode ShrinkMode) error
 }
 
 // Open opens imagePath, optionally selecting a partition, and scans for the freshest uberblock.
