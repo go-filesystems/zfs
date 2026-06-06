@@ -44,26 +44,15 @@ func (fs *zfsFS) GrowTo(newSizeBytes int64) error {
 func (fs *zfsFS) Grow(newSizeBytes int64) error { return fs.GrowTo(newSizeBytes) }
 
 // Resize routes to Grow when newSize > current size, is a no-op when
-// equal, and returns filesystem.ErrShrinkUnsupported when newSize <
-// current size. OpenZFS itself does not support pool shrink — only
-// grow via `zpool online -e` / `autoexpand=on` — and this driver
-// mirrors that constraint.
+// equal, and dispatches to Shrink (in Auto mode) when newSize <
+// current size. The shrink path is now implemented end-to-end in
+// resize.go — see ShrinkMode and ShrinkWithMode for the mode contract.
+// OpenZFS itself does not support pool shrink (vdev_removal builds a
+// permanent indirect-mapping table that adds per-pool overhead
+// forever), but our writer has no such constraint, so Resize is
+// genuinely bidirectional.
 func (fs *zfsFS) Resize(newSize int64) error {
-	if newSize <= 0 {
-		return fmt.Errorf("zfs: resize: invalid size %d", newSize)
-	}
-	curSize, err := fs.f.Size()
-	if err != nil {
-		return fmt.Errorf("zfs: resize: size: %w", err)
-	}
-	if newSize == curSize {
-		return nil
-	}
-	if newSize < curSize {
-		return fmt.Errorf("zfs: resize: cannot shrink from %d to %d: %w",
-			curSize, newSize, filesystem.ErrShrinkUnsupported)
-	}
-	return fs.GrowTo(newSize)
+	return fs.resizeOnce(newSize)
 }
 
 // growLocked is the lock-already-held implementation shared by GrowTo
