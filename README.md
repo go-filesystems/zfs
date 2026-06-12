@@ -16,7 +16,8 @@ create, inspect, and modify ZFS filesystems programmatically.
 | ReadFile / WriteFile | ✅ | Basic file I/O supported (ZPL dataset) |
 | MkDir / Delete / Rename | ✅ | Directory operations supported |
 | Snapshots / Clones | ⚠️ No | Not implemented (test-oriented subset) |
-| Compression / Checksums | ⚠️ No | Not implemented on data blocks |
+| Compression (read) | ✅ | LZ4, ZLE, LZJB decompression on data blocks |
+| Checksums | ⚠️ No | Not verified on data blocks |
 
 
 ## Module
@@ -109,7 +110,9 @@ Only **micro-ZAP** is supported for directory writes. Directory entries use a
 ## Limitations
 
 - Single vdev, single pool, single dataset
-- No compression or checksums on data blocks
+- Compressed data blocks are read transparently (LZ4, ZLE, LZJB); writes
+  always emit uncompressed blocks. GZIP/ZSTD reads are not supported. Data-block
+  checksums are not verified.
 - No snapshots, clones, or ACLs
 - Maximum 28 objects (files + directories) per pool image
 - Directory names limited to 49 bytes
