@@ -13,6 +13,7 @@ create, inspect, and modify ZFS filesystems programmatically.
 |---|---:|---|
 | Open / Close | ✅ | Opens single-pool images |
 | Format | ✅ | Creates new pool images via `Format` |
+| Grow / Resize | ✅ | Grow (`filesystem.Resizer`); shrink unsupported |
 | ReadFile / WriteFile | ✅ | Basic file I/O supported (ZPL dataset) |
 | MkDir / Delete / Rename | ✅ | Directory operations supported |
 | Snapshots / Clones | ⚠️ No | Not implemented (test-oriented subset) |
