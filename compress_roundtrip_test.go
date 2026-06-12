@@ -120,24 +120,39 @@ func zfsFrameLZ4(raw []byte) []byte {
 	return src
 }
 
-// refZLEEncode is a spec-compliant ZLE encoder: literal non-zero bytes are
-// copied as-is; runs of zeros are emitted as 0x00 followed by (runLen-1),
-// capped at 256 per run.
+// refZLEEncode is a spec-compliant OpenZFS ZLE encoder (n=64), mirroring
+// module/zfs/zle.c:zfs_zle_compress_buf. It is INDEPENDENT of the production
+// decoder (zleDecompress): it does not call it nor share its loop.
+//
+// Encoding (n=64):
+//   - a run of L non-zero (literal) bytes is emitted as control byte (L-1)
+//     followed by the L bytes, with L capped at n per chunk;
+//   - a run of Z zero bytes is emitted as control byte (n + Z - 1) with no
+//     following data, with Z capped at (256 - n) per chunk.
 func refZLEEncode(in []byte) []byte {
+	const n = 64
 	var out []byte
 	i := 0
 	for i < len(in) {
-		if in[i] != 0 {
-			out = append(out, in[i])
-			i++
-			continue
+		if in[i] == 0 {
+			// Zero run, capped at (256-n) per control byte.
+			run := 0
+			for i < len(in) && in[i] == 0 && run < (256-n) {
+				run++
+				i++
+			}
+			out = append(out, byte(n+run-1))
+		} else {
+			// Literal run, capped at n per control byte.
+			start := i
+			cnt := 0
+			for i < len(in) && in[i] != 0 && cnt < n {
+				cnt++
+				i++
+			}
+			out = append(out, byte(cnt-1))
+			out = append(out, in[start:start+cnt]...)
 		}
-		run := 1
-		for i+run < len(in) && in[i+run] == 0 && run < 256 {
-			run++
-		}
-		out = append(out, 0x00, byte(run-1))
-		i += run
 	}
 	return out
 }
@@ -194,6 +209,70 @@ func TestZLEDecompress_RoundTripRealData(t *testing.T) {
 			}
 			if !bytes.Equal(got, want) {
 				t.Fatalf("%s round-trip mismatch at byte %d", name, firstDiff(got, want))
+			}
+		})
+	}
+}
+
+// TestZLEDecompress_RealOpenZFSBlocks asserts zleDecompress against GOLDEN ZLE
+// payloads extracted from a real OpenZFS pool (zpool create + compression=zle),
+// not against this file's own reference encoder. These are the exact on-disk
+// physical (psize) bytes of L0 EMBEDDED blkptrs, captured via:
+//
+//	zpool create -o ashift=12 zletest <img>; zfs set compression=zle zletest
+//	printf 'small zle file\n' > /zletest/small.txt      # 15 bytes
+//	dd if=/dev/zero bs=4096 count=1 of=/zletest/sparse.bin; printf HEADER | dd conv=notrunc ...
+//	zdb -ddddd zletest/ <obj>   # shows the L0 EMBEDDED blkptr + 200L/13P, 1000L/1dP
+//	zdb -R zletest <dva>:<size>:dr  # raw decompressed block holding the embedded payload
+//
+// OpenZFS uses the ZLE level n=64 (module/zfs/zio_compress.c: {"zle", 64, ...}).
+// If zleDecompress regresses to the old non-spec format these will FAIL.
+func TestZLEDecompress_RealOpenZFSBlocks(t *testing.T) {
+	type vec struct {
+		name  string
+		psize []byte // exact on-disk ZLE physical payload
+		lsize int    // logical (decompressed) block size
+		want  []byte // expected decompressed prefix (rest is zeros up to lsize)
+	}
+	vecs := []vec{
+		{
+			// /zletest/small.txt: "small zle file\n" (15 bytes) in a 512-byte
+			// logical block. blkptr: 200L/13P (psize=0x13=19). Control 0x0e =>
+			// 15 literals; then ff,ff,b0 => 192+192+113 = 497 zeros.
+			name:  "small.txt",
+			psize: []byte{0x0e, 's', 'm', 'a', 'l', 'l', ' ', 'z', 'l', 'e', ' ', 'f', 'i', 'l', 'e', '\n', 0xff, 0xff, 0xb0},
+			lsize: 512,
+			want:  []byte("small zle file\n"),
+		},
+		{
+			// /zletest/sparse.bin: "HEADER" (6 bytes) in a 4096-byte logical
+			// block. blkptr: 1000L/1dP (psize=0x1d=29). Control 0x05 => 6
+			// literals; then ff*21 (=4032 zeros) + 0x79 (=58 zeros) = 4090 zeros.
+			name: "sparse.bin",
+			psize: append(append([]byte{0x05}, []byte("HEADER")...),
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x79),
+			lsize: 4096,
+			want:  []byte("HEADER"),
+		},
+	}
+	for _, v := range vecs {
+		t.Run(v.name, func(t *testing.T) {
+			got, err := zleDecompress(v.psize, v.lsize)
+			if err != nil {
+				t.Fatalf("zleDecompress(%s): %v", v.name, err)
+			}
+			if len(got) != v.lsize {
+				t.Fatalf("%s: got len %d, want %d", v.name, len(got), v.lsize)
+			}
+			if !bytes.HasPrefix(got, v.want) {
+				t.Fatalf("%s: prefix mismatch: got %q want %q", v.name, got[:len(v.want)], v.want)
+			}
+			// Everything after the literal prefix must be zero.
+			for i := len(v.want); i < len(got); i++ {
+				if got[i] != 0 {
+					t.Fatalf("%s: byte %d = %#x, want 0", v.name, i, got[i])
+				}
 			}
 		})
 	}

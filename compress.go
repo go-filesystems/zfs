@@ -157,26 +157,48 @@ func lzjbDecompress(src []byte, dstSize int) ([]byte, error) {
 	return dst, nil
 }
 
-// zleDecompress decompresses ZLE (zero-length encoding) data.
-// ZLE encodes runs of zeros: non-zero bytes are stored literally,
-// runs of zeros are encoded as 0 + (length - 1) bytes.
+// zleParam is the ZLE level used by OpenZFS for the ZIO_COMPRESS_ZLE
+// algorithm (module/zfs/zio_compress.c: {"zle", 64, ...}). It is the
+// threshold separating literal runs from zero runs in the control byte.
+const zleParam = 64
+
+// zleDecompress decompresses OpenZFS ZLE (zero-length encoding) data.
+//
+// ZLE is a stream of control bytes. For each control byte c, let length = c + 1:
+//   - if length <= n  (i.e. c < n): the next length bytes are LITERAL bytes
+//     copied verbatim from the source;
+//   - if length >  n  (i.e. c >= n): a run of (length - n) ZERO bytes is emitted
+//     and NO bytes follow the control byte.
+//
+// This mirrors module/zfs/zle.c:zfs_zle_decompress_buf with n = zleParam (64).
+// The previous implementation used a non-spec "0x00 + (len-1)" zero-run format
+// that decoded real OpenZFS ZLE blocks to garbage.
 func zleDecompress(src []byte, dstSize int) ([]byte, error) {
+	const n = zleParam
 	dst := make([]byte, dstSize)
 	si, di := 0, 0
-	for di < dstSize && si < len(src) {
-		if src[si] == 0 {
-			si++
-			if si >= len(src) {
-				di++
-				continue
+	for si < len(src) && di < dstSize {
+		length := 1 + int(src[si])
+		si++
+		if length <= n {
+			// Literal run: copy `length` bytes verbatim.
+			if si+length > len(src) {
+				return nil, fmt.Errorf("zfs: zle: literal run of %d overruns source (%d left)", length, len(src)-si)
 			}
-			n := int(src[si]) + 1
-			si++
-			di += n
+			if di+length > dstSize {
+				return nil, fmt.Errorf("zfs: zle: literal run of %d overruns destination (%d left)", length, dstSize-di)
+			}
+			copy(dst[di:], src[si:si+length])
+			si += length
+			di += length
 		} else {
-			dst[di] = src[si]
-			si++
-			di++
+			// Zero run: emit (length - n) zeros. dst is already zeroed,
+			// so just advance the destination cursor.
+			zeros := length - n
+			if di+zeros > dstSize {
+				return nil, fmt.Errorf("zfs: zle: zero run of %d overruns destination (%d left)", zeros, dstSize-di)
+			}
+			di += zeros
 		}
 	}
 	return dst, nil
