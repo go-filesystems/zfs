@@ -1,6 +1,6 @@
 # zfs
 
-![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)
+![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)
 ![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)
 
 A read/write ZFS implementation for bare disk images, supporting a single
