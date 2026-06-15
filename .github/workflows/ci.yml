@@ -1,0 +1,236 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# go.mod carries a chain of local `replace` directives, so every sibling
+# module has to sit at the path the directive expects, relative to this
+# module's directory:
+#
+#   replace github.com/go-filesystems/interface  => ../interface
+#   replace github.com/go-encryptions/zfscrypt    => ../../go-encryptions/zfscrypt
+#   replace github.com/go-encryptions/ccm         => ../../go-encryptions/ccm
+#
+# zfscrypt in turn has `replace github.com/go-encryptions/ccm => ../ccm`.
+# We check zfs out under `fs/zfs` so that `../` is `fs/` and `../../` is the
+# workspace root, giving this on-disk layout:
+#
+#   <workspace>/fs/zfs              (this module)
+#   <workspace>/fs/interface
+#   <workspace>/go-encryptions/zfscrypt
+#   <workspace>/go-encryptions/ccm
+#
+# A reusable composite action is overkill for four checkouts, so each job
+# repeats them.
+
+jobs:
+  # Native runners: build + vet + test (race + coverage) for the two
+  # natively available 64-bit arches, exactly as a developer runs locally.
+  native:
+    name: native ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Checkout zfs
+        uses: actions/checkout@v4
+        with:
+          path: fs/zfs
+
+      - name: Checkout interface (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-filesystems/interface
+          path: fs/interface
+
+      - name: Checkout zfscrypt (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-encryptions/zfscrypt
+          path: go-encryptions/zfscrypt
+
+      - name: Checkout ccm (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-encryptions/ccm
+          path: go-encryptions/ccm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: fs/zfs/go.mod
+
+      - name: Build
+        working-directory: fs/zfs
+        run: go build -mod=mod ./...
+
+      - name: Vet
+        working-directory: fs/zfs
+        run: go vet -mod=mod ./...
+
+      # The heavy stress / resize / grow paths are gated on
+      # `!testing.Short()`, so the full (non-short) run exercises them. Give
+      # it a generous timeout since the largest cases write multi-MB pools.
+      - name: Test (race + coverage)
+        working-directory: fs/zfs
+        run: |
+          go test -mod=mod -race -timeout 30m \
+            -coverprofile=cover.out -covermode=atomic ./...
+
+      - name: Enforce coverage threshold
+        working-directory: fs/zfs
+        run: |
+          set -euo pipefail
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          echo "total coverage: ${total}%"
+          # Repo's current statement coverage is 85.4%; gate just below it so
+          # an accidental regression fails CI while noise does not.
+          awk -v c="$total" 'BEGIN { exit !(c+0 >= 85.0) }' \
+            || { echo "coverage ${total}% < 85.0% gate"; exit 1; }
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.arch }}
+          path: fs/zfs/cover.out
+          if-no-files-found: ignore
+
+  # Emulated runners: cross-compile a static (CGO_ENABLED=0) per-package
+  # test binary and run it under QEMU for each non-native 64-bit arch.
+  #
+  # s390x is big-endian. ZFS is endian-adaptive: the on-disk uberblock magic
+  # and block pointers record the byte order they were written with, and the
+  # reader honours that stored order rather than assuming the host's. The
+  # RAID fixtures (testdata/raid/*.tar.zst) are real little-endian OpenZFS
+  # pools, so the s390x job is a genuine cross-endian read test — it passes
+  # at the same coverage as the native jobs.
+  #
+  # Tests run with `-test.short`: the heavy stress paths are gated behind
+  # `testing.Short()` and would be far too slow under emulation, while short
+  # mode still reaches the same statement coverage (85.4%). Fuzz functions
+  # only run their seed corpus (no `-test.fuzz`), so no active fuzzing under
+  # QEMU.
+  emulated:
+    name: emulated ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: riscv64
+            image: debian:trixie
+            qemu: rv64,v=true,vlen=128
+          - arch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu: la464
+          - arch: ppc64le
+            image: debian:trixie
+            qemu: power9
+          - arch: s390x
+            image: debian:trixie
+            qemu: qemu
+    steps:
+      - name: Checkout zfs
+        uses: actions/checkout@v4
+        with:
+          path: fs/zfs
+
+      - name: Checkout interface (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-filesystems/interface
+          path: fs/interface
+
+      - name: Checkout zfscrypt (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-encryptions/zfscrypt
+          path: go-encryptions/zfscrypt
+
+      - name: Checkout ccm (sibling replace target)
+        uses: actions/checkout@v4
+        with:
+          repository: go-encryptions/ccm
+          path: go-encryptions/ccm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+          cache-dependency-path: fs/zfs/go.mod
+
+      - name: Register QEMU binfmt handlers
+        run: docker run --rm --privileged tonistiigi/binfmt --install all
+
+      - name: Cross-compile per-package test binaries
+        working-directory: fs/zfs
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tests
+          for pkg in $(go list -mod=mod ./...); do
+            name=$(echo "$pkg" | tr '/' '_')
+            # Skip packages without test files (go test -c emits no binary).
+            go test -mod=mod -c -cover -o "/tmp/tests/${name}.test" "$pkg"
+            if [ -f "/tmp/tests/${name}.test" ]; then
+              echo "built ${name}.test"
+            fi
+          done
+          # The fixture-backed tests open paths relative to the working
+          # directory (e.g. testdata/raid/single.tar.zst). The test binaries
+          # run from /tmp/tests under QEMU, so the testdata tree has to sit
+          # right next to them.
+          if [ -d testdata ]; then
+            cp -R testdata /tmp/tests/testdata
+          fi
+          ls -la /tmp/tests
+
+      - name: Run test binaries under QEMU (${{ matrix.arch }})
+        env:
+          QEMU_CPU: ${{ matrix.qemu }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bins=(/tmp/tests/*.test)
+          if [ ${#bins[@]} -eq 0 ]; then
+            echo "no test binaries to run"; exit 0
+          fi
+          rc=0
+          for bin in "${bins[@]}"; do
+            echo "::group::$(basename "$bin")"
+            # --user 1000:1000: some tests assert that writing a read-only
+            # file fails, which root (uid 0, the docker default) bypasses.
+            if ! docker run --rm \
+              --platform linux/${{ matrix.arch }} \
+              --user 1000:1000 \
+              -e QEMU_CPU="${QEMU_CPU}" \
+              -v /tmp/tests:/t -w /t \
+              ${{ matrix.image }} \
+              "./$(basename "$bin")" -test.v -test.short; then
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc
