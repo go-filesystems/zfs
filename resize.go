@@ -420,8 +420,13 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 		_, err := fs.f.WriteAt(b, off)
 		return err
 	}
-	makeBP := func(off int64, physSize, logicalSize int, dtype uint8) blkptr {
-		return makeBlkptr(off, physSize, logicalSize, zcompressOff, dtype, 0, fmtPoolTXG)
+	// makeBP mirrors format.go's wrapper: fletcher4 block checksum over the
+	// physical block bytes `phys`, so resized pools stay byte-compatible
+	// with freshly Format()'d ones (and import-traversable under OpenZFS).
+	makeBP := func(off int64, physSize, logicalSize int, dtype uint8, phys []byte) blkptr {
+		bp := makeBlkptrCksum(off, physSize, logicalSize, zcompressOff, dtype, 0, fmtPoolTXG, zioChecksumFletch4)
+		setBPChecksum(&bp, phys)
+		return bp
 	}
 
 	// ZAPs
@@ -438,13 +443,13 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 
 	zplMasterDN := newDnode(dmotMasterNode, 1, dmotNone, 0)
 	zplMasterDN.datablkszsec = uint16(poolBlockSize / 512)
-	zplMasterDN.setBlkptrAt(0, makeBP(fmtMasterNodeZAPOff, poolBlockSize, poolBlockSize, dmotMasterNode))
+	zplMasterDN.setBlkptrAt(0, makeBP(fmtMasterNodeZAPOff, poolBlockSize, poolBlockSize, dmotMasterNode, masterNodeZAP))
 	zplMasterDN.encode()
 	copy(zplObjArray[fmtZPLMasterNode*dnodeMinSize:], zplMasterDN.raw)
 
 	zplUnlinkedDN := newDnode(dmotUnlinkedSet, 1, dmotNone, 0)
 	zplUnlinkedDN.datablkszsec = uint16(poolBlockSize / 512)
-	zplUnlinkedDN.setBlkptrAt(0, makeBP(fmtUnlinkedZAPOff, poolBlockSize, poolBlockSize, dmotUnlinkedSet))
+	zplUnlinkedDN.setBlkptrAt(0, makeBP(fmtUnlinkedZAPOff, poolBlockSize, poolBlockSize, dmotUnlinkedSet, unlinkedZAP))
 	zplUnlinkedDN.encode()
 	copy(zplObjArray[fmtZPLUnlinked*dnodeMinSize:], zplUnlinkedDN.raw)
 
@@ -457,7 +462,7 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 	saBonus := writeSABonus(rootSAAttrs, layout)
 	zplRootDN := newDnode(dmotDirContents, 1, dmotSA, uint16(len(saBonus)))
 	zplRootDN.datablkszsec = uint16(poolBlockSize / 512)
-	zplRootDN.setBlkptrAt(0, makeBP(fmtRootDirZAPOff, poolBlockSize, poolBlockSize, dmotDirContents))
+	zplRootDN.setBlkptrAt(0, makeBP(fmtRootDirZAPOff, poolBlockSize, poolBlockSize, dmotDirContents, rootDirZAP))
 	copy(zplRootDN.raw[dnodeHdrSize+blkptrSize:], saBonus)
 	zplRootDN.encode()
 	copy(zplObjArray[fmtZPLRootDir*dnodeMinSize:], zplRootDN.raw)
@@ -466,7 +471,7 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 	zplObjset := make([]byte, poolBlockSize)
 	zplMetaDN := newDnode(dmotDnode, 1, dmotNone, 0)
 	zplMetaDN.datablkszsec = uint16(fmtObjArraySize / 512)
-	zplMetaDN.setBlkptrAt(0, makeBP(fmtZPLObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode))
+	zplMetaDN.setBlkptrAt(0, makeBP(fmtZPLObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode, zplObjArray))
 	zplMetaDN.encode()
 	copy(zplObjset[0:], zplMetaDN.raw)
 	binary.LittleEndian.PutUint64(zplObjset[objsetTypeOff:], dmuOSTZFS)
@@ -475,7 +480,7 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 	mosObjArray := make([]byte, fmtObjArraySize)
 	poolDirDN := newDnode(dmotObjectDirectory, 1, dmotNone, 0)
 	poolDirDN.datablkszsec = uint16(poolBlockSize / 512)
-	poolDirDN.setBlkptrAt(0, makeBP(fmtPoolDirZAPOff, poolBlockSize, poolBlockSize, dmotObjectDirectory))
+	poolDirDN.setBlkptrAt(0, makeBP(fmtPoolDirZAPOff, poolBlockSize, poolBlockSize, dmotObjectDirectory, poolDirZAP))
 	poolDirDN.encode()
 	copy(mosObjArray[fmtMOSPoolDirObj*dnodeMinSize:], poolDirDN.raw)
 
@@ -490,7 +495,7 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 	binary.LittleEndian.PutUint64(dslDSBonus[dsDirObj:], fmtMOSDSLDirObj)
 	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTime:], now)
 	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTxg:], fmtPoolTXG)
-	zplBP := makeBP(fmtZPLObjsetOff, poolBlockSize, poolBlockSize, dmotObjset)
+	zplBP := makeBP(fmtZPLObjsetOff, poolBlockSize, poolBlockSize, dmotObjset, zplObjset)
 	encodeBlkptr(zplBP, dslDSBonus[dsBP:dsBP+blkptrSize])
 	dslDatasetDN := newDnode(dmotDSLDataset, 1, dmotDSLDataset, uint16(len(dslDSBonus)))
 	copy(dslDatasetDN.raw[dnodeHdrSize+blkptrSize:], dslDSBonus)
@@ -501,7 +506,7 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 	mosObjset := make([]byte, poolBlockSize)
 	mosMetaDN := newDnode(dmotDnode, 1, dmotNone, 0)
 	mosMetaDN.datablkszsec = uint16(fmtObjArraySize / 512)
-	mosMetaDN.setBlkptrAt(0, makeBP(fmtMOSObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode))
+	mosMetaDN.setBlkptrAt(0, makeBP(fmtMOSObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode, mosObjArray))
 	mosMetaDN.encode()
 	copy(mosObjset[0:], mosMetaDN.raw)
 	binary.LittleEndian.PutUint64(mosObjset[objsetTypeOff:], dmuOSTMeta)
@@ -525,7 +530,7 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 		}
 	}
 
-	rootBP := makeBP(fmtMOSObjsetOff, poolBlockSize, poolBlockSize, dmotObjset)
+	rootBP := makeBP(fmtMOSObjsetOff, poolBlockSize, poolBlockSize, dmotObjset, mosObjset)
 	ub := encodeUberblock(fmtPoolVersion, fmtPoolTXG, poolGUID, now, rootBP)
 
 	nvBuf := buildLabelNVList(poolName, poolGUID, poolGUID, uint64(newSize), now)
@@ -792,7 +797,7 @@ func (fs *zfsFS) writefileImpl(path string, data []byte, perm os.FileMode) error
 		if _, err := fs.f.WriteAt(block, fs.partOffset+off); err != nil {
 			return fmt.Errorf("zfs: writefileImpl: write data block: %w", err)
 		}
-		dataBPs[i] = makeBlkptr(off, bsz, bsz, zcompressOff, dmotPlainFileContents, 0, fs.curTxg)
+		dataBPs[i] = makeBlkptrCksum(off, bsz, bsz, zcompressOff, dmotPlainFileContents, 0, fs.curTxg, zioChecksumOff)
 	}
 
 	saBonus := writeSABonus(&saAttrs{
@@ -883,8 +888,8 @@ func (fs *zfsFS) mkdirImpl(path string, perm os.FileMode) error {
 	saBonus := writeSABonus(attrs, fs.zplDS.saLayout)
 	dirDN := newDnode(dmotDirContents, 1, dmotSA, uint16(len(saBonus)))
 	dirDN.datablkszsec = uint16(poolBlockSize / 512)
-	dirDN.setBlkptrAt(0, makeBlkptr(zapOff, poolBlockSize, poolBlockSize,
-		zcompressOff, dmotDirContents, 0, fs.curTxg))
+	dirDN.setBlkptrAt(0, makeBlkptrCksum(zapOff, poolBlockSize, poolBlockSize,
+		zcompressOff, dmotDirContents, 0, fs.curTxg, zioChecksumOff))
 	copy(dirDN.raw[dnodeHdrSize+blkptrSize:], saBonus)
 	dirDN.encode()
 	if err := fs.writeDnode(objNum, dirDN); err != nil {

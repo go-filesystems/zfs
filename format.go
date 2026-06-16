@@ -127,9 +127,17 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 		return err
 	}
 
-	// ── makeBP: convenience wrapper for makeBlkptr with compress=off ─────────
-	makeBP := func(off int64, physSize, logicalSize int, dtype uint8) blkptr {
-		return makeBlkptr(off, physSize, logicalSize, zcompressOff, dtype, 0, fmtPoolTXG)
+	// ── makeBP: convenience wrapper for makeBlkptr with compress=off and a
+	// fletcher4 block checksum computed over the physical block bytes
+	// `phys`. fletcher4 is the algorithm real `zpool create` uses for the
+	// MOS objset, dnode arrays, ZAPs and data on OpenZFS 2.3, so emitting
+	// it (with the matching blk_prop checksum-type) lets `zdb -e -p` verify
+	// our blocks during MOS/objset traversal. `phys` must be exactly the
+	// bytes written at `off`. ───────────────────────────────────────────
+	makeBP := func(off int64, physSize, logicalSize int, dtype uint8, phys []byte) blkptr {
+		bp := makeBlkptrCksum(off, physSize, logicalSize, zcompressOff, dtype, 0, fmtPoolTXG, zioChecksumFletch4)
+		setBPChecksum(&bp, phys)
+		return bp
 	}
 
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -159,14 +167,14 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// Object 1: ZPL master node ZAP dnode
 	zplMasterDN := newDnode(dmotMasterNode, 1, dmotNone, 0)
 	zplMasterDN.datablkszsec = uint16(poolBlockSize / 512) // 8
-	zplMasterDN.setBlkptrAt(0, makeBP(fmtMasterNodeZAPOff, poolBlockSize, poolBlockSize, dmotMasterNode))
+	zplMasterDN.setBlkptrAt(0, makeBP(fmtMasterNodeZAPOff, poolBlockSize, poolBlockSize, dmotMasterNode, masterNodeZAP))
 	zplMasterDN.encode()
 	copy(zplObjArray[fmtZPLMasterNode*dnodeMinSize:], zplMasterDN.raw)
 
 	// Object 2: Unlinked set ZAP dnode
 	zplUnlinkedDN := newDnode(dmotUnlinkedSet, 1, dmotNone, 0)
 	zplUnlinkedDN.datablkszsec = uint16(poolBlockSize / 512)
-	zplUnlinkedDN.setBlkptrAt(0, makeBP(fmtUnlinkedZAPOff, poolBlockSize, poolBlockSize, dmotUnlinkedSet))
+	zplUnlinkedDN.setBlkptrAt(0, makeBP(fmtUnlinkedZAPOff, poolBlockSize, poolBlockSize, dmotUnlinkedSet, unlinkedZAP))
 	zplUnlinkedDN.encode()
 	copy(zplObjArray[fmtZPLUnlinked*dnodeMinSize:], zplUnlinkedDN.raw)
 
@@ -188,7 +196,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	saBonus := writeSABonus(rootSAAttrs, layout)
 	zplRootDN := newDnode(dmotDirContents, 1, dmotSA, uint16(len(saBonus)))
 	zplRootDN.datablkszsec = uint16(poolBlockSize / 512)
-	zplRootDN.setBlkptrAt(0, makeBP(fmtRootDirZAPOff, poolBlockSize, poolBlockSize, dmotDirContents))
+	zplRootDN.setBlkptrAt(0, makeBP(fmtRootDirZAPOff, poolBlockSize, poolBlockSize, dmotDirContents, rootDirZAP))
 	// Write bonus into dnode raw
 	bonusStart := dnodeHdrSize + 1*blkptrSize
 	copy(zplRootDN.raw[bonusStart:], saBonus)
@@ -202,7 +210,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// ZPL meta_dnode (object 0): describes the ZPL object array
 	zplMetaDN := newDnode(dmotDnode, 1, dmotNone, 0)
 	zplMetaDN.datablkszsec = uint16(fmtObjArraySize / 512) // 32
-	zplMetaDN.setBlkptrAt(0, makeBP(fmtZPLObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode))
+	zplMetaDN.setBlkptrAt(0, makeBP(fmtZPLObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode, zplObjArray))
 	zplMetaDN.encode()
 	copy(zplObjset[0:], zplMetaDN.raw)
 	// os_type = 2 (DMU_OST_ZFS) at offset 704
@@ -216,7 +224,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// Object 1: Pool directory ZAP
 	poolDirDN := newDnode(dmotObjectDirectory, 1, dmotNone, 0)
 	poolDirDN.datablkszsec = uint16(poolBlockSize / 512)
-	poolDirDN.setBlkptrAt(0, makeBP(fmtPoolDirZAPOff, poolBlockSize, poolBlockSize, dmotObjectDirectory))
+	poolDirDN.setBlkptrAt(0, makeBP(fmtPoolDirZAPOff, poolBlockSize, poolBlockSize, dmotObjectDirectory, poolDirZAP))
 	poolDirDN.encode()
 	copy(mosObjArray[fmtMOSPoolDirObj*dnodeMinSize:], poolDirDN.raw)
 
@@ -233,7 +241,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	binary.LittleEndian.PutUint64(dslDSBonus[dsDirObj:], fmtMOSDSLDirObj) // ds_dir_obj
 	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTime:], now)       // ds_creation_time
 	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTxg:], fmtPoolTXG) // ds_creation_txg
-	zplBP := makeBP(fmtZPLObjsetOff, poolBlockSize, poolBlockSize, dmotObjset)
+	zplBP := makeBP(fmtZPLObjsetOff, poolBlockSize, poolBlockSize, dmotObjset, zplObjset)
 	encodeBlkptr(zplBP, dslDSBonus[dsBP:dsBP+blkptrSize])
 	dslDatasetDN := newDnode(dmotDSLDataset, 1, dmotDSLDataset, uint16(len(dslDSBonus)))
 	copy(dslDatasetDN.raw[dnodeHdrSize+blkptrSize:], dslDSBonus)
@@ -247,7 +255,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// MOS meta_dnode: describes the MOS object array
 	mosMetaDN := newDnode(dmotDnode, 1, dmotNone, 0)
 	mosMetaDN.datablkszsec = uint16(fmtObjArraySize / 512) // 32
-	mosMetaDN.setBlkptrAt(0, makeBP(fmtMOSObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode))
+	mosMetaDN.setBlkptrAt(0, makeBP(fmtMOSObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode, mosObjArray))
 	mosMetaDN.encode()
 	copy(mosObjset[0:], mosMetaDN.raw)
 	// os_type = 1 (DMU_OST_META) at offset 704
@@ -281,7 +289,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	// 7. Build the rootbp (pointing to the MOS objset)
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-	rootBP := makeBP(fmtMOSObjsetOff, poolBlockSize, poolBlockSize, dmotObjset)
+	rootBP := makeBP(fmtMOSObjsetOff, poolBlockSize, poolBlockSize, dmotObjset, mosObjset)
 
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	// 8. Build and encode the uberblock
