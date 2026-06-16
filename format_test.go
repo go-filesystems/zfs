@@ -215,10 +215,11 @@ func TestWriteAndOverwrite(t *testing.T) {
 }
 
 func TestBuildLabel_TruncatesLargeInputs(t *testing.T) {
-	// nvBuf > 112*1024 bytes → truncated to 112KiB; ub > uberblockSize → truncated.
-	nvBuf := make([]byte, 113*1024)
-	ub := make([]byte, uberblockSize+100)
-	label := buildLabel(nvBuf, ub)
+	// nvBuf larger than the vdev_phys payload → truncated to fit before
+	// the zio_eck_t trailer; ub larger than a ring slot → truncated.
+	nvBuf := make([]byte, vdevPhysSize+1024)
+	ub := make([]byte, uberblockSlotSize+100)
+	label := buildLabel(nvBuf, ub, 0, fmtPoolTXG)
 	if len(label) != vdevLabelSize {
 		t.Fatalf("buildLabel len = %d, want %d", len(label), vdevLabelSize)
 	}

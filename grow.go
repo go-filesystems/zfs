@@ -107,8 +107,11 @@ func (fs *zfsFS) growLocked(newSizeBytes int64) error {
 		fs.labelOffset + newSizeBytes - 2*vdevLabelSize,
 		fs.labelOffset + newSizeBytes - vdevLabelSize,
 	}
-	label := buildLabel(nvBuf, ub)
 	for _, off := range labelOffsets {
+		// Each label's self-checksums are seeded with that label's own
+		// absolute offset, so rebuild per offset rather than reusing one
+		// buffer across all four.
+		label := buildLabel(nvBuf, ub, off, fs.curTxg)
 		if _, err := fs.f.WriteAt(label, off); err != nil {
 			return fmt.Errorf("zfs: grow: write label at %d: %w", off, err)
 		}
@@ -134,6 +137,18 @@ func (fs *zfsFS) growLocked(newSizeBytes int64) error {
 	} else {
 		fs.initAllocator(newSizeBytes)
 	}
+
+	// Rewriting the four labels above clears every uberblock ring slot
+	// except the active one (buildLabel emits a fresh, mostly-zero
+	// label that populates only slot txg%nslots with a valid rootbp).
+	// The cached fs.info.Offset may now point at a wiped slot, so re-
+	// read the freshest uberblock BEFORE commitUberblock — otherwise
+	// commitUberblock would read a NULL rootbp from the stale offset.
+	info, err := openReadInfo(fs.f, fs.labelOffset)
+	if err != nil {
+		return fmt.Errorf("zfs: grow: refresh uberblock info: %w", err)
+	}
+	fs.info = info
 
 	if err := fs.commitUberblock(); err != nil {
 		return fmt.Errorf("zfs: grow: commit uberblock: %w", err)

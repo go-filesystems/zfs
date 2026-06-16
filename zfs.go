@@ -16,9 +16,26 @@ const (
 	sectorSize            = 512
 	vdevLabelSize         = 256 * 1024
 	uberblockRegionOffset = 128 * 1024
+	uberblockRegionSize   = 128 * 1024 // VDEV_UBERBLOCK_RING
 	uberblockSize         = 1024
 	uberblockSlots        = 128
 	uberblockMagic        = 0x00bab10c
+
+	// vdevPhysOffset / vdevPhysSize match OpenZFS sys/vdev_label.h:
+	// 8 KiB pad1 + 8 KiB pad2/boot precede the 112 KiB vdev_phys region,
+	// whose final 40 bytes are a zio_eck_t self-checksum trailer.
+	vdevPhysOffset = 16 * 1024  // 0x4000
+	vdevPhysSize   = 112 * 1024 // VDEV_PHYS_SIZE
+
+	// uberblockSlotSize is the on-disk stride between uberblocks in the
+	// ring: VDEV_UBERBLOCK_SIZE = max(1<<ashift, 1 KiB). Our writer only
+	// produces ashift=12 pools, so the slot size is 4 KiB (32 slots in
+	// the 128 KiB ring) — matching what real `zpool create -o ashift=12`
+	// emits, which is what zdb / zpool import expect. The reader scans
+	// the ring at the smaller 1 KiB granularity (uberblockSize) so it
+	// still locates 4 KiB-spaced uberblocks in both our pools and real
+	// OpenZFS pools.
+	uberblockSlotSize = 4096
 
 	// vdevLabelStartSize matches OpenZFS's VDEV_LABEL_START_SIZE: two
 	// labels at the start (2 × 256 KiB) + VDEV_BOOT_SIZE (3.5 MiB) =
