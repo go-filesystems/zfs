@@ -159,6 +159,21 @@ type FS interface {
 	Resize(newSize int64) error
 	Shrink(newSize int64) error
 	ShrinkWithMode(newSize int64, mode ShrinkMode) error
+	// Snapshot creates a frozen, isolated snapshot of the currently-open
+	// dataset. The snapshot is unaffected by later writes to the live
+	// dataset and is readable via OpenSnapshot. See snapshot.go.
+	Snapshot(snapName string) error
+}
+
+// OpenSnapshot opens a snapshot of a dataset for reading. datasetPath has the
+// same semantics as OpenDataset (pool prefix implicit, "" for the pool root);
+// snapName is the snapshot name created by FS.Snapshot. The returned FS is a
+// read-only view of the frozen snapshot — write operations are not meaningful
+// against a snapshot and are not supported.
+//
+// Equivalent to OpenDataset(imagePath, partIndex, datasetPath+"@"+snapName).
+func OpenSnapshot(imagePath string, partIndex int, datasetPath, snapName string) (FS, error) {
+	return openInternal(imagePath, partIndex, datasetPath+"@"+snapName)
 }
 
 // Open opens imagePath, optionally selecting a partition, and scans for the freshest uberblock.
