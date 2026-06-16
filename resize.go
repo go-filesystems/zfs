@@ -529,7 +529,6 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 	ub := encodeUberblock(fmtPoolVersion, fmtPoolTXG, poolGUID, now, rootBP)
 
 	nvBuf := buildLabelNVList(poolName, poolGUID, poolGUID, uint64(newSize), now)
-	label := buildLabel(nvBuf, ub)
 
 	// First, BEFORE we move/clobber labels, truncate the file down to
 	// the new size — this drops any stale L2/L3 labels at the OLD
@@ -549,6 +548,7 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 		fs.labelOffset + newSize - vdevLabelSize,
 	}
 	for _, off := range labelOffsets {
+		label := buildLabel(nvBuf, ub, off, fmtPoolTXG)
 		if err := writeAt(off, label); err != nil {
 			return fmt.Errorf("write label at %d: %w", off, err)
 		}
@@ -1149,10 +1149,12 @@ func (fs *zfsFS) relabelAndTruncate(newSize int64) error {
 
 	poolName, poolGUID, _ := fs.readPoolIdentity()
 	nvBuf := buildLabelNVList(poolName, poolGUID, poolGUID, uint64(newSize), now)
-	label := buildLabel(nvBuf, ub)
 
 	// Write the leading labels at their (unchanged) positions, then
 	// the new trailing labels INSIDE the bytes we are about to keep.
+	// buildLabel embeds the active uberblock (with its self-checksum)
+	// into the correct ring slot for fs.curTxg, so no separate
+	// uberblock write is needed here.
 	labelOffsets := []int64{
 		fs.labelOffset + 0*vdevLabelSize,
 		fs.labelOffset + vdevLabelSize,
@@ -1160,18 +1162,9 @@ func (fs *zfsFS) relabelAndTruncate(newSize int64) error {
 		fs.labelOffset + newSize - vdevLabelSize,
 	}
 	for _, off := range labelOffsets {
+		label := buildLabel(nvBuf, ub, off, fs.curTxg)
 		if _, err := fs.f.WriteAt(label, off); err != nil {
 			return fmt.Errorf("write label at %d: %w", off, err)
-		}
-	}
-
-	// Commit the matching uberblock into the canonical ring slot.
-	slot := int(fs.curTxg % uberblockSlots)
-	for li := 0; li < 2; li++ {
-		ubOff := fs.labelOffset + int64(li)*vdevLabelSize +
-			uberblockRegionOffset + int64(slot)*uberblockSize
-		if _, err := fs.f.WriteAt(ub, ubOff); err != nil {
-			return fmt.Errorf("write uberblock slot %d label %d: %w", slot, li, err)
 		}
 	}
 
