@@ -130,6 +130,7 @@ var (
 	_ filesystem.Grower     = (*zfsFS)(nil)
 	_ filesystem.Resizer    = (*zfsFS)(nil)
 	_ filesystem.Symlinker  = (*zfsFS)(nil)
+	_ filesystem.HardLinker = (*zfsFS)(nil)
 )
 
 var (
