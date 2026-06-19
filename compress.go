@@ -1,11 +1,17 @@
 package filesystem_zfs
 
 // compress.go – Decompression for ZFS block data.
-// Implements LZ4 (most common), LZJB (legacy), and ZLE (zero-length encoding).
+// Implements LZ4 (most common), LZJB (legacy), ZLE (zero-length encoding),
+// GZIP (raw zlib stream) and ZSTD (with the ZFS zstd header).
 
 import (
+	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"fmt"
+	"io"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // lz4Decompress decompresses ZFS LZ4-compressed data.
@@ -200,6 +206,102 @@ func zleDecompress(src []byte, dstSize int) ([]byte, error) {
 			}
 			di += zeros
 		}
+	}
+	return dst, nil
+}
+
+// gzipDecompress decompresses ZFS GZIP-compressed block data.
+//
+// OpenZFS stores GZIP-compressed blocks as a raw zlib stream (RFC 1950): the
+// kernel's gzip_compress / gzip_decompress (module/zfs/gzip.c) call zlib's
+// compress2()/uncompress() directly on the buffer, with NO extra framing and
+// NO length prefix. The on-disk byte therefore decodes the same way for every
+// gzip-1..9 level (ZIO_COMPRESS_GZIP_1..9): the level only affects the
+// encoder, not the wire format. We feed the physical buffer to a zlib reader;
+// the zlib trailer terminates the stream, so any allocation slack past the
+// stream end is harmless.
+//
+// dstSize is the expected logical (decompressed) size.
+func gzipDecompress(src []byte, dstSize int) ([]byte, error) {
+	zr, err := zlib.NewReader(bytes.NewReader(src))
+	if err != nil {
+		return nil, fmt.Errorf("zfs: gzip: %w", err)
+	}
+	defer zr.Close()
+
+	dst := make([]byte, dstSize)
+	n, err := io.ReadFull(zr, dst)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return nil, fmt.Errorf("zfs: gzip: %w", err)
+	}
+	if n != dstSize {
+		return nil, fmt.Errorf("zfs: gzip: decompressed %d bytes, want %d", n, dstSize)
+	}
+	return dst, nil
+}
+
+// zstdHeaderSize is the size of the ZFS zstd header (zfs_zstdhdr_t) that
+// precedes the magicless zstd frame on disk: a 4-byte big-endian compressed
+// length (c_len) followed by a 4-byte big-endian version+level field
+// (raw_version_level). See include/sys/zstd/zstd.h.
+const zstdHeaderSize = 8
+
+// zstdMagic is the standard zstd frame magic number (little-endian
+// 0xFD2FB528). OpenZFS compresses with ZSTD_f_zstd1_magicless (see
+// module/zstd/zfs_zstd.c, "Use the 'magicless' zstd header which saves us 4
+// header bytes"), so the on-disk frame omits this prefix. The portable Go
+// zstd decoder only accepts standard frames, so we re-prepend the magic to
+// reconstruct an equivalent standard frame before decoding.
+var zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
+
+// zstdDecoder is a shared, stateless zstd decoder. klauspost's decoder is safe
+// for concurrent use across goroutines via DecodeAll.
+var zstdDecoder = func() *zstd.Decoder {
+	d, err := zstd.NewReader(nil)
+	if err != nil {
+		panic(fmt.Sprintf("zfs: zstd: init decoder: %v", err))
+	}
+	return d
+}()
+
+// zstdDecompress decompresses ZFS ZSTD-compressed block data
+// (ZIO_COMPRESS_ZSTD).
+//
+// OpenZFS wraps the zstd frame with a zfs_zstdhdr_t header
+// (include/sys/zstd/zstd.h):
+//
+//	struct zfs_zstdhdr {
+//	        uint32_t c_len;              // big-endian compressed length
+//	        uint32_t raw_version_level;  // big-endian packed version + level
+//	        char     data[];             // raw zstd frame (c_len bytes)
+//	};
+//
+// zfs_zstd_decompress_level (module/zstd/zfs_zstd.c) reads c_len with BE_32 and
+// passes hdr->data with length c_len to a decompression context configured for
+// the magicless format. We mirror that: skip the 8-byte header, take c_len
+// bytes, re-prepend the standard zstd magic, and decode into a dstSize buffer.
+//
+// dstSize is the expected logical (decompressed) size.
+func zstdDecompress(src []byte, dstSize int) ([]byte, error) {
+	if len(src) < zstdHeaderSize {
+		return nil, fmt.Errorf("zfs: zstd: source too short for header (%d < %d)", len(src), zstdHeaderSize)
+	}
+	cLen := int(binary.BigEndian.Uint32(src[:4]))
+	frameStart := zstdHeaderSize
+	if cLen < 0 || frameStart+cLen > len(src) {
+		return nil, fmt.Errorf("zfs: zstd: c_len %d exceeds buffer (%d available)", cLen, len(src)-frameStart)
+	}
+	// Reconstruct a standard frame: magic + magicless on-disk frame.
+	frame := make([]byte, 0, 4+cLen)
+	frame = append(frame, zstdMagic...)
+	frame = append(frame, src[frameStart:frameStart+cLen]...)
+
+	dst, err := zstdDecoder.DecodeAll(frame, make([]byte, 0, dstSize))
+	if err != nil {
+		return nil, fmt.Errorf("zfs: zstd: %w", err)
+	}
+	if len(dst) != dstSize {
+		return nil, fmt.Errorf("zfs: zstd: decompressed %d bytes, want %d", len(dst), dstSize)
 	}
 	return dst, nil
 }
