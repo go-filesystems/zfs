@@ -44,6 +44,13 @@ const (
 	// spa_load requires it on a feature-flags pool.
 	dmuPoolFeatureDescriptions = "feature_descriptions"
 
+	// featSpacemapHistogram is the guid of the READONLY_COMPAT feature
+	// com.delphix:spacemap_histogram. Its refcount (stored in the
+	// features_for_write ZAP) must equal the number of metaslab space
+	// maps whose bonus is space_map_phys_t-sized, or zdb's
+	// verify_spacemap_refcounts() audit fails.
+	featSpacemapHistogram = "com.delphix:spacemap_histogram"
+
 	// dsl_dir_phys_t field offsets in bonus (uint64 LE, dnode has bonustype=DMU_OT_DSL_DIR)
 	ddCreationTime      = 0  // uint64
 	ddHeadDatasetObj    = 8  // uint64 – points to the DSL dataset

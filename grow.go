@@ -90,7 +90,11 @@ func (fs *zfsFS) growLocked(newSizeBytes int64) error {
 	poolName := "data"
 
 	now := uint64(time.Now().Unix())
-	nvBuf := buildLabelNVList(poolName, poolGUID, poolGUID, uint64(newSizeBytes), now)
+	// Grow does not (yet) rewrite the metaslab array / space maps, so the
+	// label advertises the metaslab geometry but no array object.
+	gml := computeMetaslabLayout(rawVdevAsize(uint64(newSizeBytes)))
+	gml.arrayObj = 0
+	nvBuf := buildLabelNVList(poolName, poolGUID, poolGUID, uint64(newSizeBytes), now, gml)
 
 	// Re-derive rootBP for embedding into the label's uberblock slot.
 	rootBPBuf := make([]byte, blkptrSize)
