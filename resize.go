@@ -156,12 +156,16 @@ func (fs *zfsFS) shrinkLocked(newSize int64, mode ShrinkMode) error {
 	}
 }
 
-// hasSnapshots reports whether the head dataset references a prev or
-// next snapshot via the standard dsl_dataset_phys_t fields. Our writer
-// never emits snapshots so this returns false on every pool it
-// produces; we still check rather than assume because the same code
-// path is run against pools opened via OpenFromDevice with a
-// hand-crafted backing store that might.
+// hasSnapshots reports whether the head dataset has any USER-VISIBLE
+// snapshots, i.e. named entries in its snapshot-name ZAP
+// (ds_snapnames_zapobj). It deliberately does NOT key off
+// ds_prev_snap_obj: on a feature-flags (v5000) pool every head dataset
+// descends from the hidden $ORIGIN snapshot, so ds_prev_snap_obj is
+// always non-zero — that is a structural artifact, not a user snapshot.
+// Real ZFS lists snapshots from the snapnames ZAP, which is what we
+// mirror here. A freshly Format()'d pool has an empty snapnames ZAP, so
+// this returns false (and InPlace shrink is permitted), exactly as
+// before the $ORIGIN hierarchy was added.
 func (fs *zfsFS) hasSnapshots() bool {
 	if fs.zplDS == nil || fs.zplDS.mos == nil {
 		return false
@@ -196,12 +200,22 @@ func (fs *zfsFS) hasSnapshots() bool {
 		return false
 	}
 	dsBonus := dsDN.bonusData()
-	if len(dsBonus) < dsNextSnapObj+8 {
+	if len(dsBonus) < dsSnapnamesZAPObj+8 {
 		return false
 	}
-	prev := binary.LittleEndian.Uint64(dsBonus[dsPrevSnapObj:])
-	next := binary.LittleEndian.Uint64(dsBonus[dsNextSnapObj:])
-	return prev != 0 || next != 0
+	snapZAPObj := binary.LittleEndian.Uint64(dsBonus[dsSnapnamesZAPObj:])
+	if snapZAPObj == 0 {
+		return false
+	}
+	snapDN, err := mos.readObject(snapZAPObj)
+	if err != nil {
+		return false
+	}
+	snaps, err := zapListAll(fs.f, fs.partOffset, snapDN)
+	if err != nil {
+		return false
+	}
+	return len(snaps) > 0
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1222,4 +1236,3 @@ func (fs *zfsFS) resizeOnce(newSize int64) error {
 	}
 	return fs.Shrink(newSize)
 }
-
