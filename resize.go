@@ -547,7 +547,9 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 	rootBP := makeBP(fmtMOSObjsetOff, poolBlockSize, poolBlockSize, dmotObjset, mosObjset)
 	ub := encodeUberblock(fmtPoolVersion, fmtPoolTXG, poolGUID, now, rootBP)
 
-	nvBuf := buildLabelNVList(poolName, poolGUID, poolGUID, uint64(newSize), now)
+	rml := computeMetaslabLayout(rawVdevAsize(uint64(newSize)))
+	rml.arrayObj = 0
+	nvBuf := buildLabelNVList(poolName, poolGUID, poolGUID, uint64(newSize), now, rml)
 
 	// First, BEFORE we move/clobber labels, truncate the file down to
 	// the new size — this drops any stale L2/L3 labels at the OLD
@@ -1167,7 +1169,9 @@ func (fs *zfsFS) relabelAndTruncate(newSize int64) error {
 	ub := encodeUberblock(fs.info.Version, fs.curTxg, fs.info.GUIDSum, now, rootBP)
 
 	poolName, poolGUID, _ := fs.readPoolIdentity()
-	nvBuf := buildLabelNVList(poolName, poolGUID, poolGUID, uint64(newSize), now)
+	rml := computeMetaslabLayout(rawVdevAsize(uint64(newSize)))
+	rml.arrayObj = 0
+	nvBuf := buildLabelNVList(poolName, poolGUID, poolGUID, uint64(newSize), now, rml)
 
 	// Write the leading labels at their (unchanged) positions, then
 	// the new trailing labels INSIDE the bytes we are about to keep.

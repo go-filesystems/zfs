@@ -177,12 +177,11 @@ func TestWriteThenZdb(t *testing.T) {
 	}
 
 	// zdb -e -AAA -bcc <pool>: traverse ALL blocks and verify their
-	// checksums. -AAA lets zdb continue past the space-map leak/claim
-	// asserts (the writer does not yet emit metaslab spacemaps, so block
-	// space-accounting is intentionally absent); the block traversal
-	// itself recomputes and checks every block pointer's fletcher4
-	// checksum. Exit 0 with no "checksum error" is the proof our
-	// on-disk block-pointer checksums match the OpenZFS spec.
+	// checksums. -AAA lets zdb continue past any space-map leak/claim
+	// asserts; the block traversal itself recomputes and checks every
+	// block pointer's fletcher4 checksum. Exit 0 with no "checksum error"
+	// is the proof our on-disk block-pointer checksums match the OpenZFS
+	// spec.
 	bccCmd := exec.Command(zdbPath, "-e", "-p", imgDir, "-AAA", "-bcc", compatwPoolName)
 	bccOut, bccErr := bccCmd.CombinedOutput()
 	bccStr := string(bccOut)
@@ -195,6 +194,52 @@ func TestWriteThenZdb(t *testing.T) {
 	}
 	if !strings.Contains(bccStr, "Traversing all blocks to verify checksums") {
 		t.Errorf("zdb -e -bcc did not reach block traversal.\nOutput:\n%s", bccStr)
+	}
+
+	// zdb -e -mmm <pool>: dump the metaslabs and their space maps. This
+	// proves the writer emits a metaslab array + per-metaslab space-map
+	// objects (vdev metaslab_array != 0). The first metaslab holds every
+	// pool block, so its space map must report a non-zero smp_alloc.
+	mmmCmd := exec.Command(zdbPath, "-e", "-p", imgDir, "-mmm", compatwPoolName)
+	mmmOut, mmmErr := mmmCmd.CombinedOutput()
+	mmmStr := string(mmmOut)
+	if mmmErr != nil {
+		t.Fatalf("zdb -e -mmm failed: %v\nmetaslab dump did not complete.\nOutput:\n%s", mmmErr, mmmStr)
+	}
+	for _, want := range []string{"Metaslabs:", "space map object", "metaslab      0"} {
+		if !strings.Contains(mmmStr, want) {
+			t.Errorf("zdb -e -mmm output missing %q (metaslab layout incomplete).\nOutput:\n%s", want, mmmStr)
+		}
+	}
+
+	// zdb -e -bcc <pool> WITHOUT -AAA: this is the space-accounting gate.
+	// zdb loads every metaslab's space map, replays its ALLOC/FREE
+	// records, and asserts that the bytes reachable by block-pointer
+	// traversal equal the bytes the space maps mark allocated. Before the
+	// writer emitted metaslabs this reported
+	// "block traversal size N != alloc 0 (leaked)" and a space-map
+	// refcount mismatch; now it must report "No leaks (block sum matches
+	// space maps exactly)" and exit 0.
+	saCmd := exec.Command(zdbPath, "-e", "-p", imgDir, "-bcc", compatwPoolName)
+	saOut, saErr := saCmd.CombinedOutput()
+	saStr := string(saOut)
+	if saErr != nil {
+		t.Fatalf("zdb -e -bcc (space accounting, no -AAA) failed: %v\n"+
+			"the writer's metaslab space maps do not reconcile with block\n"+
+			"traversal. Output:\n%s", saErr, saStr)
+	}
+	if strings.Contains(saStr, "leaked") || strings.Contains(saStr, "!= alloc") {
+		t.Errorf("zdb -e -bcc reported leaked / size != alloc — the space\n"+
+			"maps over- or under-count the writer's allocations.\nOutput:\n%s", saStr)
+	}
+	if strings.Contains(saStr, "space map refcount mismatch") {
+		t.Errorf("zdb -e -bcc reported a space map refcount mismatch — the\n"+
+			"spacemap_histogram feature refcount does not match the metaslab\n"+
+			"count.\nOutput:\n%s", saStr)
+	}
+	if !strings.Contains(saStr, "No leaks") {
+		t.Errorf("zdb -e -bcc did not confirm \"No leaks (block sum matches\n"+
+			"space maps exactly)\".\nOutput:\n%s", saStr)
 	}
 }
 

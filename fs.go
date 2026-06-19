@@ -924,6 +924,13 @@ func (fs *zfsFS) commitUberblock() error {
 // initAllocator computes the next free offset by scanning ZPL block pointers.
 func (fs *zfsFS) initAllocator(imageSize int64) {
 	maxOff := int64(fmtInitialNextFree)
+	// Format() places the metaslab array + per-metaslab space-map blocks
+	// immediately past the fixed layout. They are MOS (not ZPL) objects,
+	// so the ZPL scan below never sees them; advance the floor past them
+	// so runtime writes do not clobber the space maps.
+	if end := metaslabRegionEnd(uint64(imageSize)); end > uint64(maxOff) {
+		maxOff = int64(end)
+	}
 	if fs.zplDS != nil {
 		// Quick scan: look at each ZPL object's data BP
 		for i := uint64(1); i < fmtObjArrayObjs; i++ {
