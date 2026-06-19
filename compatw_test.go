@@ -104,11 +104,9 @@ func TestWriteThenZdb(t *testing.T) {
 	// our writer emits?" — and it is unprivileged (no -e / kernel / loop
 	// device needed).
 	//
-	// We deliberately do NOT walk the pool with `zdb -e -p` here: a full
-	// import/MOS traversal additionally needs spec-conformant block-
-	// pointer checksums and metaslab spacemaps, which this minimal
-	// writer does not yet produce (see the package notes / PR). Label
-	// conformance is the committed milestone and this is its gate.
+	// After the label check we additionally walk the pool with `zdb -e`
+	// (see below): the writer now emits spec block-pointer checksums and
+	// the DSL hierarchy needed for a full import + objset traversal.
 	cmd := exec.Command(zdbPath, "-l", imgPath)
 	out, runErr := cmd.CombinedOutput()
 	outStr := string(out)
@@ -148,6 +146,56 @@ func TestWriteThenZdb(t *testing.T) {
 			t.Errorf("zdb -l output missing %q. Full output:\n%s", want, outStr)
 		}
 	}
+
+	// ── Milestone: full pool import + MOS/objset traversal + block-
+	// checksum verification via `zdb -e`. The image file must be named
+	// <poolname>.img inside a directory we point `-p` at, and the pool
+	// must be EXPORTED (which a Format()'d image is). ──────────────────
+	//
+	// zdb -e -d <pool>: opens the pool (spa_load through "LOADED"),
+	// opens the DSL pool, and enumerates every dataset (MOS + ZPL objset
+	// traversal). Exit 0 proves the writer now emits a fully importable
+	// pool: spec vdev labels, conformant block-pointer checksums, the
+	// DSL special-directory hierarchy ($MOS/$FREE/$ORIGIN + origin
+	// snapshot + deadlists + props), and the pool-directory entries
+	// (config / features / free_bpobj / sync_bplist) that spa_load
+	// requires.
+	dCmd := exec.Command(zdbPath, "-e", "-p", imgDir, "-d", compatwPoolName)
+	dOut, dErr := dCmd.CombinedOutput()
+	if dErr != nil {
+		t.Fatalf("zdb -e -d failed on a Format()-produced pool: %v\n"+
+			"The OpenZFS userland could not import + traverse our pool.\n"+
+			"Output:\n%s", dErr, dOut)
+	}
+	dStr := string(dOut)
+	// zdb -d prints one "Dataset <name> [<type>]" line per dataset it
+	// walked; the MOS and the root ZPL dataset must both appear.
+	for _, want := range []string{"Dataset mos [META]", "Dataset " + compatwPoolName + " [ZPL]"} {
+		if !strings.Contains(dStr, want) {
+			t.Errorf("zdb -e -d output missing %q (dataset traversal incomplete).\nOutput:\n%s", want, dStr)
+		}
+	}
+
+	// zdb -e -AAA -bcc <pool>: traverse ALL blocks and verify their
+	// checksums. -AAA lets zdb continue past the space-map leak/claim
+	// asserts (the writer does not yet emit metaslab spacemaps, so block
+	// space-accounting is intentionally absent); the block traversal
+	// itself recomputes and checks every block pointer's fletcher4
+	// checksum. Exit 0 with no "checksum error" is the proof our
+	// on-disk block-pointer checksums match the OpenZFS spec.
+	bccCmd := exec.Command(zdbPath, "-e", "-p", imgDir, "-AAA", "-bcc", compatwPoolName)
+	bccOut, bccErr := bccCmd.CombinedOutput()
+	bccStr := string(bccOut)
+	if bccErr != nil {
+		t.Fatalf("zdb -e -AAA -bcc failed: %v\nblock-checksum traversal did not complete.\nOutput:\n%s", bccErr, bccStr)
+	}
+	if strings.Contains(bccStr, "checksum error") || strings.Contains(bccStr, "bad checksum") {
+		t.Errorf("zdb -e -bcc reported a block checksum error — our\n"+
+			"block-pointer checksums diverge from the OpenZFS spec.\nOutput:\n%s", bccStr)
+	}
+	if !strings.Contains(bccStr, "Traversing all blocks to verify checksums") {
+		t.Errorf("zdb -e -bcc did not reach block traversal.\nOutput:\n%s", bccStr)
+	}
 }
 
 // TestWriteThenInternalReadback validates the writer ↔ reader
@@ -159,19 +207,19 @@ func TestWriteThenZdb(t *testing.T) {
 //
 // Asserts (two phases):
 //
-//   Phase 1 — fresh-format readback:
-//     - Format() returns an open FS that can be closed cleanly.
-//     - Close → fresh Open succeeds (no corruption on sync).
-//     - Uberblock found by the lib's read path has the genesis
-//       txg=1 (= fmtPoolTXG; verifies the writer's claimed initial
-//       txg matches the on-disk bytes).
-//     - Endian is "little" (writer is LE-only).
+//	Phase 1 — fresh-format readback:
+//	  - Format() returns an open FS that can be closed cleanly.
+//	  - Close → fresh Open succeeds (no corruption on sync).
+//	  - Uberblock found by the lib's read path has the genesis
+//	    txg=1 (= fmtPoolTXG; verifies the writer's claimed initial
+//	    txg matches the on-disk bytes).
+//	  - Endian is "little" (writer is LE-only).
 //
-//   Phase 2 — write-cycle readback:
-//     - WriteFile + Close + fresh Open finds the written file.
-//     - Post-write uberblock txg > genesis txg (the lib bumps txg
-//       on writes; this confirms the uberblock ring is being
-//       rotated correctly).
+//	Phase 2 — write-cycle readback:
+//	  - WriteFile + Close + fresh Open finds the written file.
+//	  - Post-write uberblock txg > genesis txg (the lib bumps txg
+//	    on writes; this confirms the uberblock ring is being
+//	    rotated correctly).
 func TestWriteThenInternalReadback(t *testing.T) {
 	// ── Phase 1: fresh-format readback ───────────────────────────
 	imgPath := filepath.Join(t.TempDir(), "roundtrip.img")
@@ -368,25 +416,28 @@ func TestWriteThenLabelSpecConformance(t *testing.T) {
 			if info.PoolGUID != guid {
 				t.Errorf("L%d pool_guid = %#x, want %#x", labelIdx, info.PoolGUID, guid)
 			}
-			if info.Type != "root" {
-				t.Errorf("L%d vdev_tree.type = %q, want %q", labelIdx, info.Type, "root")
+			// For a single file-backed vdev, the label's vdev_tree IS the
+			// top-level (leaf) vdev directly — type "file" (or "disk"),
+			// NOT a synthetic "root" wrapper. This matches real `zpool
+			// create` on a file vdev (verified via `zdb -l` on OpenZFS
+			// 2.3: vdev_tree.type = 'file', guid == top_guid). The importer
+			// synthesises the enclosing root on its own; emitting our own
+			// extra "root" child made OpenZFS report a missing top-level
+			// vdev (EOVERFLOW) and blocked `zdb -e -p` traversal.
+			if info.Type != "file" && info.Type != "disk" {
+				t.Errorf("L%d vdev_tree.type = %q, want a leaf type (file/disk)", labelIdx, info.Type)
 			}
-			if len(info.LeafGUIDs) != 1 {
-				t.Fatalf("L%d expected 1 leaf, got %d", labelIdx, len(info.LeafGUIDs))
+			// A leaf vdev_tree has no children — top_guid identifies it.
+			if len(info.LeafGUIDs) != 0 {
+				t.Errorf("L%d expected leaf vdev_tree (no children), got %d children", labelIdx, len(info.LeafGUIDs))
 			}
-			// The leaf (= top-level) vdev carries its own guid, distinct
+			// The top-level (leaf) vdev carries its own guid, distinct
 			// from the pool guid — exactly as real `zpool create` does.
-			// (OpenZFS would otherwise treat the leaf as a second copy of
-			// the root vdev and report a missing top-level vdev.)
-			if info.LeafGUIDs[0] == 0 {
-				t.Errorf("L%d leaf guid is zero", labelIdx)
+			if info.TopGUID == 0 {
+				t.Errorf("L%d top_guid is zero", labelIdx)
 			}
-			if info.LeafGUIDs[0] == info.PoolGUID {
-				t.Errorf("L%d leaf guid %#x must differ from pool_guid", labelIdx, info.LeafGUIDs[0])
-			}
-			if info.TopGUID != info.LeafGUIDs[0] {
-				t.Errorf("L%d top_guid %#x != leaf guid %#x (single-disk top vdev IS the leaf)",
-					labelIdx, info.TopGUID, info.LeafGUIDs[0])
+			if info.TopGUID == info.PoolGUID {
+				t.Errorf("L%d top_guid %#x must differ from pool_guid", labelIdx, info.TopGUID)
 			}
 			if info.Ashift != 12 {
 				t.Errorf("L%d ashift = %d, want 12", labelIdx, info.Ashift)
@@ -488,12 +539,15 @@ func TestWriteThenUberblockSelfReadback(t *testing.T) {
 					t.Errorf("L%d slot %d endian = %q, want %q",
 						labelIdx, slot, ubInfo.Endian, "little")
 				}
-				// ub_guid_sum is the sum of all leaf vdev guids; for a
-				// single-leaf pool that is the one leaf's guid, which is
-				// distinct from the pool guid (see vdevGUIDFor).
-				wantGUIDSum := vdevGUIDFor(guid)
+				// ub_guid_sum is the sum of EVERY vdev guid in the MOS
+				// config tree: the synthetic root top-level vdev (guid ==
+				// pool_guid) plus the single leaf (vdevGUIDFor(pool_guid)).
+				// OpenZFS recomputes this from the trusted config during
+				// spa_load and rejects the pool if it differs ("uberblock
+				// guid sum doesn't match MOS guid sum").
+				wantGUIDSum := guid + vdevGUIDFor(guid)
 				if ubInfo.GUIDSum != wantGUIDSum {
-					t.Errorf("L%d slot %d guid_sum = %#x, want %#x (single-leaf = leaf vdev guid)",
+					t.Errorf("L%d slot %d guid_sum = %#x, want %#x (root guid + leaf guid)",
 						labelIdx, slot, ubInfo.GUIDSum, wantGUIDSum)
 				}
 				// Verify the embedded magic explicitly: an extra
