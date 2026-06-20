@@ -811,7 +811,9 @@ func (fs *zfsFS) writefileImpl(path string, data []byte, perm os.FileMode) error
 		if _, err := fs.f.WriteAt(block, fs.partOffset+off); err != nil {
 			return fmt.Errorf("zfs: writefileImpl: write data block: %w", err)
 		}
-		dataBPs[i] = makeBlkptrCksum(off, bsz, bsz, zcompressOff, dmotPlainFileContents, 0, fs.curTxg, zioChecksumOff)
+		dbp := makeBlkptrCksum(off, bsz, bsz, zcompressOff, dmotPlainFileContents, 0, fs.curTxg, zioChecksumFletch4)
+		setBPChecksum(&dbp, block)
+		dataBPs[i] = dbp
 	}
 
 	saBonus := writeSABonus(&saAttrs{
@@ -902,8 +904,10 @@ func (fs *zfsFS) mkdirImpl(path string, perm os.FileMode) error {
 	saBonus := writeSABonus(attrs, fs.zplDS.saLayout)
 	dirDN := newDnode(dmotDirContents, 1, dmotSA, uint16(len(saBonus)))
 	dirDN.datablkszsec = uint16(poolBlockSize / 512)
-	dirDN.setBlkptrAt(0, makeBlkptrCksum(zapOff, poolBlockSize, poolBlockSize,
-		zcompressOff, dmotDirContents, 0, fs.curTxg, zioChecksumOff))
+	zbp := makeBlkptrCksum(zapOff, poolBlockSize, poolBlockSize,
+		zcompressOff, dmotDirContents, 0, fs.curTxg, zioChecksumFletch4)
+	setBPChecksum(&zbp, emptyZAP)
+	dirDN.setBlkptrAt(0, zbp)
 	copy(dirDN.raw[dnodeHdrSize+blkptrSize:], saBonus)
 	dirDN.encode()
 	if err := fs.writeDnode(objNum, dirDN); err != nil {
