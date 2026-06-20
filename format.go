@@ -48,14 +48,7 @@ const (
 	fmtMasterNodeZAPOff = fmtZPLObjArrayOff + 16*1024  // 0x08B000
 	fmtUnlinkedZAPOff   = fmtMasterNodeZAPOff + 4*1024 // 0x08C000
 	fmtRootDirZAPOff    = fmtUnlinkedZAPOff + 4*1024   // 0x08D000
-	// SA infrastructure data blocks (ZPL objects 4..6). The kernel reads
-	// these at mount to interpret each znode's SA bonus. See safat.go.
-	fmtSAMasterZAPOff   = fmtRootDirZAPOff + 4*1024    // SA master node microZAP (SA_ATTRS)
-	fmtSARegistryZAPOff = fmtSAMasterZAPOff + 4*1024   // attribute REGISTRY microZAP
-	fmtSALayoutsHdrOff  = fmtSARegistryZAPOff + 4*1024 // LAYOUTS fat-ZAP header block (blkid 0)
-	fmtSALayoutsLeafOff = fmtSALayoutsHdrOff + 4*1024  // LAYOUTS fat-ZAP leaf block (blkid 1)
-	fmtSALayoutsIndOff  = fmtSALayoutsLeafOff + 4*1024 // LAYOUTS L1 indirect block (2 BPs)
-	fmtConfigOff        = fmtSALayoutsIndOff + 4*1024  // (packed MOS config nvlist)
+	fmtConfigOff        = fmtRootDirZAPOff + 4*1024    // 0x08E000 (packed MOS config nvlist)
 	fmtFeatReadZAPOff   = fmtConfigOff + 16*1024       // 0x092000 (features_for_read ZAP)
 	fmtFeatWriteZAPOff  = fmtFeatReadZAPOff + 4*1024   // 0x093000 (features_for_write ZAP)
 	fmtFeatDescZAPOff   = fmtFeatWriteZAPOff + 4*1024  // 0x094000 (feature_descriptions ZAP)
@@ -160,16 +153,13 @@ const (
 	// highest fmtMOS* object number above.
 	fmtMOSObjCount = 29
 	// fmtZPLObjCount is the number of allocated ZPL objects (master node,
-	// unlinked set, root dir, SA master/registry/layouts = 1..6).
-	fmtZPLObjCount = 6
+	// unlinked set, root dir = 1..3).
+	fmtZPLObjCount = 3
 
 	// ZPL object numbers
 	fmtZPLMasterNode = 1
 	fmtZPLUnlinked   = 2
 	fmtZPLRootDir    = 3
-	fmtZPLSAMaster   = 4 // DMU_OT_SA_MASTER_NODE (SA_ATTRS): REGISTRY+LAYOUTS
-	fmtZPLSARegistry = 5 // DMU_OT_SA_ATTR_REGISTRATION
-	fmtZPLSALayouts  = 6 // DMU_OT_SA_ATTR_LAYOUTS (fat-ZAP, uint16 arrays)
 
 	fmtPoolVersion = 5000      // pool feature flags version
 	fmtZPLVersion  = uint64(5) // ZPL version
@@ -337,18 +327,10 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// leave it empty rather than emit a malformed microZAP uint64 value.
 	featDescZAP := newMicroZAPBlock(poolBlockSize)
 
-	// ZPL master node ZAP. The kernel's zfs_init_fs() reads these at mount:
-	//   "VERSION"      → ZPL version (5)
-	//   "ROOT"         → root directory object
-	//   "SA_ATTRS"     → SA master node object (REGISTRY + LAYOUTS); required
-	//                    so sa_setup() can resolve each znode's layout.
-	//   "DELETE_QUEUE" → unlinked set object (tolerated-missing, but real
-	//                    pools always carry it; we point it at the unlinked ZAP).
+	// ZPL master node ZAP: "ROOT"→3, "VERSION"→5
 	masterNodeZAP := newMicroZAPBlock(poolBlockSize)
 	mzapInsert(masterNodeZAP, zplKeyRoot, fmtZPLRootDir)
 	mzapInsert(masterNodeZAP, zplKeyVersion, fmtZPLVersion)
-	mzapInsert(masterNodeZAP, zplKeySAAttrs, fmtZPLSAMaster)
-	mzapInsert(masterNodeZAP, zplKeyDeleteQueue, fmtZPLUnlinked)
 
 	// Unlinked set ZAP: empty
 	unlinkedZAP := newMicroZAPBlock(poolBlockSize)
@@ -389,7 +371,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 		ctime:  [2]uint64{now, 0},
 		crtime: [2]uint64{now, 0},
 	}
-	layout := saZnodeLayout()
+	layout := defaultSALayout()
 	saBonus := writeSABonus(rootSAAttrs, layout)
 	zplRootDN := newDnode(dmotDirContents, 1, dmotSA, uint16(len(saBonus)))
 	zplRootDN.datablkszsec = uint16(poolBlockSize / 512)
@@ -399,70 +381,6 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	copy(zplRootDN.raw[bonusStart:], saBonus)
 	zplRootDN.encode()
 	copy(zplObjArray[fmtZPLRootDir*dnodeMinSize:], zplRootDN.raw)
-
-	// ── Objects 4/5/6: SA infrastructure (REGISTRY + LAYOUTS + master) ──
-	// These let the OpenZFS kernel resolve each znode's SA layout at mount.
-	// See safat.go for the on-disk encoding details.
-	//
-	// REGISTRY (obj 5): microZAP, attr-name → ATTR_ENCODE(num,len,bswap).
-	saRegistryZAP := newMicroZAPBlock(poolBlockSize)
-	for _, a := range zfsAttrTable {
-		mzapInsert(saRegistryZAP, a.name, attrEncode(a.attr, a.length, a.bswap))
-	}
-	saRegistryDN := newDnode(dmotSAAttrRegistration, 1, dmotNone, 0)
-	saRegistryDN.datablkszsec = uint16(poolBlockSize / 512)
-	saRegistryDN.setBlkptrAt(0, makeBP(fmtSARegistryZAPOff, poolBlockSize, poolBlockSize, dmotSAAttrRegistration, saRegistryZAP))
-	saRegistryDN.encode()
-	copy(zplObjArray[fmtZPLSARegistry*dnodeMinSize:], saRegistryDN.raw)
-
-	// LAYOUTS (obj 6): fat-ZAP, "N" → uint16 array of attribute numbers.
-	// We register layout saZnodeLayoutNum = our znode packing order.
-	layoutAttrs := saZnodeLayout()
-	layoutVals := make([]uint64, len(layoutAttrs))
-	for i, a := range layoutAttrs {
-		layoutVals[i] = uint64(a)
-	}
-	saLayoutsHdr, saLayoutsLeaf, errLay := buildFatZAPObject(poolBlockSize, mzapDefaultSalt, []fatZAPEntry{
-		{name: fmt.Sprintf("%d", saZnodeLayoutNum), intLen: 2, values: layoutVals},
-	})
-	if errLay != nil {
-		return nil, fmt.Errorf("zfs: build LAYOUTS fat-zap: %w", errLay)
-	}
-	// The fat-ZAP object spans two logical 4 KiB blocks (header=blkid 0,
-	// leaf=blkid 1) reached through one L1 indirect block holding both BPs.
-	saLayHdrBP := makeBP(fmtSALayoutsHdrOff, poolBlockSize, poolBlockSize, dmotSAAttrLayouts, saLayoutsHdr)
-	saLayLeafBP := makeBP(fmtSALayoutsLeafOff, poolBlockSize, poolBlockSize, dmotSAAttrLayouts, saLayoutsLeaf)
-	saLayIndBlock := make([]byte, poolBlockSize)
-	encodeBlkptr(saLayHdrBP, saLayIndBlock[0*blkptrSize:1*blkptrSize])
-	encodeBlkptr(saLayLeafBP, saLayIndBlock[1*blkptrSize:2*blkptrSize])
-	// L1 indirect BP: level 1, logical/physical size = one indirect block,
-	// fletcher4 over the indirect block bytes, datatype = SA layouts.
-	saLayIndBP := makeBlkptrCksum(fmtSALayoutsIndOff, poolBlockSize, poolBlockSize,
-		zcompressOff, dmotSAAttrLayouts, 1, fmtPoolTXG, zioChecksumFletch4)
-	// blk_fill of an indirect BP is the number of non-hole block pointers
-	// reachable below it. The L1 indirect block holds two L0 data BPs
-	// (header + leaf), so fill = 2; zdb's traversal verifies child fills
-	// sum to the parent's and reports EBADE on a mismatch.
-	saLayIndBP.fill = 2
-	setBPChecksum(&saLayIndBP, saLayIndBlock)
-	saLayoutsDN := newDnode(dmotSAAttrLayouts, 1, dmotNone, 0)
-	saLayoutsDN.datablkszsec = uint16(poolBlockSize / 512)
-	saLayoutsDN.indblkshift = 12 // 4 KiB indirect blocks
-	saLayoutsDN.nlevels = 2
-	saLayoutsDN.maxblkid = 1 // two data blocks: header + leaf
-	saLayoutsDN.setBlkptrAt(0, saLayIndBP)
-	saLayoutsDN.encode()
-	copy(zplObjArray[fmtZPLSALayouts*dnodeMinSize:], saLayoutsDN.raw)
-
-	// SA master node (obj 4): microZAP, "REGISTRY"→5, "LAYOUTS"→6.
-	saMasterZAP := newMicroZAPBlock(poolBlockSize)
-	mzapInsert(saMasterZAP, saKeyRegistry, fmtZPLSARegistry)
-	mzapInsert(saMasterZAP, saKeyLayouts, fmtZPLSALayouts)
-	saMasterDN := newDnode(dmotSAMasterNode, 1, dmotNone, 0)
-	saMasterDN.datablkszsec = uint16(poolBlockSize / 512)
-	saMasterDN.setBlkptrAt(0, makeBP(fmtSAMasterZAPOff, poolBlockSize, poolBlockSize, dmotSAMasterNode, saMasterZAP))
-	saMasterDN.encode()
-	copy(zplObjArray[fmtZPLSAMaster*dnodeMinSize:], saMasterDN.raw)
 
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	// 3. Build ZPL objset block (4 KiB)
@@ -764,11 +682,6 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 		{fmtMasterNodeZAPOff, masterNodeZAP},
 		{fmtUnlinkedZAPOff, unlinkedZAP},
 		{fmtRootDirZAPOff, rootDirZAP},
-		{fmtSAMasterZAPOff, saMasterZAP},
-		{fmtSARegistryZAPOff, saRegistryZAP},
-		{fmtSALayoutsHdrOff, saLayoutsHdr},
-		{fmtSALayoutsLeafOff, saLayoutsLeaf},
-		{fmtSALayoutsIndOff, saLayIndBlock},
 		{fmtConfigOff, configBlock},
 		{fmtFeatReadZAPOff, featReadZAP},
 		{fmtFeatWriteZAPOff, featWriteZAP},
