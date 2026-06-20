@@ -165,6 +165,18 @@ const (
 	fmtZPLVersion  = uint64(5) // ZPL version
 	fmtPoolTXG     = uint64(1) // genesis transaction group
 
+	// fmtFeatSpacemapHistogram is the GUID of the spacemap_histogram
+	// feature. Once Format() emits a metaslab space_map with a
+	// space_map_phys_t bonus, zdb's verify_spacemap_refcounts() expects the
+	// feature refcount for this GUID to equal the number of such space maps
+	// (get_metaslab_refcount counts every metaslab whose space map has a
+	// sizeof(space_map_phys_t) bonus). We emit exactly one space map
+	// (metaslab 0), so the feature is enabled in the label/MOS-config
+	// "features_for_read" nvlist and — because spacemap_histogram is a
+	// READONLY_COMPAT feature — its refcount (=1) is stored in the
+	// features_for_WRITE MOS ZAP (see featWriteZAP below).
+	fmtFeatSpacemapHistogram = "com.delphix:spacemap_histogram"
+
 	// fmtVdevMetaslabArray is the MOS object id recorded in the leaf
 	// vdev's metaslab_array nvpair. It points at the DMU_OT_OBJECT_ARRAY
 	// (object 28) whose data block lists the per-metaslab space_map object
@@ -298,10 +310,21 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	rootDLZAP := newMicroZAPBlock(poolBlockSize)
 	rootSnapNamesZAP := newMicroZAPBlock(poolBlockSize)
 
-	// features_for_read / features_for_write / feature_descriptions ZAPs
-	// (all empty on a pool with no feature flags enabled).
+	// features_for_read / features_for_write / feature_descriptions ZAPs.
+	//
+	// spacemap_histogram is a READONLY_COMPAT feature, so OpenZFS stores
+	// its refcount in the features_for_WRITE ZAP (spa_feat_for_write_obj),
+	// NOT features_for_read — feature_get_refcount_from_disk() picks the
+	// ZAP by the ZFEATURE_FLAG_READONLY_COMPAT flag. The matching "enabled"
+	// boolean still goes in the label's "features_for_read" nvlist (labels
+	// only carry that one feature nvlist). The refcount equals the number
+	// of metaslab space_maps with a space_map_phys_t bonus (1).
 	featReadZAP := newMicroZAPBlock(poolBlockSize)
 	featWriteZAP := newMicroZAPBlock(poolBlockSize)
+	mzapInsert(featWriteZAP, fmtFeatSpacemapHistogram, 1)
+	// feature_descriptions maps GUID → human string (a fat-ZAP value);
+	// it is advisory only (zdb's refcount audit never reads it), so we
+	// leave it empty rather than emit a malformed microZAP uint64 value.
 	featDescZAP := newMicroZAPBlock(poolBlockSize)
 
 	// ZPL master node ZAP: "ROOT"→3, "VERSION"→5
@@ -416,8 +439,20 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// $ORIGIN feature present, dsl_dataset_hold_obj asserts every
 	// non-origin dataset descends from a snapshot. Real `zpool create`
 	// makes the root dataset a clone of the origin snapshot (obj 16).
-	binary.LittleEndian.PutUint64(dslDSBonus[dsPrevSnapObj:], fmtMOSOriginSnapObj)     // ds_prev_snap_obj
-	binary.LittleEndian.PutUint64(dslDSBonus[dsPrevSnapTxg:], fmtPoolTXG)              // ds_prev_snap_txg
+	binary.LittleEndian.PutUint64(dslDSBonus[dsPrevSnapObj:], fmtMOSOriginSnapObj) // ds_prev_snap_obj
+	// ds_prev_snap_txg must be STRICTLY less than the birth txg of every
+	// block this live dataset owns, or `zdb -bcc` block traversal treats
+	// those blocks as belonging to the prev snapshot and skips them
+	// (traverse_dataset visits only bp->blk_birth > td_min_txg, and
+	// td_min_txg = ds_prev_snap_txg for a head dataset). Our genesis pool
+	// births every block at fmtPoolTXG (1), so prev_snap_txg must be 0 —
+	// the origin snapshot conceptually predates the very first txg. (Real
+	// `zpool create` instead births the root dataset's objset a few txgs
+	// after the txg-1 origin snapshot; we have only one txg, so we lower
+	// the watermark instead of raising the births.) The prev_snap_obj link
+	// to the origin snapshot is unchanged, so dsl_dataset_hold_obj's
+	// "every non-origin dataset descends from a snapshot" invariant holds.
+	binary.LittleEndian.PutUint64(dslDSBonus[dsPrevSnapTxg:], 0) // ds_prev_snap_txg
 	binary.LittleEndian.PutUint64(dslDSBonus[dsSnapnamesZAPObj:], fmtMOSRootSnapNames) // ds_snapnames_zapobj
 	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTime:], now)                    // ds_creation_time
 	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTxg:], fmtPoolTXG)              // ds_creation_txg
@@ -857,7 +892,14 @@ func buildLabelNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes, ts
 		// label with "invalid label: 'features_for_read' missing" if this
 		// nvlist is absent. We enable no read-incompatible features, so an
 		// empty list is correct and lets the importer proceed.
-		nvNVList("features_for_read", nvList{}),
+		nvNVList("features_for_read", nvList{
+			// spacemap_histogram is active because the writer emits a
+			// metaslab space_map with a space_map_phys_t bonus; zdb's
+			// space-map refcount audit requires the feature be enabled
+			// here AND counted in the features_for_write MOS ZAP
+			// (spacemap_histogram is READONLY_COMPAT; see featWriteZAP).
+			nvBoolean(fmtFeatSpacemapHistogram),
+		}),
 	}
 	return encodeNVListFull(config)
 }
@@ -1029,7 +1071,14 @@ func buildMOSConfigNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes
 		nvUint64("errata", 0),
 		nvUint64("vdev_children", 1),
 		nvNVList("vdev_tree", root),
-		nvNVList("features_for_read", nvList{}),
+		nvNVList("features_for_read", nvList{
+			// spacemap_histogram is active because the writer emits a
+			// metaslab space_map with a space_map_phys_t bonus; zdb's
+			// space-map refcount audit requires the feature be enabled
+			// here AND counted in the features_for_write MOS ZAP
+			// (spacemap_histogram is READONLY_COMPAT; see featWriteZAP).
+			nvBoolean(fmtFeatSpacemapHistogram),
+		}),
 	}
 	return encodeNVListFull(config)
 }

@@ -176,25 +176,62 @@ func TestWriteThenZdb(t *testing.T) {
 		}
 	}
 
-	// zdb -e -AAA -bcc <pool>: traverse ALL blocks and verify their
-	// checksums. -AAA lets zdb continue past the space-map leak/claim
-	// asserts (the writer does not yet emit metaslab spacemaps, so block
-	// space-accounting is intentionally absent); the block traversal
-	// itself recomputes and checks every block pointer's fletcher4
-	// checksum. Exit 0 with no "checksum error" is the proof our
-	// on-disk block-pointer checksums match the OpenZFS spec.
-	bccCmd := exec.Command(zdbPath, "-e", "-p", imgDir, "-AAA", "-bcc", compatwPoolName)
+	// zdb -e -bcc <pool> (WITHOUT -AAA): the SPACE-ACCOUNTING milestone.
+	//
+	// -bcc traverses every block, recomputing and verifying each block
+	// pointer's fletcher4 checksum, AND (without -AAA) cross-checks the
+	// total allocated bytes that traversal finds against what the vdev's
+	// metaslab space_maps claim is allocated. A clean exit-0 run proves
+	// two things at once:
+	//
+	//   1. Block-pointer checksums match the OpenZFS spec (no "checksum
+	//      error" / "bad checksum").
+	//   2. The writer's metaslab space_map accounting BALANCES: zdb prints
+	//      "No leaks (block sum matches space maps exactly)" and does not
+	//      print "leaked" / "size != alloc". This is the metaslab_array +
+	//      space_map milestone — before it, plain `zdb -e -bcc` asserted
+	//      "block traversal size N != alloc 0 (leaked)".
+	//
+	// We also require no "space map refcount mismatch": the metaslab
+	// space_map's space_map_phys_t bonus makes zdb count one space map for
+	// the spacemap_histogram feature, so Format() enables that feature and
+	// records its refcount (=1) in the features_for_write ZAP.
+	//
+	// -AAA is deliberately NOT passed: it would mask exactly the leak /
+	// space-accounting asserts this gate exists to catch.
+	bccCmd := exec.Command(zdbPath, "-e", "-p", imgDir, "-bcc", compatwPoolName)
 	bccOut, bccErr := bccCmd.CombinedOutput()
 	bccStr := string(bccOut)
 	if bccErr != nil {
-		t.Fatalf("zdb -e -AAA -bcc failed: %v\nblock-checksum traversal did not complete.\nOutput:\n%s", bccErr, bccStr)
+		t.Fatalf("zdb -e -bcc (no -AAA) failed: %v\n"+
+			"The space-accounting / block-checksum traversal did not\n"+
+			"complete cleanly. This is the metaslab space_map milestone\n"+
+			"gate. Output:\n%s", bccErr, bccStr)
 	}
 	if strings.Contains(bccStr, "checksum error") || strings.Contains(bccStr, "bad checksum") {
 		t.Errorf("zdb -e -bcc reported a block checksum error — our\n"+
 			"block-pointer checksums diverge from the OpenZFS spec.\nOutput:\n%s", bccStr)
 	}
-	if !strings.Contains(bccStr, "Traversing all blocks to verify checksums") {
+	if !strings.Contains(bccStr, "Traversing all blocks to verify") {
 		t.Errorf("zdb -e -bcc did not reach block traversal.\nOutput:\n%s", bccStr)
+	}
+	// Space-accounting leak gate: traversal byte-sum must equal the
+	// space_maps' claimed allocation. Match the actual diagnostic
+	// ("leaked space:" / "size N != alloc M (leaked ...)") rather than the
+	// bare word "leaked", which also appears in zdb's clean-run banner
+	// ("...verify nothing leaked ...").
+	if strings.Contains(bccStr, "leaked space:") || strings.Contains(bccStr, "!= alloc") {
+		t.Errorf("zdb -e -bcc reported a space-map LEAK — the metaslab\n"+
+			"space_map accounting does not balance against block traversal.\nOutput:\n%s", bccStr)
+	}
+	if strings.Contains(bccStr, "space map refcount mismatch") {
+		t.Errorf("zdb -e -bcc reported a space-map REFCOUNT mismatch — the\n"+
+			"spacemap_histogram feature refcount does not match the number\n"+
+			"of metaslab space_maps Format() emitted.\nOutput:\n%s", bccStr)
+	}
+	if !strings.Contains(bccStr, "No leaks (block sum matches space maps exactly)") {
+		t.Errorf("zdb -e -bcc did not confirm clean space accounting\n"+
+			"(expected \"No leaks (block sum matches space maps exactly)\").\nOutput:\n%s", bccStr)
 	}
 }
 
