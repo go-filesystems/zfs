@@ -1,6 +1,6 @@
 # zfs
 
-![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)
+![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)
 ![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)
 
 A read/write ZFS implementation for bare disk images, supporting a single
@@ -13,12 +13,10 @@ create, inspect, and modify ZFS filesystems programmatically.
 |---|---:|---|
 | Open / Close | ✅ | Opens single-pool images |
 | Format | ✅ | Creates new pool images via `Format` |
-| Grow / Resize | ✅ | Grow (`filesystem.Resizer`); shrink unsupported |
 | ReadFile / WriteFile | ✅ | Basic file I/O supported (ZPL dataset) |
 | MkDir / Delete / Rename | ✅ | Directory operations supported |
 | Snapshots / Clones | ⚠️ No | Not implemented (test-oriented subset) |
-| Compression (read) | ✅ | LZ4, ZLE, LZJB decompression on data blocks |
-| Checksums | ⚠️ No | Not verified on data blocks |
+| Compression / Checksums | ⚠️ No | Not implemented on data blocks |
 
 
 ## Module
@@ -111,9 +109,7 @@ Only **micro-ZAP** is supported for directory writes. Directory entries use a
 ## Limitations
 
 - Single vdev, single pool, single dataset
-- Compressed data blocks are read transparently (LZ4, ZLE, LZJB); writes
-  always emit uncompressed blocks. GZIP/ZSTD reads are not supported. Data-block
-  checksums are not verified.
+- No compression or checksums on data blocks
 - No snapshots, clones, or ACLs
 - Maximum 28 objects (files + directories) per pool image
 - Directory names limited to 49 bytes
