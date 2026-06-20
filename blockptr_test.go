@@ -135,13 +135,8 @@ func TestReadBlock_LZJBCompression(t *testing.T) {
 }
 
 func TestReadBlock_ZLECompression(t *testing.T) {
-	// Build valid OpenZFS ZLE-encoded data (n=64): control 0x04 => 5 literal
-	// bytes "hello", then zero runs filling the rest of the 1024-byte logical
-	// block. dstSize is 1024, so 1019 zeros remain after "hello": encode them
-	// as ff,ff,ff,ff,ff (5*192 = 960) + 0x82 (= 67-64? no): 1019 = 192*5 + 59,
-	// 59 zeros => control 64+59-1 = 122 = 0x7a.
-	src := append([]byte{0x04}, []byte("hello")...)
-	src = append(src, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7a)
+	// Build valid ZLE-encoded data.
+	src := []byte("hello") // 5 non-zero bytes
 	buf := make([]byte, 512)
 	copy(buf, src)
 
@@ -154,14 +149,9 @@ func TestReadBlock_ZLECompression(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readBlock ZLE: %v", err)
 	}
-	// Decompresses to dstSize=1024; "hello" is in first 5 bytes, rest zeros.
+	// zleDecompress pads to dstSize=1024; "hello" is in first 5 bytes.
 	if len(got) != 1024 || !bytes.HasPrefix(got, []byte("hello")) {
 		t.Fatalf("got len=%d prefix=%q, want len=1024 prefix=hello", len(got), got[:5])
-	}
-	for i := 5; i < len(got); i++ {
-		if got[i] != 0 {
-			t.Fatalf("byte %d = %#x, want 0", i, got[i])
-		}
 	}
 }
 

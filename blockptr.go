@@ -259,17 +259,13 @@ func readBlock(r io.ReaderAt, partOff int64, bp blkptr) ([]byte, error) {
 		return raw, nil
 	}
 
-	switch {
-	case comp == zcompressLZ4:
+	switch comp {
+	case zcompressLZ4:
 		return lz4Decompress(raw, int(lsize))
-	case comp == zcompressLZJB:
+	case zcompressLZJB:
 		return lzjbDecompress(raw, int(lsize))
-	case comp == zcompressZLE:
+	case zcompressZLE:
 		return zleDecompress(raw, int(lsize))
-	case comp >= zcompressGZIP1 && comp <= zcompressGZIP9:
-		return gzipDecompress(raw, int(lsize))
-	case comp == zcompressZSTD:
-		return zstdDecompress(raw, int(lsize))
 	default:
 		return nil, fmt.Errorf("zfs: unsupported compression %d", comp)
 	}
@@ -352,12 +348,6 @@ func readEmbedded(bp blkptr) ([]byte, error) {
 	case zcompressZLE:
 		return zleDecompress(compressed, lsize)
 	default:
-		if comp >= zcompressGZIP1 && comp <= zcompressGZIP9 {
-			return gzipDecompress(compressed, lsize)
-		}
-		if comp == zcompressZSTD {
-			return zstdDecompress(compressed, lsize)
-		}
 		return nil, fmt.Errorf("zfs: embedded BP unsupported compress %d", comp)
 	}
 }
