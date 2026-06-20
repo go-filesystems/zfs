@@ -82,6 +82,8 @@ var saAttrSize = map[uint16]int{
 	zplFlags:   8,
 	zplUID:     8,
 	zplGID:     8,
+	zplPad:     32, // ZPL_PAD: 4 × uint64
+	zplDACLCount: 8, // ZPL_DACL_COUNT
 	zplSymlink: 0, // variable
 }
 
@@ -219,9 +221,16 @@ func parseSABonus(buf []byte, layout []uint16) (*saAttrs, error) {
 		return nil, fmt.Errorf("zfs: SA: bad magic 0x%08X", magic)
 	}
 	layoutInfo := le.Uint16(buf[4:6])
-	hdrSize := int(layoutInfo >> 10) // number of uint16 var-size lengths
-	// Skip SA header: 4 (magic) + 2 (layout_info) + hdrSize*2 (lengths)
-	dataStart := 4 + 2 + hdrSize*2
+	// SA_HDR_SIZE(hdr) = (bits 10..15 of sa_layout_info) * 8 — the byte
+	// offset at which attribute data begins (sys/sa_impl.h). The header is
+	// magic(4) + layout_info(2) + optional uint16 var-size lengths, all
+	// rounded up to an 8-byte multiple.
+	dataStart := int(layoutInfo>>10) * 8
+	if dataStart < 6 {
+		// Legacy/zero header (e.g. older Format() output): fall back to the
+		// minimal 8-byte header so reads stay backward-compatible.
+		dataStart = 8
+	}
 	if dataStart > len(buf) {
 		dataStart = len(buf)
 	}
@@ -282,10 +291,17 @@ func parseSABonus(buf []byte, layout []uint16) (*saAttrs, error) {
 // Returns the SA bonus buffer (sa header + packed attrs).
 func writeSABonus(attrs *saAttrs, layout []uint16) []byte {
 	le := binary.LittleEndian
-	// No variable-size attributes → hdrSize = 0
-	// Header: 4 (magic) + 2 (layout_info) = 6 bytes, round to 8
-	const hdrSize = 0
-	headerBytes := 4 + 2 // magic + layout_info (hdrSize=0 → no length entries)
+	// sa_hdr_phys_t: sa_magic(4) + sa_layout_info(2), then attribute data
+	// begins at SA_HDR_SIZE bytes. With no variable-length attributes the
+	// header is the minimum 8 bytes (one hdrsz unit; SA_HDR_SIZE = unit*8),
+	// so the layout-info hdrsz field = 1 and data starts at offset 8.
+	//
+	// sa_layout_info packing (SA_HDR_LAYOUT_INFO_ENCODE): bits 0..9 = layout
+	// number, bits 10..15 = hdrsz units. The on-disk layout number MUST be
+	// saZnodeLayoutNum (>= 2): SA_LAYOUT_NUM remaps 0→1 and 1 is the kernel's
+	// empty dummy layout, so neither can describe our packing.
+	const headerBytes = 8
+	const hdrSizeUnits = headerBytes / 8 // = 1
 
 	// Calculate data size
 	dataSize := 0
@@ -297,7 +313,7 @@ func writeSABonus(attrs *saAttrs, layout []uint16) []byte {
 
 	buf := make([]byte, headerBytes+dataSize)
 	le.PutUint32(buf[0:4], saMagic)
-	layoutInfo := uint16(hdrSize << 10) // layout index 0
+	layoutInfo := uint16(saZnodeLayoutNum&0x3FF) | uint16(hdrSizeUnits<<10)
 	le.PutUint16(buf[4:6], layoutInfo)
 
 	off := headerBytes
