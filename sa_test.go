@@ -288,10 +288,8 @@ func TestWriteSABonus_VarSizeAttr(t *testing.T) {
 	// Layout with zplSymlink (sz=0) → !ok||sz==0 → continue (not written to buffer).
 	layout := []uint16{zplMode, zplSymlink, zplSize}
 	bonus := writeSABonus(&saAttrs{mode: 0o0644, size: 10}, layout)
-	// Only mode(8) and size(8) written → header(8)+16 = 24 bytes. The SA
-	// header is the spec-minimum 8 bytes (sa_magic + sa_layout_info, padded
-	// to one 8-byte SA_HDR_SIZE unit); variable-size attrs are not packed.
-	const wantLen = 24
+	// Only mode(8) and size(8) written → header(6)+16 = 22 bytes.
+	const wantLen = 22
 	if len(bonus) != wantLen {
 		t.Errorf("len(bonus) = %d, want %d", len(bonus), wantLen)
 	}

@@ -679,11 +679,7 @@ func (fs *zfsFS) Rename(oldPath, newPath string) error {
 
 // allocObjectNum scans the ZPL object array to find a free slot (zeroed dnode).
 func (fs *zfsFS) allocObjectNum() (uint64, error) {
-	// Objects 1..fmtZPLObjCount are reserved by Format() (master node,
-	// unlinked set, root dir, SA master/registry/layouts). User files start
-	// at the first slot after them; the dmotNone check below also skips any
-	// already-allocated slot, so a low start bound is safe either way.
-	for i := uint64(fmtZPLObjCount + 1); i < fmtObjArrayObjs; i++ {
+	for i := uint64(4); i < fmtObjArrayObjs; i++ {
 		dn, err := fs.zplDS.zplOS.readObject(i)
 		if err != nil {
 			continue
