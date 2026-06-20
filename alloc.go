@@ -160,6 +160,52 @@ func (a *allocator) freeListBytes() int64 {
 	return total
 }
 
+// allocatedExtents returns the set of currently-allocated byte extents in
+// [startOff, nextFree), expressed as sorted, coalesced (off, size) runs. It
+// is exactly [startOff, nextFree) minus every extent parked on the free list:
+//
+//   - Every block live on disk was either written by Format (which never
+//     frees, so it is wholly inside [startOff, fmtInitialNextFree)) or handed
+//     out by the bump pointer and not since freed.
+//   - A freed-and-not-reused extent sits on the free list and is a hole.
+//   - A reused extent was popped off the free list, so it is no longer there.
+//
+// So this set equals what `zdb -bcc` block traversal finds reachable from the
+// rootbp, which is what the metaslab space_map must claim for the leak audit
+// (size == alloc) to pass. Offsets are data-area-relative (the same units
+// metaslab space maps and DVAs use).
+func (a *allocator) allocatedExtents(startOff int64) []freeExtent {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Collect and sort the holes (free-list extents) within the live span.
+	var holes []freeExtent
+	for _, extents := range a.freeBySize {
+		for _, e := range extents {
+			if e.off >= startOff && e.off < a.nextFree {
+				holes = append(holes, e)
+			}
+		}
+	}
+	sort.Slice(holes, func(i, j int) bool { return holes[i].off < holes[j].off })
+
+	// Subtract the holes from [startOff, nextFree).
+	var out []freeExtent
+	cur := startOff
+	for _, h := range holes {
+		if h.off > cur {
+			out = append(out, freeExtent{off: cur, size: h.off - cur})
+		}
+		if h.off+h.size > cur {
+			cur = h.off + h.size
+		}
+	}
+	if cur < a.nextFree {
+		out = append(out, freeExtent{off: cur, size: a.nextFree - cur})
+	}
+	return out
+}
+
 // bestFitSize returns the smallest free-list bucket size that is
 // strictly greater than need and has at least one extent available.
 // Caller must hold a.mu.

@@ -130,10 +130,11 @@ const (
 
 // zplDataset holds the resolved ZPL layer for a dataset.
 type zplDataset struct {
-	mos        *objset  // MOS object set
-	zplOS      *objset  // ZPL object set
-	rootObjNum uint64   // root directory object number in zplOS
-	saLayout   []uint16 // SA attribute layout to use
+	mos          *objset  // MOS object set
+	zplOS        *objset  // ZPL object set
+	rootObjNum   uint64   // root directory object number in zplOS
+	headDSObjNum uint64   // MOS object number of the head DSL dataset (holds ds_bp → ZPL objset)
+	saLayout     []uint16 // SA attribute layout to use
 }
 
 // openRootDataset navigates from the MOS to the root ZPL dataset.
@@ -276,10 +277,11 @@ func openNamedDataset(r io.ReaderAt, partOff int64, rootBP blkptr, childPath str
 	saLayout := defaultSALayout()
 
 	return &zplDataset{
-		mos:        mos,
-		zplOS:      zplOS,
-		rootObjNum: rootObjNum,
-		saLayout:   saLayout,
+		mos:          mos,
+		zplOS:        zplOS,
+		rootObjNum:   rootObjNum,
+		headDSObjNum: headDatasetObjNum,
+		saLayout:     saLayout,
 	}, nil
 }
 
