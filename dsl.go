@@ -121,13 +121,8 @@ const (
 	dmuPoolSyncBpobj = "sync_bplist"
 
 	// ZPL master node keys
-	zplKeyRoot        = "ROOT"
-	zplKeyVersion     = "VERSION"
-	zplKeySAAttrs     = "SA_ATTRS"
-	zplKeyDeleteQueue = "DELETE_QUEUE"
-	// SA master node sub-keys (module/zfs/sa.c).
-	saKeyRegistry = "REGISTRY"
-	saKeyLayouts  = "LAYOUTS"
+	zplKeyRoot    = "ROOT"
+	zplKeyVersion = "VERSION"
 
 	// Fixed object numbers in ZPL object set
 	zplMasterNodeObjNum = 1
@@ -277,9 +272,8 @@ func openNamedDataset(r io.ReaderAt, partOff int64, rootBP blkptr, childPath str
 		return nil, fmt.Errorf("zfs: ZPL master node missing 'ROOT' key")
 	}
 
-	// Our writer packs znode bonuses with saZnodeLayout(), registered
-	// on disk as layout saZnodeLayoutNum so the OpenZFS kernel can mount.
-	saLayout := saZnodeLayout()
+	// Use default SA layout (our Format() hardcodes layout 0)
+	saLayout := defaultSALayout()
 
 	return &zplDataset{
 		mos:        mos,
