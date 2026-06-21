@@ -453,7 +453,7 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 	rootDirZAP := newMicroZAPBlock(poolBlockSize)
 
 	// ZPL object array
-	zplObjArray := make([]byte, fmtObjArraySize)
+	zplObjArray := make([]byte, fmtZPLObjArraySize)
 
 	zplMasterDN := newDnode(dmotMasterNode, 1, dmotNone, 0)
 	zplMasterDN.datablkszsec = uint16(poolBlockSize / 512)
@@ -484,14 +484,14 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 	// ZPL objset
 	zplObjset := make([]byte, poolBlockSize)
 	zplMetaDN := newDnode(dmotDnode, 1, dmotNone, 0)
-	zplMetaDN.datablkszsec = uint16(fmtObjArraySize / 512)
-	zplMetaDN.setBlkptrAt(0, makeBP(fmtZPLObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode, zplObjArray))
+	zplMetaDN.datablkszsec = uint16(fmtZPLObjArraySize / 512)
+	zplMetaDN.setBlkptrAt(0, makeBP(fmtZPLObjArrayOff, fmtZPLObjArraySize, fmtZPLObjArraySize, dmotDnode, zplObjArray))
 	zplMetaDN.encode()
 	copy(zplObjset[0:], zplMetaDN.raw)
 	binary.LittleEndian.PutUint64(zplObjset[objsetTypeOff:], dmuOSTZFS)
 
 	// MOS object array
-	mosObjArray := make([]byte, fmtObjArraySize)
+	mosObjArray := make([]byte, fmtMOSObjArraySize)
 	poolDirDN := newDnode(dmotObjectDirectory, 1, dmotNone, 0)
 	poolDirDN.datablkszsec = uint16(poolBlockSize / 512)
 	poolDirDN.setBlkptrAt(0, makeBP(fmtPoolDirZAPOff, poolBlockSize, poolBlockSize, dmotObjectDirectory, poolDirZAP))
@@ -519,8 +519,8 @@ func (fs *zfsFS) formatHeadLocked(poolName string, poolGUID uint64, newSize int6
 	// MOS objset
 	mosObjset := make([]byte, poolBlockSize)
 	mosMetaDN := newDnode(dmotDnode, 1, dmotNone, 0)
-	mosMetaDN.datablkszsec = uint16(fmtObjArraySize / 512)
-	mosMetaDN.setBlkptrAt(0, makeBP(fmtMOSObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode, mosObjArray))
+	mosMetaDN.datablkszsec = uint16(fmtMOSObjArraySize / 512)
+	mosMetaDN.setBlkptrAt(0, makeBP(fmtMOSObjArrayOff, fmtMOSObjArraySize, fmtMOSObjArraySize, dmotDnode, mosObjArray))
 	mosMetaDN.encode()
 	copy(mosObjset[0:], mosMetaDN.raw)
 	binary.LittleEndian.PutUint64(mosObjset[objsetTypeOff:], dmuOSTMeta)
@@ -1008,7 +1008,7 @@ func (fs *zfsFS) shrinkInPlaceLocked(newSize int64, curSize int64) error {
 	// then if the indirect block itself is in the high region it gets
 	// reallocated to the low region; if its parent is in the high
 	// region too, the recursion handles that one level up.
-	for objNum := uint64(0); objNum < fmtObjArrayObjs; objNum++ {
+	for objNum := uint64(0); objNum < fmtZPLObjArrayObjs; objNum++ {
 		dn, err := fs.zplDS.zplOS.readObject(objNum)
 		if err != nil {
 			continue

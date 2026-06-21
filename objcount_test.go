@@ -26,7 +26,7 @@ func reopenObjCounts(t *testing.T, path string) (usedobjs, metaFill, objectCount
 	usedobjs = fs.zplDS.zplOS.bp.fill                    // ds_bp fill == zdb usedobjs
 	metaFill = fs.zplDS.zplOS.metaDnode.blkptrAt(0).fill // meta_dnode data BP fill
 
-	for i := uint64(1); i < fmtObjArrayObjs; i++ {
+	for i := uint64(1); i < fmtZPLObjArrayObjs; i++ {
 		dn, err := fs.zplDS.zplOS.readObject(i)
 		if err != nil || dn == nil {
 			continue

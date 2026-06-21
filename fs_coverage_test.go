@@ -429,14 +429,14 @@ func TestReadDirEntries_InvalidObjNum(t *testing.T) {
 
 func TestAllocObjectNum_PoolFull(t *testing.T) {
 	// Fill all available object slots with files.
-	// fmtObjArrayObjs = fmtObjArraySize/dnodeMinSize = 16384/512 = 32
+	// fmtZPLObjArrayObjs = fmtZPLObjArraySize/dnodeMinSize = 16384/512 = 32
 	// Objects 1..fmtZPLObjCount are pre-used by format (master node,
 	// unlinked set, root dir, SA master/registry/layouts). Free user slots
 	// are (fmtZPLObjCount+1)..31.
 	fs := newTestFS(t)
 
 	// Create exactly enough files to fill all free slots.
-	for i := 0; i < fmtObjArrayObjs-(fmtZPLObjCount+1); i++ {
+	for i := 0; i < fmtZPLObjArrayObjs-(fmtZPLObjCount+1); i++ {
 		name := "/" + string([]byte{'a' + byte(i/26), 'a' + byte(i%26)})
 		if err := fs.WriteFile(name, []byte("x"), 0o644); err != nil {
 			t.Fatalf("WriteFile %d: %v", i, err)
@@ -547,7 +547,7 @@ func TestStat_ReadAttrsError(t *testing.T) {
 }
 
 func TestWriteDnode_ObjectIDNonZero(t *testing.T) {
-	// writeDnode with objNum=32 → blockID = 32*512 / fmtObjArraySize = 1 ≠ 0 → error.
+	// writeDnode with objNum=32 → blockID = 32*512 / fmtZPLObjArraySize = 1 ≠ 0 → error.
 	fs := newTestFS(t)
 	dn := newDnode(dmotNone, 0, 0, 0)
 	dn.encode()
@@ -866,7 +866,7 @@ func TestWriteFile_AllocFails(t *testing.T) {
 	// Exhaust the allocator by setting its limit to next so no space is available.
 	fs := newTestFS(t)
 	// Set allocator limit to current nextFree (no space left) by creating a new allocator with same start and limit.
-	fs.alloc = newAllocator(fs.alloc.nextFree, fs.alloc.nextFree, poolBlockSize)
+	fs.alloc = newAllocator(fs.alloc.nextFree, fs.alloc.nextFree, poolBlockSize, 0)
 	if err := fs.WriteFile("/x", []byte("data"), 0o644); err == nil {
 		t.Fatal("expected alloc error")
 	}
@@ -922,7 +922,7 @@ func TestWriteFile_UpdateDirZAPFails(t *testing.T) {
 func TestMkDir_AllocFails(t *testing.T) {
 	// alloc.alloc fails → MkDir returns error (covers fs.go line 300).
 	fs := newTestFS(t)
-	fs.alloc = newAllocator(fs.alloc.nextFree, fs.alloc.nextFree, poolBlockSize)
+	fs.alloc = newAllocator(fs.alloc.nextFree, fs.alloc.nextFree, poolBlockSize, 0)
 	if err := fs.MkDir("/d", 0o755); err == nil {
 		t.Fatal("expected alloc error")
 	}
@@ -941,7 +941,7 @@ func TestMkDir_AllocObjectNumFails(t *testing.T) {
 	// allocObjectNum fails → MkDir returns error (covers fs.go line 311).
 	// Fill all object slots with written files to exhaust object numbers.
 	fs := newTestFS(t)
-	// Fill objects 4 through fmtObjArrayObjs-1 so allocObjectNum finds no free slots.
+	// Fill objects 4 through fmtZPLObjArrayObjs-1 so allocObjectNum finds no free slots.
 	// We do this by writing many dummy dnodes into the object array.
 	metaDN := fs.zplDS.zplOS.metaDnode
 	metaBP := metaDN.blkptrAt(0)
@@ -950,7 +950,7 @@ func TestMkDir_AllocObjectNumFails(t *testing.T) {
 		t.Fatalf("readBlock: %v", err)
 	}
 	// Mark objects 4..31 as in-use by setting their type byte (offset 0) to dmotPlainFileContents
-	for i := int64(4); i < fmtObjArrayObjs; i++ {
+	for i := int64(4); i < fmtZPLObjArrayObjs; i++ {
 		off := i * dnodeMinSize
 		if off+dnodeMinSize > int64(len(blkData)) {
 			break
@@ -1198,9 +1198,9 @@ func TestWriteDnode_OutOfBounds(t *testing.T) {
 	// offsetInBlock+dnodeMinSize > len(blkData) (covers fs.go line 552).
 	// Use objNum at the very end of the block so offset+512 > blockSize.
 	// The ZPL obj array block is poolBlockSize(4096) = 8*dnodeMinSize(512).
-	// fmtObjArrayObjs = 32 → last valid slot is 31 at offset 31*512 = 15872 >> 4096.
+	// fmtZPLObjArrayObjs = 32 → last valid slot is 31 at offset 31*512 = 15872 >> 4096.
 	// But writeDnode only reads one block (blockID must be 0). So objNum must satisfy
-	// objNum*dnodeMinSize/blkSz == 0 → objNum < fmtObjArraySize/dnodeMinSize = 8.
+	// objNum*dnodeMinSize/blkSz == 0 → objNum < fmtZPLObjArraySize/dnodeMinSize = 8.
 	// For objNum=7: byteOff=7*512=3584, then offset+512=4096 == len(blkData)=4096 → not OOB.
 	// For objNum=8: byteOff=8*512=4096; blockID=4096/4096=1 → blockID!=0 → already caught.
 	// The OOB check (line 552) fires when offsetInBlock+dnodeMinSize > len(blkData).

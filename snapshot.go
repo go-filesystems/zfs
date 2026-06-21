@@ -419,7 +419,7 @@ func (fs *zfsFS) snapshotHighWater() int64 {
 			maxEnd = end
 		}
 	}
-	for i := uint64(1); i < fmtObjArrayObjs; i++ {
+	for i := uint64(1); i < fmtMOSObjArrayObjs; i++ {
 		dn, err := mos.readObject(i)
 		if err != nil || dn == nil || dn.typ != dmotDSLDataset {
 			continue
@@ -500,12 +500,12 @@ func (fs *zfsFS) walkObjectArray(bp blkptr, visit func(blkptr)) {
 // These mirror writeDnode / allocObjectNum (which target the ZPL object array)
 // but operate on the MOS object array, which Format places in a single 16 KiB
 // block described by the MOS meta_dnode. Format uses MOS objects 1..3, leaving
-// 4..(fmtObjArrayObjs-1) free for snapshot datasets and their snap ZAPs.
+// 4..(fmtMOSObjArrayObjs-1) free for snapshot datasets and their snap ZAPs.
 
 // allocMOSObjectNum returns the first free (dmotNone) MOS object slot.
 func (fs *zfsFS) allocMOSObjectNum() (uint64, error) {
 	mos := fs.zplDS.mos
-	for i := uint64(4); i < fmtObjArrayObjs; i++ {
+	for i := uint64(4); i < fmtMOSObjArrayObjs; i++ {
 		dn, err := mos.readObject(i)
 		if err != nil {
 			continue
@@ -533,17 +533,19 @@ func (fs *zfsFS) writeMOSObject(objNum uint64, dn *dnode) error {
 	metaDN := fs.zplDS.mos.metaDnode
 	blkSz := uint64(metaDN.dataBlockSize())
 	if blkSz == 0 {
-		blkSz = fmtObjArraySize
+		blkSz = fmtDnodeBlkSize
 	}
 	byteOff := objNum * uint64(dnodeMinSize)
 	blockID := byteOff / blkSz
 	offsetInBlock := int(byteOff % blkSz)
-	if blockID != 0 {
-		return fmt.Errorf("zfs: writeMOSObject: object %d out of single-block array", objNum)
+	// The MOS object array spans multiple 16 KiB dnode blocks; object objNum
+	// lives in block blockID, addressed by the meta_dnode's BP[blockID].
+	if blockID >= uint64(metaDN.nblkptr) {
+		return fmt.Errorf("zfs: writeMOSObject: object %d beyond MOS array (%d blocks)", objNum, metaDN.nblkptr)
 	}
-	bp := metaDN.blkptrAt(0)
+	bp := metaDN.blkptrAt(int(blockID))
 	if bp.isNull() {
-		return fmt.Errorf("zfs: writeMOSObject: MOS meta_dnode has null BP")
+		return fmt.Errorf("zfs: writeMOSObject: MOS meta_dnode BP[%d] is null", blockID)
 	}
 	blkData, err := readBlock(fs.f, fs.partOffset, bp)
 	if err != nil {
