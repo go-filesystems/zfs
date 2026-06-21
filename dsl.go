@@ -170,6 +170,12 @@ func openRootDataset(r io.ReaderAt, partOff int64, rootBP blkptr) (*zplDataset, 
 // levels via each DSL dir's ddChildDirZAPObj and open the leaf
 // dataset's ZPL.
 func openNamedDataset(r io.ReaderAt, partOff int64, rootBP blkptr, childPath string) (*zplDataset, error) {
+	// A trailing "@<snap>" selects a snapshot of the named dataset rather
+	// than its live head (see snapshot.go). Split it off here so the
+	// child-dir walk below operates on the dataset path only.
+	dsPath, snapName := splitSnapSuffix(childPath)
+	childPath = dsPath
+
 	// Step 1: Open the MOS
 	mos, err := openObjset(r, partOff, rootBP)
 	if err != nil {
@@ -244,8 +250,21 @@ func openNamedDataset(r io.ReaderAt, partOff int64, rootBP blkptr, childPath str
 		return nil, fmt.Errorf("zfs: DSL dir has no head dataset")
 	}
 
+	// Step 3.5: If a snapshot was requested, resolve it through the head
+	// dataset's ds_snapnames_zapobj and switch to the snapshot's dataset
+	// object. The snapshot dataset's bonus has the same shape, so the rest
+	// of the navigation (read ds_bp → open ZPL objset) is unchanged.
+	datasetObjNum := headDatasetObjNum
+	if snapName != "" {
+		snapObj, err := resolveSnapshot(r, partOff, mos, headDatasetObjNum, snapName)
+		if err != nil {
+			return nil, err
+		}
+		datasetObjNum = snapObj
+	}
+
 	// Step 4: Read DSL dataset object to get ZPL objset BP
-	dslDatasetDN, err := mos.readObject(headDatasetObjNum)
+	dslDatasetDN, err := mos.readObject(datasetObjNum)
 	if err != nil {
 		return nil, fmt.Errorf("zfs: read DSL dataset: %w", err)
 	}
@@ -289,6 +308,57 @@ func openNamedDataset(r io.ReaderAt, partOff int64, rootBP blkptr, childPath str
 		headDSObjNum: headDatasetObjNum,
 		saLayout:     saLayout,
 	}, nil
+}
+
+// splitSnapSuffix splits a dataset path of the form "child/path@snap" into
+// ("child/path", "snap"). With no '@' the whole input is the dataset path and
+// the snapshot name is empty.
+func splitSnapSuffix(p string) (dsPath, snap string) {
+	if i := indexByte(p, '@'); i >= 0 {
+		return p[:i], p[i+1:]
+	}
+	return p, ""
+}
+
+// indexByte is strings.IndexByte spelled out to avoid pulling "strings" into
+// dsl.go's import set just for one call.
+func indexByte(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// resolveSnapshot reads the head dataset's ds_snapnames_zapobj ZAP and returns
+// the MOS object number of the snapshot named snapName.
+func resolveSnapshot(r io.ReaderAt, partOff int64, mos *objset, headDatasetObjNum uint64, snapName string) (uint64, error) {
+	headDN, err := mos.readObject(headDatasetObjNum)
+	if err != nil {
+		return 0, fmt.Errorf("zfs: read head dataset for snapshot %q: %w", snapName, err)
+	}
+	bonus := headDN.bonusData()
+	if len(bonus) < dsSnapnamesZAPObj+8 {
+		return 0, fmt.Errorf("zfs: head dataset bonus too short for snapnames ZAP")
+	}
+	snapZAPObj := binary.LittleEndian.Uint64(bonus[dsSnapnamesZAPObj:])
+	if snapZAPObj == 0 {
+		return 0, fmt.Errorf("zfs: dataset has no snapshots (looking for %q)", snapName)
+	}
+	zapDN, err := mos.readObject(snapZAPObj)
+	if err != nil {
+		return 0, fmt.Errorf("zfs: read snapnames ZAP: %w", err)
+	}
+	entries, err := zapListAll(r, partOff, zapDN)
+	if err != nil {
+		return 0, fmt.Errorf("zfs: parse snapnames ZAP: %w", err)
+	}
+	obj, ok := entries[snapName]
+	if !ok {
+		return 0, fmt.Errorf("zfs: snapshot %q not found (have: %v): %w", snapName, childKeys(entries), errNotFound)
+	}
+	return obj, nil
 }
 
 // readDirEntries returns the object number → name mapping for a directory.
