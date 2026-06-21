@@ -88,9 +88,18 @@ const (
 	// head dataset (object 3) and opens/closes its deadlist; a zero
 	// deadlist obj makes dsl_deadlist_close dereference an unopened buffer
 	// and zdb -d segfaults.
-	fmtRootDLOff        = fmtSyncBpobjOff + 4*1024     // 0x0A2000 root head deadlist
-	fmtRootSnapNamesOff = fmtRootDLOff + 4*1024        // 0x0A3000 root head snap map
-	fmtInitialNextFree  = fmtRootSnapNamesOff + 4*1024 // 0x0A4000
+	fmtRootDLOff        = fmtSyncBpobjOff + 4*1024 // 0x0A2000 root head deadlist
+	fmtRootSnapNamesOff = fmtRootDLOff + 4*1024    // 0x0A3000 root head snap map
+	// Metaslab spacemap region. The metaslab_array object's data block
+	// holds one uint64 per metaslab (the per-metaslab space_map object
+	// number). Each metaslab that has had any allocation also gets a
+	// space_map object whose data block holds the on-disk space-map log.
+	// For our small images everything Format() writes lands in metaslab 0,
+	// so only metaslab 0 needs a populated space map; the remaining
+	// metaslabs are entirely free (array entry 0 / no space_map object).
+	fmtMetaslabArrayOff = fmtRootSnapNamesOff + 4*1024 // 0x0A4000 metaslab_array data block
+	fmtSpaceMap0Off     = fmtMetaslabArrayOff + 4*1024 // 0x0A5000 metaslab-0 space_map log
+	fmtInitialNextFree  = fmtSpaceMap0Off + 4*1024     // 0x0A6000
 
 	fmtObjArraySize = 16 * 1024 // 16 KiB = 32 × 512-byte dnodes
 	fmtObjArrayObjs = fmtObjArraySize / dnodeMinSize
@@ -133,10 +142,16 @@ const (
 	fmtMOSSyncBpobjObj    = 25 // deferred-frees ("sync") bpobj
 	fmtMOSRootDLObj       = 26 // root head dataset deadlist
 	fmtMOSRootSnapNames   = 27 // root head dataset snapshot-name map
-	// fmtMOSObjCount is the number of allocated MOS objects (1..27); it
+	// Metaslab objects. The metaslab_array (object 28) is a uint64 array
+	// naming each metaslab's space_map object; only metaslab 0 carries any
+	// allocation on a freshly formatted pool, so it is the single space_map
+	// object (29). The leaf vdev's "metaslab_array" nvpair points at 28.
+	fmtMOSMetaslabArray = 28 // DMU_OT_OBJECT_ARRAY: array of space_map obj nums
+	fmtMOSSpaceMap0Obj  = 29 // DMU_OT_SPACE_MAP for metaslab 0
+	// fmtMOSObjCount is the number of allocated MOS objects (1..29); it
 	// is the objset block pointer's fill count. Keep in sync with the
 	// highest fmtMOS* object number above.
-	fmtMOSObjCount = 27
+	fmtMOSObjCount = 29
 	// fmtZPLObjCount is the number of allocated ZPL objects (master node,
 	// unlinked set, root dir = 1..3).
 	fmtZPLObjCount = 3
@@ -150,13 +165,31 @@ const (
 	fmtZPLVersion  = uint64(5) // ZPL version
 	fmtPoolTXG     = uint64(1) // genesis transaction group
 
+	// fmtFeatSpacemapHistogram is the GUID of the spacemap_histogram
+	// feature. Once Format() emits a metaslab space_map with a
+	// space_map_phys_t bonus, zdb's verify_spacemap_refcounts() expects the
+	// feature refcount for this GUID to equal the number of such space maps
+	// (get_metaslab_refcount counts every metaslab whose space map has a
+	// sizeof(space_map_phys_t) bonus). We emit exactly one space map
+	// (metaslab 0), so the feature is enabled in the label/MOS-config
+	// "features_for_read" nvlist and — because spacemap_histogram is a
+	// READONLY_COMPAT feature — its refcount (=1) is stored in the
+	// features_for_WRITE MOS ZAP (see featWriteZAP below).
+	fmtFeatSpacemapHistogram = "com.delphix:spacemap_histogram"
+
 	// fmtVdevMetaslabArray is the MOS object id recorded in the leaf
-	// vdev's metaslab_array nvpair. Our minimal writer does not build
-	// per-metaslab spacemaps, so this is a nominal value: it makes the
-	// label nvlist complete for `zdb -l` parsing but a full metaslab
-	// load (e.g. `zpool import`) still needs the backing spacemap
-	// objects, which Format() intentionally omits.
-	fmtVdevMetaslabArray = 0
+	// vdev's metaslab_array nvpair. It points at the DMU_OT_OBJECT_ARRAY
+	// (object 28) whose data block lists the per-metaslab space_map object
+	// numbers, letting the metaslab loader open the vdev's allocation space
+	// (required by `zpool import` and by `zdb -bcc` space accounting).
+	fmtVdevMetaslabArray = fmtMOSMetaslabArray
+
+	// fmtMetaslabShift is log2 of the metaslab size (16 MiB). It matches
+	// the "metaslab_shift" written to the label / MOS config nvlists and is
+	// the granularity at which Format() partitions the vdev asize into
+	// metaslabs. Space-map entry offsets/runs are in 2^ashift (smShift)
+	// units, independent of this value.
+	fmtMetaslabShift = 24
 )
 
 // vdevGUIDFor derives the single leaf vdev's guid from the pool guid.
@@ -277,10 +310,21 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	rootDLZAP := newMicroZAPBlock(poolBlockSize)
 	rootSnapNamesZAP := newMicroZAPBlock(poolBlockSize)
 
-	// features_for_read / features_for_write / feature_descriptions ZAPs
-	// (all empty on a pool with no feature flags enabled).
+	// features_for_read / features_for_write / feature_descriptions ZAPs.
+	//
+	// spacemap_histogram is a READONLY_COMPAT feature, so OpenZFS stores
+	// its refcount in the features_for_WRITE ZAP (spa_feat_for_write_obj),
+	// NOT features_for_read — feature_get_refcount_from_disk() picks the
+	// ZAP by the ZFEATURE_FLAG_READONLY_COMPAT flag. The matching "enabled"
+	// boolean still goes in the label's "features_for_read" nvlist (labels
+	// only carry that one feature nvlist). The refcount equals the number
+	// of metaslab space_maps with a space_map_phys_t bonus (1).
 	featReadZAP := newMicroZAPBlock(poolBlockSize)
 	featWriteZAP := newMicroZAPBlock(poolBlockSize)
+	mzapInsert(featWriteZAP, fmtFeatSpacemapHistogram, 1)
+	// feature_descriptions maps GUID → human string (a fat-ZAP value);
+	// it is advisory only (zdb's refcount audit never reads it), so we
+	// leave it empty rather than emit a malformed microZAP uint64 value.
 	featDescZAP := newMicroZAPBlock(poolBlockSize)
 
 	// ZPL master node ZAP: "ROOT"→3, "VERSION"→5
@@ -395,8 +439,20 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// $ORIGIN feature present, dsl_dataset_hold_obj asserts every
 	// non-origin dataset descends from a snapshot. Real `zpool create`
 	// makes the root dataset a clone of the origin snapshot (obj 16).
-	binary.LittleEndian.PutUint64(dslDSBonus[dsPrevSnapObj:], fmtMOSOriginSnapObj)     // ds_prev_snap_obj
-	binary.LittleEndian.PutUint64(dslDSBonus[dsPrevSnapTxg:], fmtPoolTXG)              // ds_prev_snap_txg
+	binary.LittleEndian.PutUint64(dslDSBonus[dsPrevSnapObj:], fmtMOSOriginSnapObj) // ds_prev_snap_obj
+	// ds_prev_snap_txg must be STRICTLY less than the birth txg of every
+	// block this live dataset owns, or `zdb -bcc` block traversal treats
+	// those blocks as belonging to the prev snapshot and skips them
+	// (traverse_dataset visits only bp->blk_birth > td_min_txg, and
+	// td_min_txg = ds_prev_snap_txg for a head dataset). Our genesis pool
+	// births every block at fmtPoolTXG (1), so prev_snap_txg must be 0 —
+	// the origin snapshot conceptually predates the very first txg. (Real
+	// `zpool create` instead births the root dataset's objset a few txgs
+	// after the txg-1 origin snapshot; we have only one txg, so we lower
+	// the watermark instead of raising the births.) The prev_snap_obj link
+	// to the origin snapshot is unchanged, so dsl_dataset_hold_obj's
+	// "every non-origin dataset descends from a snapshot" invariant holds.
+	binary.LittleEndian.PutUint64(dslDSBonus[dsPrevSnapTxg:], 0) // ds_prev_snap_txg
 	binary.LittleEndian.PutUint64(dslDSBonus[dsSnapnamesZAPObj:], fmtMOSRootSnapNames) // ds_snapnames_zapobj
 	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTime:], now)                    // ds_creation_time
 	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTxg:], fmtPoolTXG)              // ds_creation_txg
@@ -538,6 +594,60 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// Object 24: $ORIGIN head dataset's snapshot-name map (DSL_DS_SNAP_MAP).
 	putZAPObj(mosObjArray, fmtMOSOriginSnapNames, dmotDSLDSSnapMap, fmtOriginSnapNamesOff, poolBlockSize, originSnapNamesZAP, makeBP)
 
+	// ── Objects 28/29: metaslab_array + metaslab-0 space_map ─────────────
+	// Partition the vdev asize into 2^fmtMetaslabShift metaslabs. Every
+	// block Format() writes lives in the contiguous data span
+	// [fmtMOSObjsetOff, fmtInitialNextFree), which falls entirely inside
+	// metaslab 0 (metaslab 0 = [0, 16 MiB)). So metaslab 0's space map
+	// records that one ALLOC run and the remaining metaslabs are wholly
+	// free (their metaslab_array slot stays 0, no space_map object).
+	//
+	// Because the data span is gapless, its byte length equals the sum of
+	// every block's DVA asize — i.e. exactly what `zdb -bcc` block
+	// traversal counts as allocated — so smp_alloc balances against
+	// traversal and the "size != alloc (leaked)" assertion is satisfied.
+	ml := chooseMetaslabLayout(vdevAsize(sizeBytes), fmtMetaslabShift)
+
+	allocStart := int64(fmtMOSObjsetOff)
+	allocEnd := int64(fmtInitialNextFree)
+	allocBytes := allocEnd - allocStart
+
+	// metaslab-0 space-map log: a single ALLOC run at intra-metaslab offset
+	// allocStart (metaslab 0 begins at vdev offset 0) covering allocBytes.
+	sm0Log := encodeSpaceMapLog([]smRange{{off: allocStart, length: allocBytes, typ: smAlloc}})
+	sm0Block := make([]byte, poolBlockSize)
+	copy(sm0Block, sm0Log)
+	sm0Bonus := makeSpaceMapPhys(fmtMOSSpaceMap0Obj, len(sm0Log), allocBytes)
+	sm0DN := newDnode(dmotSpaceMap, 1, dmotSpaceMapHdr, uint16(len(sm0Bonus)))
+	sm0DN.datablkszsec = uint16(poolBlockSize / 512)
+	sm0DN.used = uint64(poolBlockSize)
+	sm0DN.flags = dnodeFlagUsedBytes
+	sm0DN.setBlkptrAt(0, makeBP(fmtSpaceMap0Off, poolBlockSize, poolBlockSize, dmotSpaceMap, sm0Block))
+	copy(sm0DN.raw[dnodeBonusOff(1):], sm0Bonus)
+	sm0DN.encode()
+	copy(mosObjArray[fmtMOSSpaceMap0Obj*dnodeMinSize:], sm0DN.raw)
+
+	// metaslab_array data block: one uint64 per metaslab = its space_map
+	// object number (0 = no allocation yet). Only metaslab 0 has a space
+	// map (object fmtMOSSpaceMap0Obj); slots 1..count-1 stay 0.
+	msArrayBlock := make([]byte, poolBlockSize)
+	binary.LittleEndian.PutUint64(msArrayBlock[0:], fmtMOSSpaceMap0Obj)
+	msArrayDN := newDnode(dmotObjectArray, 1, dmotNone, 0)
+	msArrayDN.datablkszsec = uint16(poolBlockSize / 512)
+	msArrayDN.used = uint64(poolBlockSize)
+	msArrayDN.flags = dnodeFlagUsedBytes
+	// maxblkid 0: a single data block holds all `ml.count` entries (count is
+	// tiny for our images — at most a few hundred uint64s in 4 KiB).
+	msArrayDN.setBlkptrAt(0, makeBP(fmtMetaslabArrayOff, poolBlockSize, poolBlockSize, dmotObjectArray, msArrayBlock))
+	msArrayDN.encode()
+	copy(mosObjArray[fmtMOSMetaslabArray*dnodeMinSize:], msArrayDN.raw)
+	// A single 4 KiB block holds 512 uint64 slots — enough for any pool up
+	// to 512 × 16 MiB = 8 GiB. For larger vdevs the high metaslab slots
+	// read back as 0 (= no space_map = entirely free), which is still sound
+	// because all of Format()'s allocations are confined to metaslab 0; the
+	// extra free metaslabs simply contribute 0 to smp_alloc.
+	_ = ml.count
+
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	// 5. Build MOS objset block (4 KiB)
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -591,6 +701,8 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 		{fmtSyncBpobjOff, syncBpobjBlock},
 		{fmtRootDLOff, rootDLZAP},
 		{fmtRootSnapNamesOff, rootSnapNamesZAP},
+		{fmtMetaslabArrayOff, msArrayBlock},
+		{fmtSpaceMap0Off, sm0Block},
 	}
 	// Shift every data write past VDEV_LABEL_START_SIZE so the on-disk
 	// layout matches what real `zpool create` produces. The DVA values
@@ -711,6 +823,21 @@ func buildLabel(nvBuf, ub []byte, labelOff int64, txg uint64) []byte {
 	return label
 }
 
+// vdevAsize returns the leaf vdev's allocatable size: the total device
+// bytes minus the leading label/boot reserve (VDEV_LABEL_START_SIZE) and
+// the two trailing labels, aligned DOWN to a metaslab (2^fmtMetaslabShift)
+// boundary. This is the value written as "asize" in the label / MOS config
+// nvlists and the span the metaslabs partition. DVA offsets in block
+// pointers are measured from byte 0 of this allocatable area.
+func vdevAsize(totalBytes int64) int64 {
+	asize := totalBytes - vdevLabelStartSize - 2*vdevLabelSize
+	if asize < 0 {
+		asize = 0
+	}
+	asize &^= (int64(1) << fmtMetaslabShift) - 1
+	return asize
+}
+
 // buildLabelNVList constructs the XDR-encoded nvlist for a vdev label.
 //
 // The field set mirrors what real `zpool create` writes (verified
@@ -725,14 +852,9 @@ func buildLabel(nvBuf, ub []byte, labelOff int64, txg uint64) []byte {
 // OpenZFS derives vdev asize.
 func buildLabelNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes, ts uint64) []byte {
 	// Usable size = total - leading label/boot reserve (4 MiB) - two
-	// trailing labels. metaslab_shift describes the metaslab size; we
-	// use a fixed 2^metaslabShift and align asize down to it.
-	const metaslabShift = 24 // 16 MiB metaslabs (OpenZFS default for small vdevs)
-	asize := int64(totalBytes) - vdevLabelStartSize - 2*vdevLabelSize
-	if asize < 0 {
-		asize = 0
-	}
-	asize &^= (int64(1) << metaslabShift) - 1
+	// trailing labels, aligned down to a metaslab boundary.
+	metaslabShift := uint64(fmtMetaslabShift)
+	asize := vdevAsize(int64(totalBytes))
 
 	// The label's vdev_tree is the TOP-LEVEL vdev itself — for our single
 	// file-backed disk that is the leaf directly, NOT wrapped in a
@@ -770,7 +892,14 @@ func buildLabelNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes, ts
 		// label with "invalid label: 'features_for_read' missing" if this
 		// nvlist is absent. We enable no read-incompatible features, so an
 		// empty list is correct and lets the importer proceed.
-		nvNVList("features_for_read", nvList{}),
+		nvNVList("features_for_read", nvList{
+			// spacemap_histogram is active because the writer emits a
+			// metaslab space_map with a space_map_phys_t bonus; zdb's
+			// space-map refcount audit requires the feature be enabled
+			// here AND counted in the features_for_write MOS ZAP
+			// (spacemap_histogram is READONLY_COMPAT; see featWriteZAP).
+			nvBoolean(fmtFeatSpacemapHistogram),
+		}),
 	}
 	return encodeNVListFull(config)
 }
@@ -911,12 +1040,8 @@ func putBpobj(mosObjArray []byte, obj int, off int64, blockSize int, makeBP make
 // single leaf as children[0]. spa_load reads this to assemble its trusted
 // config after the untrusted label config gets it as far as the MOS.
 func buildMOSConfigNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes, ts uint64) []byte {
-	const metaslabShift = 24
-	asize := int64(totalBytes) - vdevLabelStartSize - 2*vdevLabelSize
-	if asize < 0 {
-		asize = 0
-	}
-	asize &^= (int64(1) << metaslabShift) - 1
+	metaslabShift := uint64(fmtMetaslabShift)
+	asize := vdevAsize(int64(totalBytes))
 
 	leaf := nvList{
 		nvString("type", "file"),
@@ -946,7 +1071,14 @@ func buildMOSConfigNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes
 		nvUint64("errata", 0),
 		nvUint64("vdev_children", 1),
 		nvNVList("vdev_tree", root),
-		nvNVList("features_for_read", nvList{}),
+		nvNVList("features_for_read", nvList{
+			// spacemap_histogram is active because the writer emits a
+			// metaslab space_map with a space_map_phys_t bonus; zdb's
+			// space-map refcount audit requires the feature be enabled
+			// here AND counted in the features_for_write MOS ZAP
+			// (spacemap_histogram is READONLY_COMPAT; see featWriteZAP).
+			nvBoolean(fmtFeatSpacemapHistogram),
+		}),
 	}
 	return encodeNVListFull(config)
 }
