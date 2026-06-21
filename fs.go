@@ -707,6 +707,23 @@ func (fs *zfsFS) allocObjectNum() (uint64, error) {
 	return 0, fmt.Errorf("zfs: no free object slot in ZPL (pool full)")
 }
 
+// countZPLObjects returns the number of allocated dnodes in the ZPL object
+// array block, matching what zdb's dump_objset() counts and asserts against
+// the objset BP's fill. The meta_dnode (object 0) is not an allocated object
+// — dmu_object_next() never yields it — so the scan starts at object 1. A
+// slot is allocated iff its dn_type byte (offset 0 of the 512-byte dnode) is
+// non-zero (DMU_OT_NONE == 0); DeleteFile/DeleteDir zero the whole dnode,
+// which clears the type and so drops the slot from this count.
+func countZPLObjects(objArray []byte) uint64 {
+	var n uint64
+	for off := dnodeMinSize; off+dnodeMinSize <= len(objArray); off += dnodeMinSize {
+		if objArray[off] != dmotNone {
+			n++
+		}
+	}
+	return n
+}
+
 // writeDnode writes a dnode back to the ZPL object array at objNum.
 func (fs *zfsFS) writeDnode(objNum uint64, dn *dnode) error {
 	// Object array is at fmtZPLObjArrayOff; each dnode is 512 bytes.
@@ -1181,13 +1198,27 @@ func (fs *zfsFS) recommitChain() (blkptr, error) {
 		return blkptr{}, fmt.Errorf("read ZPL object array: %w", err)
 	}
 	setBPChecksum(&zplMetaBP, zplObjArray)
+	// Refresh the objset's allocated-object accounting. zdb's dump_objset()
+	// asserts `object_count == usedobjs`, where object_count is the number
+	// of allocated dnodes it finds by walking the meta_dnode's object array
+	// and usedobjs is BP_GET_FILL() of the objset block pointer (== ds_bp).
+	// Format() seeds both fills with fmtZPLObjCount, but WriteFile/MkDir add
+	// dnodes and DeleteFile/DeleteDir zero them without ever revising the
+	// fill, so a written-to pool tripped the assert. Recount the live array
+	// here and stamp the fresh count onto both the meta_dnode's data BP and
+	// the objset BP so they stay in lock-step with the dnodes on disk.
+	objCount := countZPLObjects(zplObjArray)
+	zplMetaBP.fill = objCount
 	encodeBlkptr(zplMetaBP, zplObjsetBlk[dnodeHdrSize:dnodeHdrSize+blkptrSize])
 	if err := writePhys(zplBP, zplObjsetBlk); err != nil {
 		return blkptr{}, fmt.Errorf("write ZPL objset: %w", err)
 	}
 
 	// (b) ZPL objset block → zplBP checksum, stored in the DSL dataset's ds_bp.
+	// The objset BP's fill is what zdb reports as `usedobjs`, so carry the
+	// freshly-recounted object total up from the meta_dnode's data BP.
 	setBPChecksum(&zplBP, zplObjsetBlk)
+	zplBP.fill = objCount
 	encodeBlkptr(zplBP, mosObjArray[dsOff+zplBPOff:dsOff+zplBPOff+blkptrSize])
 	if err := writePhys(mosMetaBP, mosObjArray); err != nil {
 		return blkptr{}, fmt.Errorf("write MOS object array: %w", err)
