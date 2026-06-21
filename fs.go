@@ -1372,6 +1372,19 @@ func (fs *zfsFS) initAllocator(imageSize int64) {
 			}
 		}
 	}
+	// Snapshots (snapshot.go) deep-copy their dataset's block tree into
+	// fresh extents that NO live ZPL object references — the loop above
+	// therefore misses them. If the bump pointer started below a snapshot's
+	// copied region, a post-reopen write would clobber the frozen snapshot.
+	// Fold in the high-water mark of every snapshot dataset reachable from
+	// the MOS so the allocator always resumes ABOVE all pinned snapshot
+	// blocks.
+	if fs.zplDS != nil && fs.zplDS.mos != nil {
+		if snapMax := fs.snapshotHighWater(); snapMax > maxOff {
+			maxOff = snapMax
+		}
+	}
+
 	next := alignUp(maxOff, int64(poolBlockSize))
 	limit := imageSize - 2*vdevLabelSize
 	if limit < next {
