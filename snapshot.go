@@ -201,12 +201,20 @@ func (fs *zfsFS) snapshotHeadDataset(snapName string) error {
 	le.PutUint64(snapBonus[dsDirObj:], headDirObj)
 	le.PutUint64(snapBonus[dsPrevSnapObj:], prevSnapObj)
 	le.PutUint64(snapBonus[dsPrevSnapTxg:], prevSnapTxg)
-	le.PutUint64(snapBonus[dsNextSnapObj:], headDSObj) // next = the live head
+	le.PutUint64(snapBonus[dsNextSnapObj:], headDSObj) // next in chain = the live head
 	le.PutUint64(snapBonus[dsSnapnamesZAPObj:], 0)
 	le.PutUint64(snapBonus[dsNumChildren:], 0)
 	le.PutUint64(snapBonus[dsCreationTime:], now)
 	le.PutUint64(snapBonus[dsCreationTxg:], fs.curTxg)
 	encodeBlkptr(snapZPLBP, snapBonus[dsBP:dsBP+blkptrSize])
+	// Give the snapshot its OWN deadlist (the bonus was copied from the head,
+	// which points ds_deadlist_obj at the head's deadlist — sharing it makes
+	// zdb's dataset walk panic on a duplicate deadlist object).
+	snapDLObj, err := fs.allocDeadlist()
+	if err != nil {
+		return fmt.Errorf("zfs: Snapshot: %w", err)
+	}
+	le.PutUint64(snapBonus[dsDeadlistObj:], snapDLObj)
 
 	snapDSDN := newDnode(dmotDSLDataset, 1, dmotDSLDataset, uint16(len(snapBonus)))
 	copy(snapDSDN.raw[dnodeHdrSize+blkptrSize:], snapBonus)
@@ -222,22 +230,43 @@ func (fs *zfsFS) snapshotHeadDataset(snapName string) error {
 	if _, err := fs.f.WriteAt(snapZAPBlk, fs.partOffset+snapZAPBP.dvaOffset(0)); err != nil {
 		return fmt.Errorf("zfs: Snapshot: write snap ZAP block: %w", err)
 	}
-	if createdZAP {
-		// Write a MOS dnode describing the snap ZAP.
-		zapDN := newDnode(dmotDSLDSSnapMap, 1, dmotNone, 0)
-		zapDN.datablkszsec = uint16(poolBlockSize / 512)
-		zapDN.setBlkptrAt(0, snapZAPBP)
-		zapDN.encode()
-		if err := fs.writeMOSObject(snapZAPObj, zapDN); err != nil {
-			return fmt.Errorf("zfs: Snapshot: write snap ZAP dnode: %w", err)
-		}
+	// The ZAP block's contents changed (a name was inserted), so its dnode's
+	// BP must carry a fresh fletcher4 over the new bytes — whether the ZAP
+	// object is brand new (createdZAP) or pre-existing (e.g. the root
+	// dataset's Format-time snapnames ZAP). Without this zdb fails to read it
+	// (ECKSUM). recommitChain re-checksums the MOS object array (the dnodes),
+	// but not the data blocks those dnodes point at, so we update the BP here.
+	setBPChecksum(&snapZAPBP, snapZAPBlk)
+	snapZAPBP.birth = fs.curTxg
+	snapZAPBP.physBirth = fs.curTxg
+	zapDN := newDnode(dmotDSLDSSnapMap, 1, dmotNone, 0)
+	zapDN.datablkszsec = uint16(poolBlockSize / 512)
+	zapDN.setBlkptrAt(0, snapZAPBP)
+	zapDN.encode()
+	if err := fs.writeMOSObject(snapZAPObj, zapDN); err != nil {
+		return fmt.Errorf("zfs: Snapshot: write snap ZAP dnode: %w", err)
 	}
 
-	// 7. Update the head DSL dataset: its previous snapshot is now this snap
-	// (ds_prev_snap_obj / ds_prev_snap_txg), num_children grows by one, and —
-	// on the first snapshot — its ds_snapnames_zapobj is set.
+	// 7. Update the head DSL dataset: link the snapshot into the chain
+	// (ds_prev_snap_obj) and bump num_children / ds_snapnames_zapobj.
+	//
+	// Do NOT advance ds_prev_snap_txg. zdb's space audit (`zdb -bcc`) charges
+	// blocks with birth <= ds_prev_snap_txg to the previous snapshot instead
+	// of the head. Real ZFS snapshots SHARE the head's old blocks, so that
+	// snapshot then traverses (and accounts) them. Our snapshot is an eager
+	// CLONE — it points at a private copy, not the head's live blocks — so if
+	// we advanced ds_prev_snap_txg to the snapshot txg, every live block
+	// (born at Format/earlier write txgs) would be charged to a snapshot that
+	// never references it, and zdb would report it leaked. Leaving
+	// ds_prev_snap_txg at its prior value keeps the head owning its full live
+	// tree; the snapshot independently owns its copied tree (born this txg).
+	// Link the snapshot into the head's chain so zdb's dataset walk
+	// (dsl_dataset_hold_obj requires a valid chain), BUT do NOT advance
+	// ds_prev_snap_txg: our snapshot is an eager copy that shares no blocks
+	// with the head, so the head must keep owning (and zdb keep traversing)
+	// all its live blocks — advancing the txg would charge them to a snapshot
+	// that never references them and `zdb -bcc` would report them leaked.
 	le.PutUint64(headDSBonus[dsPrevSnapObj:], snapDSObj)
-	le.PutUint64(headDSBonus[dsPrevSnapTxg:], fs.curTxg)
 	numChildren := le.Uint64(headDSBonus[dsNumChildren:])
 	le.PutUint64(headDSBonus[dsNumChildren:], numChildren+1)
 	le.PutUint64(headDSBonus[dsSnapnamesZAPObj:], snapZAPObj)
@@ -251,6 +280,46 @@ func (fs *zfsFS) snapshotHeadDataset(snapName string) error {
 
 	// 8. Commit a fresh uberblock so the new MOS objects survive reopen.
 	return fs.commitUberblock()
+}
+
+// allocDeadlist creates a fresh, empty deadlist MOS object (a DMU_OT_DEADLIST
+// dnode over an empty micro-ZAP) and returns its object number. Every dataset
+// — head and each snapshot — must own a DISTINCT deadlist object: zdb's
+// dmu_objset_find walk builds a range tree of the deadlist objects it visits
+// and panics ("adding existent segment to range tree") if two datasets name
+// the same one. The snapshot bonus is copied from the head, which would
+// otherwise make every snapshot share the head's deadlist (object
+// fmtMOSRootDLObj). The block pointer is checksummed here because recommitChain
+// re-checksums the MOS object array but not the data blocks its dnodes point at.
+func (fs *zfsFS) allocDeadlist() (uint64, error) {
+	obj, err := fs.allocMOSObjectNum()
+	if err != nil {
+		return 0, fmt.Errorf("alloc deadlist obj: %w", err)
+	}
+	if err := fs.reserveMOSObject(obj); err != nil {
+		return 0, fmt.Errorf("reserve deadlist obj: %w", err)
+	}
+	off, err := fs.alloc.alloc(poolBlockSize)
+	if err != nil {
+		return 0, fmt.Errorf("alloc deadlist block: %w", err)
+	}
+	zap := newMicroZAPBlock(poolBlockSize)
+	if _, err := fs.f.WriteAt(zap, fs.partOffset+off); err != nil {
+		return 0, fmt.Errorf("write deadlist block: %w", err)
+	}
+	bp := makeBlkptr(off, poolBlockSize, poolBlockSize, zcompressOff, dmotDeadlist, 0, fs.curTxg)
+	setBPChecksum(&bp, zap)
+	bonus := make([]byte, dslDeadlistPhysSize)
+	dn := newDnode(dmotDeadlist, 1, dmotDeadlistHdr, uint16(len(bonus)))
+	dn.datablkszsec = uint16(poolBlockSize / 512)
+	dn.flags = dnodeFlagUsedBytes
+	dn.setBlkptrAt(0, bp)
+	copy(dn.raw[dnodeBonusOff(1):], bonus)
+	dn.encode()
+	if err := fs.writeMOSObject(obj, dn); err != nil {
+		return 0, fmt.Errorf("write deadlist dnode: %w", err)
+	}
+	return obj, nil
 }
 
 // headDSLDirObj returns the MOS object number of the pool's root DSL dir
@@ -313,6 +382,12 @@ func (fs *zfsFS) copyObjsetTree(srcBP blkptr) (blkptr, error) {
 		return blkptr{}, fmt.Errorf("write objset copy: %w", err)
 	}
 	newBP := makeBlkptr(off, int(srcBP.psize()), int(srcBP.lsize()), zcompressOff, dmotObjset, srcBP.level(), fs.curTxg)
+	// The copy occupies a fresh DVA, so its BP needs a fresh fletcher4 over
+	// the copied bytes; without it zdb fails to verify the snapshot objset,
+	// abandons the subtree, and reports its blocks as leaked. Carry the
+	// source fill (object count) up unchanged.
+	setBPChecksum(&newBP, dst)
+	newBP.fill = srcBP.fill
 	return newBP, nil
 }
 
@@ -396,6 +471,11 @@ func (fs *zfsFS) copyBlkptrTree(bp blkptr, objectArrayLevel0 bool, leafBlockSize
 		return blkptr{}, fmt.Errorf("write block copy: %w", err)
 	}
 	newBP := makeBlkptr(newOff, int(bp.psize()), int(bp.lsize()), zcompressOff, bp.dmuType(), bp.level(), fs.curTxg)
+	// Re-checksum over the copied bytes (the copy lives at a new DVA) and
+	// preserve the source fill — indirect / object-array BPs carry the count
+	// of blocks / dnodes beneath them, which zdb's leak audit relies on.
+	setBPChecksum(&newBP, dst)
+	newBP.fill = bp.fill
 	return newBP, nil
 }
 
