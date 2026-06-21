@@ -255,7 +255,14 @@ func (fs *zfsFS) WriteFile(path string, data []byte, perm os.FileMode) error {
 		if _, err := fs.f.WriteAt(block, fs.partOffset+off); err != nil {
 			return fmt.Errorf("zfs: WriteFile: write data block %d: %w", i, err)
 		}
-		dataBPs[i] = makeBlkptrCksum(off, bsz, bsz, zcompressOff, dmotPlainFileContents, 0, fs.curTxg, zioChecksumOff)
+		// Emit a real fletcher4 block-pointer checksum over the exact
+		// on-disk bytes. Earlier the writer left these as ZIO_CHECKSUM_OFF,
+		// which made `zdb -e -bcc` fail on a written-to pool; the checksum
+		// must be present and (per commitUberblock's recommitChain)
+		// propagate up the whole BP chain.
+		dbp := makeBlkptrCksum(off, bsz, bsz, zcompressOff, dmotPlainFileContents, 0, fs.curTxg, zioChecksumFletch4)
+		setBPChecksum(&dbp, block)
+		dataBPs[i] = dbp
 	}
 
 	// Build the dnode. nblkptr=1 by default — multi-block files route
@@ -365,8 +372,10 @@ func (fs *zfsFS) MkDir(path string, perm os.FileMode) error {
 	saBonus := writeSABonus(attrs, fs.zplDS.saLayout)
 	dirDN := newDnode(dmotDirContents, 1, dmotSA, uint16(len(saBonus)))
 	dirDN.datablkszsec = uint16(poolBlockSize / 512)
-	dirDN.setBlkptrAt(0, makeBlkptrCksum(zapOff, poolBlockSize, poolBlockSize,
-		zcompressOff, dmotDirContents, 0, fs.curTxg, zioChecksumOff))
+	zbp := makeBlkptrCksum(zapOff, poolBlockSize, poolBlockSize,
+		zcompressOff, dmotDirContents, 0, fs.curTxg, zioChecksumFletch4)
+	setBPChecksum(&zbp, emptyZAP)
+	dirDN.setBlkptrAt(0, zbp)
 	bonusStart := dnodeHdrSize + blkptrSize
 	copy(dirDN.raw[bonusStart:], saBonus)
 	dirDN.encode()
@@ -440,9 +449,12 @@ func (fs *zfsFS) writeBlockTree(dataBPs []blkptr, dataBlockSize, indirBlockSize 
 				return blkptr{}, 0, fmt.Errorf("zfs: writeBlockTree: write indirect: %w", err)
 			}
 			// Indirect BPs carry level = nlevels (so the immediate
-			// parent of dataBPs is level=1, etc.).
+			// parent of dataBPs is level=1, etc.). The fletcher4 checksum
+			// covers the indirect block's on-disk bytes (the array of
+			// child BPs, themselves already checksummed bottom-up).
 			indirBP := makeBlkptrCksum(off, indirBlockSize, indirBlockSize,
-				zcompressOff, dmotPlainFileContents, uint8(nlevels), fs.curTxg, zioChecksumOff)
+				zcompressOff, dmotPlainFileContents, uint8(nlevels), fs.curTxg, zioChecksumFletch4)
+			setBPChecksum(&indirBP, indirBuf)
 			nextBPs = append(nextBPs, indirBP)
 		}
 		currentBPs = nextBPs
@@ -762,6 +774,28 @@ func (fs *zfsFS) updateDirZAP(dirObjNum uint64, name string, rawVal uint64, del 
 	if _, err := fs.f.WriteAt(blkData, physOff); err != nil {
 		return fmt.Errorf("zfs: updateDirZAP: write back: %w", err)
 	}
+
+	// The ZAP block's bytes changed, so the directory dnode's block
+	// pointer checksum over it is now stale. Recompute it (matching the
+	// dnode's configured checksum type, defaulting to fletcher4) and
+	// rewrite the dnode into the object array so commitUberblock's
+	// chain recompute carries the new checksum up to the uberblock.
+	if !bp.isEmbedded() && bp.checksumType() != zioChecksumOff && bp.checksumType() != zioChecksumInherit {
+		if bp.checksumType() == 0 {
+			// Legacy dir dnodes written before this fix recorded
+			// ZIO_CHECKSUM_INHERIT(0) on the ZAP BP; upgrade to fletcher4
+			// so the block becomes zdb-verifiable.
+			bp.prop = (bp.prop &^ (uint64(bpCksumBits) << bpCksumShift)) |
+				(uint64(zioChecksumFletch4) << bpCksumShift)
+		}
+		setBPChecksum(&bp, blkData)
+		bp.birth = fs.curTxg
+		bp.physBirth = fs.curTxg
+		dirDN.setBlkptrAt(0, bp)
+		if err := fs.writeDnode(dirObjNum, dirDN); err != nil {
+			return fmt.Errorf("zfs: updateDirZAP: rewrite dir dnode: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -883,18 +917,33 @@ func (fs *zfsFS) readDirEntryRaw(dirObjNum uint64, name string) (uint64, error) 
 }
 
 // commitUberblock increments the txg and writes a new uberblock to label 0, slot 0
-// and label 1, slot 0.  The rootbp is re-derived from the MOS meta_dnode.
+// and label 1, slot 0.  The rootbp is re-derived by recomputing the block-pointer
+// checksum chain from the (just-rewritten) ZPL object array up to the uberblock.
 func (fs *zfsFS) commitUberblock() error {
 	fs.curTxg++
 
-	// The rootbp points to the MOS objset itself; that block is unchanged.
-	// Re-read its block pointer from the Open()-cached info.
-	rootBPBuf := make([]byte, blkptrSize)
-	if _, err := fs.f.ReadAt(rootBPBuf, fs.info.Offset+40); err != nil {
-		return fmt.Errorf("zfs: commitUberblock: read rootbp: %w", err)
+	// Re-emit metaslab 0's space_map so its claimed allocation matches the
+	// blocks now live on disk. Block traversal (`zdb -e -bcc`, no -AAA)
+	// cross-checks the space_map's smp_alloc against the bytes it finds
+	// reachable from the rootbp; without this the writer's new data /
+	// indirect / ZAP allocations show up as "size != alloc (leaked)". This
+	// rewrites the space_map dnode INTO the on-disk MOS object array, so it
+	// must run before recommitChain (which re-reads that array and
+	// recomputes its checksum up the chain).
+	if err := fs.updateSpaceMap(); err != nil {
+		return fmt.Errorf("zfs: commitUberblock: update space_map: %w", err)
 	}
-	rootBP := parseBlkptr(rootBPBuf)
-	// Update birth txg
+
+	// Recompute the block-pointer checksum chain from the leaf metadata
+	// blocks the mutation just rewrote, bottom-up to the rootbp. Without
+	// this, every in-place metadata rewrite (writeDnode / updateDirZAP)
+	// leaves a STALE fletcher4 up the chain, so `zdb -e -bcc` fails on a
+	// written-to pool. recommitChain returns the fresh, fully-checksummed
+	// rootbp to embed in the new uberblock.
+	rootBP, err := fs.recommitChain()
+	if err != nil {
+		return fmt.Errorf("zfs: commitUberblock: recompute checksum chain: %w", err)
+	}
 	rootBP.birth = fs.curTxg
 	rootBP.physBirth = fs.curTxg
 
@@ -919,6 +968,237 @@ func (fs *zfsFS) commitUberblock() error {
 		fs.f.WriteAt(slotBuf, labelOff+int64(ubAt))
 	}
 	return nil
+}
+
+// updateSpaceMap re-emits metaslab 0's on-disk space_map to match the set of
+// blocks currently live on the vdev, so `zdb -e -bcc` block traversal balances
+// against the space maps (no "size != alloc (leaked)"). It is a no-op on
+// read-only / bare-uberblock pools.
+//
+// The allocator reports the live allocated set as [allocStart, nextFree) minus
+// the free list (see allocatedExtents). All of Format()'s writes and the
+// writer's runtime allocations are confined to metaslab 0 ([0, 2^msShift)), so
+// the extents — already data-area-relative, which is exactly the metaslab-0
+// offset basis — encode directly into the space-map log. smp_alloc is the sum
+// of their lengths.
+func (fs *zfsFS) updateSpaceMap() error {
+	if fs.zplDS == nil || fs.alloc == nil {
+		return nil
+	}
+
+	// Locate the on-disk MOS object array via the active rootbp.
+	rootBPBuf := make([]byte, blkptrSize)
+	if _, err := fs.f.ReadAt(rootBPBuf, fs.info.Offset+40); err != nil {
+		return fmt.Errorf("read rootbp: %w", err)
+	}
+	rootBP := parseBlkptr(rootBPBuf)
+	mosObjsetBlk := make([]byte, rootBP.psize())
+	if _, err := fs.f.ReadAt(mosObjsetBlk, fs.partOffset+rootBP.dvaOffset(0)); err != nil {
+		return fmt.Errorf("read MOS objset: %w", err)
+	}
+	mosMetaBP := parseBlkptr(mosObjsetBlk[dnodeHdrSize : dnodeHdrSize+blkptrSize])
+	mosObjArray := make([]byte, mosMetaBP.psize())
+	if _, err := fs.f.ReadAt(mosObjArray, fs.partOffset+mosMetaBP.dvaOffset(0)); err != nil {
+		return fmt.Errorf("read MOS object array: %w", err)
+	}
+
+	// Parse the metaslab-0 space_map dnode (MOS object fmtMOSSpaceMap0Obj).
+	smOff := fmtMOSSpaceMap0Obj * dnodeMinSize
+	if smOff+dnodeMinSize > len(mosObjArray) {
+		return fmt.Errorf("space_map object %d out of MOS array", fmtMOSSpaceMap0Obj)
+	}
+	smDN, err := parseDnode(mosObjArray[smOff : smOff+dnodeMinSize])
+	if err != nil {
+		return fmt.Errorf("parse space_map dnode: %w", err)
+	}
+	if smDN.typ != dmotSpaceMap {
+		// Older / different layout without our metaslab space map — nothing
+		// to maintain (the leak audit only applies when a space map exists).
+		return nil
+	}
+	smBP := smDN.blkptrAt(0)
+	if smBP.isNull() {
+		return fmt.Errorf("space_map dnode has null data BP")
+	}
+
+	// Build the new space-map log from the live allocated set.
+	extents := fs.alloc.allocatedExtents(int64(fmtMOSObjsetOff))
+	metaslab0End := int64(1) << fmtMetaslabShift
+	ranges := make([]smRange, 0, len(extents))
+	var allocBytes int64
+	for _, e := range extents {
+		if e.off+e.size > metaslab0End {
+			// The live set has grown past metaslab 0. Maintaining a
+			// balanced multi-metaslab space_map at runtime (allocating new
+			// space_map objects, growing the metaslab_array, adjusting the
+			// spacemap_histogram feature refcount) is beyond this writer;
+			// leave the space_map untouched rather than emit a wrong one.
+			// The block-pointer checksum chain is still fully recomputed by
+			// recommitChain, so the pool stays checksum-clean — only the
+			// space-accounting leak audit (`zdb -bcc` without -AAA) would
+			// flag such a >16 MiB pool. Smaller pools stay fully balanced.
+			return nil
+		}
+		ranges = append(ranges, smRange{off: e.off, length: e.size, typ: smAlloc})
+		allocBytes += e.size
+	}
+	smLog := encodeSpaceMapLog(ranges)
+
+	smBlkSize := int(smBP.psize())
+	if len(smLog) > smBlkSize {
+		// Too many discontiguous live extents to fit the space-map log in
+		// one block. Same rationale as the metaslab-0 overflow above: leave
+		// the space_map as-is rather than truncate it.
+		return nil
+	}
+	smBlock := make([]byte, smBlkSize)
+	copy(smBlock, smLog)
+
+	// Write the space-map data block and recompute its BP checksum.
+	if _, err := fs.f.WriteAt(smBlock, fs.partOffset+smBP.dvaOffset(0)); err != nil {
+		return fmt.Errorf("write space_map block: %w", err)
+	}
+	setBPChecksum(&smBP, smBlock)
+	smBP.birth = fs.curTxg
+	smBP.physBirth = fs.curTxg
+	smDN.setBlkptrAt(0, smBP)
+
+	// Update the space_map_phys_t bonus (smp_length, smp_alloc) in place.
+	bonusBase := dnodeBonusOff(int(smDN.nblkptr))
+	if bonusBase+smpAlloc+8 > len(smDN.raw) {
+		return fmt.Errorf("space_map bonus out of dnode")
+	}
+	binary.LittleEndian.PutUint64(smDN.raw[bonusBase+smpLength:], uint64(len(smLog)))
+	binary.LittleEndian.PutUint64(smDN.raw[bonusBase+smpAlloc:], uint64(allocBytes))
+
+	// Write the updated space_map dnode back into the on-disk MOS object
+	// array. recommitChain re-reads this array and recomputes its checksum
+	// (and the whole chain above) on the next step.
+	copy(mosObjArray[smOff:smOff+dnodeMinSize], smDN.raw[:dnodeMinSize])
+	if _, err := fs.f.WriteAt(mosObjArray, fs.partOffset+mosMetaBP.dvaOffset(0)); err != nil {
+		return fmt.Errorf("write MOS object array: %w", err)
+	}
+	return nil
+}
+
+// recommitChain recomputes the on-disk block-pointer checksum chain after a
+// metadata mutation and returns the fresh rootbp that should go into the new
+// uberblock. ZFS verifies every block by the fletcher4 checksum stored in the
+// blkptr that POINTS AT it, so an in-place rewrite of any block (the ZPL object
+// array via writeDnode, a directory ZAP via updateDirZAP, a file's data/indirect
+// blocks) invalidates the checksum of EVERY block pointer from the uberblock
+// down to it. recommitChain walks that path top-down and rewrites it bottom-up:
+//
+//	uberblock.rootbp        → MOS objset block
+//	  MOS meta_dnode.bp[0]  → MOS object array      (holds the DSL dataset dnode)
+//	    DSL dataset.ds_bp   → ZPL objset block
+//	      ZPL meta_dnode.bp[0] → ZPL object array   (rewritten by writeDnode)
+//
+// Leaf BPs inside the ZPL object array (file data, indirect blocks, directory
+// ZAP blocks) are already checksummed by the write path (WriteFile / MkDir /
+// writeBlockTree / updateDirZAP) and rewritten into the object array before
+// commit, so re-checksumming the object array here covers them too.
+//
+// All blocks are single-DVA, level-0 metadata at fixed physical offsets, so we
+// read each block by its parent BP's DVA, patch the embedded child BP, write the
+// block back, and recompute the parent's fletcher4 over the new bytes.
+func (fs *zfsFS) recommitChain() (blkptr, error) {
+	// Bare-uberblock image (no DSL/ZPL loaded): nothing to recompute —
+	// fall back to bumping the existing rootbp's birth txg.
+	if fs.zplDS == nil {
+		rootBPBuf := make([]byte, blkptrSize)
+		if _, err := fs.f.ReadAt(rootBPBuf, fs.info.Offset+40); err != nil {
+			return blkptr{}, fmt.Errorf("read rootbp: %w", err)
+		}
+		return parseBlkptr(rootBPBuf), nil
+	}
+
+	// readPhys / writePhys operate on the data area (DVAs are relative to it).
+	readPhys := func(bp blkptr) ([]byte, error) {
+		buf := make([]byte, bp.psize())
+		if _, err := fs.f.ReadAt(buf, fs.partOffset+bp.dvaOffset(0)); err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+	writePhys := func(bp blkptr, data []byte) error {
+		_, err := fs.f.WriteAt(data, fs.partOffset+bp.dvaOffset(0))
+		return err
+	}
+
+	// 1. Read the current rootbp (points at the MOS objset block).
+	rootBPBuf := make([]byte, blkptrSize)
+	if _, err := fs.f.ReadAt(rootBPBuf, fs.info.Offset+40); err != nil {
+		return blkptr{}, fmt.Errorf("read rootbp: %w", err)
+	}
+	rootBP := parseBlkptr(rootBPBuf)
+
+	mosObjsetBlk, err := readPhys(rootBP)
+	if err != nil {
+		return blkptr{}, fmt.Errorf("read MOS objset: %w", err)
+	}
+	mosMetaBP := parseBlkptr(mosObjsetBlk[dnodeHdrSize : dnodeHdrSize+blkptrSize])
+
+	// 2. Read the MOS object array and locate the head DSL dataset dnode,
+	//    whose bonus ds_bp points at the ZPL objset block.
+	mosObjArray, err := readPhys(mosMetaBP)
+	if err != nil {
+		return blkptr{}, fmt.Errorf("read MOS object array: %w", err)
+	}
+	dsObjNum := fs.zplDS.headDSObjNum
+	dsOff := int(dsObjNum) * dnodeMinSize
+	if dsOff+dnodeMinSize > len(mosObjArray) {
+		return blkptr{}, fmt.Errorf("DSL dataset object %d out of MOS array", dsObjNum)
+	}
+	dsDN, err := parseDnode(mosObjArray[dsOff : dsOff+dnodeMinSize])
+	if err != nil {
+		return blkptr{}, fmt.Errorf("parse DSL dataset dnode: %w", err)
+	}
+	bonusBase := dnodeHdrSize + int(dsDN.nblkptr)*blkptrSize
+	zplBPOff := bonusBase + dsBP // ds_bp sits at offset dsBP within the bonus
+	if zplBPOff+blkptrSize > len(mosObjArray[dsOff:dsOff+dnodeMinSize]) {
+		return blkptr{}, fmt.Errorf("ds_bp out of DSL dataset dnode")
+	}
+	zplBP := parseBlkptr(mosObjArray[dsOff+zplBPOff : dsOff+zplBPOff+blkptrSize])
+
+	// 3. Read the ZPL objset block; its meta_dnode bp[0] points at the ZPL
+	//    object array (the block writeDnode rewrote in place).
+	zplObjsetBlk, err := readPhys(zplBP)
+	if err != nil {
+		return blkptr{}, fmt.Errorf("read ZPL objset: %w", err)
+	}
+	zplMetaBP := parseBlkptr(zplObjsetBlk[dnodeHdrSize : dnodeHdrSize+blkptrSize])
+
+	// ── Bottom-up recompute ──────────────────────────────────────────────
+
+	// (a) ZPL object array → zplMetaBP checksum.
+	zplObjArray, err := readPhys(zplMetaBP)
+	if err != nil {
+		return blkptr{}, fmt.Errorf("read ZPL object array: %w", err)
+	}
+	setBPChecksum(&zplMetaBP, zplObjArray)
+	encodeBlkptr(zplMetaBP, zplObjsetBlk[dnodeHdrSize:dnodeHdrSize+blkptrSize])
+	if err := writePhys(zplBP, zplObjsetBlk); err != nil {
+		return blkptr{}, fmt.Errorf("write ZPL objset: %w", err)
+	}
+
+	// (b) ZPL objset block → zplBP checksum, stored in the DSL dataset's ds_bp.
+	setBPChecksum(&zplBP, zplObjsetBlk)
+	encodeBlkptr(zplBP, mosObjArray[dsOff+zplBPOff:dsOff+zplBPOff+blkptrSize])
+	if err := writePhys(mosMetaBP, mosObjArray); err != nil {
+		return blkptr{}, fmt.Errorf("write MOS object array: %w", err)
+	}
+
+	// (c) MOS object array → mosMetaBP checksum, stored in the MOS objset block.
+	setBPChecksum(&mosMetaBP, mosObjArray)
+	encodeBlkptr(mosMetaBP, mosObjsetBlk[dnodeHdrSize:dnodeHdrSize+blkptrSize])
+	if err := writePhys(rootBP, mosObjsetBlk); err != nil {
+		return blkptr{}, fmt.Errorf("write MOS objset: %w", err)
+	}
+
+	// (d) MOS objset block → rootbp checksum (returned for the uberblock).
+	setBPChecksum(&rootBP, mosObjsetBlk)
+	return rootBP, nil
 }
 
 // initAllocator computes the next free offset by scanning ZPL block pointers.
