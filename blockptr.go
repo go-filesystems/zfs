@@ -42,6 +42,8 @@ const (
 	bpCompressShift = 32 // bits 38:32
 	bpCompressBits  = 0x7F
 	bpEmbeddedBit   = uint64(1) << 39
+	bpCksumShift    = 40 // bits 47:40 (zio_checksum_t)
+	bpCksumBits     = 0xFF
 	bpTypeShift     = 48 // bits 55:48
 	bpTypeBits      = 0xFF
 	bpLevelShift    = 56 // bits 60:56
@@ -173,21 +175,34 @@ func encodeBlkptr(bp blkptr, b []byte) {
 	}
 }
 
-// makeProp builds a blk_prop value for a data block.
+// makeProp builds a blk_prop value for a block, recording the
+// fletcher4 checksum type at bits 47:40. fletcher4 is the algorithm
+// OpenZFS uses by default for the MOS objset, dnode arrays, ZAPs and
+// data; pairing it with a real blk_cksum (see setBPChecksum) lets real
+// OpenZFS verify our blocks. makePropCksum lets callers override the
+// checksum type (e.g. ZIO_CHECKSUM_OFF for runtime mutation paths that
+// do not yet recompute checksums).
+//
 // lsize and psize are in bytes (must be multiples of 512).
-// Checksum is always set to ZIO_CHECKSUM_OFF (2) so that readers skip verification.
 func makeProp(compress uint8, lsize, psize int, dtype uint8, level uint8) uint64 {
+	return makePropCksum(compress, lsize, psize, dtype, level, zioChecksumFletch4)
+}
+
+// makePropCksum is makeProp with an explicit ZIO checksum type.
+func makePropCksum(compress uint8, lsize, psize int, dtype uint8, level uint8, ctype uint8) uint64 {
 	ls := uint64(lsize/512 - 1)
 	ps := uint64(psize/512 - 1)
-	const checksumOff = uint64(2) << 40 // ZIO_CHECKSUM_OFF at bits 47:40
 	return ls |
 		(ps << 16) |
 		(uint64(compress) << bpCompressShift) |
-		checksumOff |
+		(uint64(ctype&bpCksumBits) << bpCksumShift) |
 		(uint64(dtype) << bpTypeShift) |
 		(uint64(level&bpLevelBits) << bpLevelShift) |
 		bpLEBit
 }
+
+// checksumType returns the ZIO checksum-type byte (bits 47:40).
+func (bp blkptr) checksumType() uint8 { return uint8((bp.prop >> bpCksumShift) & bpCksumBits) }
 
 // makeDVA builds the two DVA words for a block at byteOff with physSize bytes on vdev 0.
 func makeDVA(byteOff int64, physSize int) [2]uint64 {
@@ -198,15 +213,39 @@ func makeDVA(byteOff int64, physSize int) [2]uint64 {
 	return [2]uint64{w0, w1}
 }
 
-// makeBlkptr constructs a block pointer for a single-copy, uncompressed block.
+// makeBlkptr constructs a block pointer for a single-copy block. The
+// blk_prop records the fletcher4 checksum type (see makeProp); the caller
+// fills blk_cksum via setBPChecksum once the physical block bytes are
+// finalised. Use makeBlkptrCksum to pick a different checksum type.
 func makeBlkptr(byteOff int64, physSize, logicalSize int, compress uint8, dtype uint8, level uint8, txg uint64) blkptr {
+	return makeBlkptrCksum(byteOff, physSize, logicalSize, compress, dtype, level, txg, zioChecksumFletch4)
+}
+
+// makeBlkptrCksum is makeBlkptr with an explicit ZIO checksum type.
+func makeBlkptrCksum(byteOff int64, physSize, logicalSize int, compress uint8, dtype uint8, level uint8, txg uint64, ctype uint8) blkptr {
 	var bp blkptr
 	bp.dva[0] = makeDVA(byteOff, physSize)
-	bp.prop = makeProp(compress, logicalSize, physSize, dtype, level)
+	bp.prop = makePropCksum(compress, logicalSize, physSize, dtype, level, ctype)
 	bp.birth = txg
 	bp.physBirth = txg
 	bp.fill = 1
 	return bp
+}
+
+// setBPChecksum computes the on-disk checksum over the physical block
+// bytes `phys` using the algorithm recorded in bp.prop and stores it in
+// bp.cksum. `phys` must be exactly the bytes written at the BP's DVA
+// (post-compression / post-encryption). Embedded and OFF blocks are left
+// untouched.
+func setBPChecksum(bp *blkptr, phys []byte) {
+	if bp.isEmbedded() {
+		return
+	}
+	ctype := bp.checksumType()
+	if ctype == zioChecksumOff || ctype == zioChecksumInherit {
+		return
+	}
+	bp.cksum = blockChecksum(ctype, phys)
 }
 
 // readBlock reads the logical content of a block pointer from r.

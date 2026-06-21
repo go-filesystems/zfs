@@ -255,7 +255,7 @@ func (fs *zfsFS) WriteFile(path string, data []byte, perm os.FileMode) error {
 		if _, err := fs.f.WriteAt(block, fs.partOffset+off); err != nil {
 			return fmt.Errorf("zfs: WriteFile: write data block %d: %w", i, err)
 		}
-		dataBPs[i] = makeBlkptr(off, bsz, bsz, zcompressOff, dmotPlainFileContents, 0, fs.curTxg)
+		dataBPs[i] = makeBlkptrCksum(off, bsz, bsz, zcompressOff, dmotPlainFileContents, 0, fs.curTxg, zioChecksumOff)
 	}
 
 	// Build the dnode. nblkptr=1 by default — multi-block files route
@@ -365,8 +365,8 @@ func (fs *zfsFS) MkDir(path string, perm os.FileMode) error {
 	saBonus := writeSABonus(attrs, fs.zplDS.saLayout)
 	dirDN := newDnode(dmotDirContents, 1, dmotSA, uint16(len(saBonus)))
 	dirDN.datablkszsec = uint16(poolBlockSize / 512)
-	dirDN.setBlkptrAt(0, makeBlkptr(zapOff, poolBlockSize, poolBlockSize,
-		zcompressOff, dmotDirContents, 0, fs.curTxg))
+	dirDN.setBlkptrAt(0, makeBlkptrCksum(zapOff, poolBlockSize, poolBlockSize,
+		zcompressOff, dmotDirContents, 0, fs.curTxg, zioChecksumOff))
 	bonusStart := dnodeHdrSize + blkptrSize
 	copy(dirDN.raw[bonusStart:], saBonus)
 	dirDN.encode()
@@ -441,8 +441,8 @@ func (fs *zfsFS) writeBlockTree(dataBPs []blkptr, dataBlockSize, indirBlockSize 
 			}
 			// Indirect BPs carry level = nlevels (so the immediate
 			// parent of dataBPs is level=1, etc.).
-			indirBP := makeBlkptr(off, indirBlockSize, indirBlockSize,
-				zcompressOff, dmotPlainFileContents, uint8(nlevels), fs.curTxg)
+			indirBP := makeBlkptrCksum(off, indirBlockSize, indirBlockSize,
+				zcompressOff, dmotPlainFileContents, uint8(nlevels), fs.curTxg, zioChecksumOff)
 			nextBPs = append(nextBPs, indirBP)
 		}
 		currentBPs = nextBPs

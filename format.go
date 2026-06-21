@@ -48,15 +48,98 @@ const (
 	fmtMasterNodeZAPOff = fmtZPLObjArrayOff + 16*1024  // 0x08B000
 	fmtUnlinkedZAPOff   = fmtMasterNodeZAPOff + 4*1024 // 0x08C000
 	fmtRootDirZAPOff    = fmtUnlinkedZAPOff + 4*1024   // 0x08D000
-	fmtInitialNextFree  = fmtRootDirZAPOff + 4*1024    // 0x08E000
+	fmtConfigOff        = fmtRootDirZAPOff + 4*1024    // 0x08E000 (packed MOS config nvlist)
+	fmtFeatReadZAPOff   = fmtConfigOff + 16*1024       // 0x092000 (features_for_read ZAP)
+	fmtFeatWriteZAPOff  = fmtFeatReadZAPOff + 4*1024   // 0x093000 (features_for_write ZAP)
+	fmtFeatDescZAPOff   = fmtFeatWriteZAPOff + 4*1024  // 0x094000 (feature_descriptions ZAP)
+	// DSL special-directory hierarchy that dsl_pool_open() requires on a
+	// v5000 pool: the root DSL dir's child map ($MOS/$FREE/$ORIGIN), the
+	// three special dirs, the $ORIGIN head dataset + its origin snapshot,
+	// their deadlists, and the pool-wide free bpobj. See the block-build
+	// section for how each object is wired.
+	fmtRootChildZAPOff = fmtFeatDescZAPOff + 4*1024  // 0x095000 root dir child map
+	fmtMOSDirOff       = fmtRootChildZAPOff + 4*1024 // 0x096000 $MOS child map
+	fmtFreeDirChildOff = fmtMOSDirOff + 4*1024       // 0x097000 $FREE child map
+	fmtOriginChildOff  = fmtFreeDirChildOff + 4*1024 // 0x098000 $ORIGIN child map
+	fmtOriginHeadDLOff = fmtOriginChildOff + 4*1024  // 0x099000 $ORIGIN head deadlist ZAP
+	fmtOriginSnapDLOff = fmtOriginHeadDLOff + 4*1024 // 0x09A000 origin snapshot deadlist ZAP
+	fmtFreeBpobjOff    = fmtOriginSnapDLOff + 4*1024 // 0x09B000 pool free bpobj data block
+	// Per-DSL-dir property ZAPs. dsl_prop_get_dd() does
+	// zap_lookup(dd_props_zapobj, ...) while resolving inherited
+	// properties; a zero props zapobj points at MOS object 0 (the
+	// meta-dnode, not a ZAP) and zap_lookup returns EINVAL, failing
+	// dsl_pool_open. Each dir therefore needs a real (empty) props ZAP.
+	fmtRootPropsOff   = fmtFreeBpobjOff + 4*1024 // 0x09C000 root dir props
+	fmtMOSPropsOff    = fmtRootPropsOff + 4*1024 // 0x09D000 $MOS dir props
+	fmtFreePropsOff   = fmtMOSPropsOff + 4*1024  // 0x09E000 $FREE dir props
+	fmtOriginPropsOff = fmtFreePropsOff + 4*1024 // 0x09F000 $ORIGIN dir props
+	// $ORIGIN head dataset's snapshot-name map. dsl_dataset_get_snapname()
+	// (reached when zdb sets ZFS_DEBUG_SNAPNAMES) does
+	// zap_value_search(head->ds_snapnames_zapobj, snapobj) to name the
+	// origin snapshot; a zero snapnames obj points at MOS object 0 and
+	// returns EINVAL. The ZAP maps "$ORIGIN" → the snapshot object.
+	fmtOriginSnapNamesOff = fmtOriginPropsOff + 4*1024 // 0x0A0000
+	// Deferred-frees ("sync") bpobj. spa_load_impl() requires the
+	// pool-directory "sync_bplist" entry and opens it as a bpobj
+	// (spa_deferred_bpobj); a missing entry fails the load with ENOENT.
+	fmtSyncBpobjOff = fmtOriginSnapNamesOff + 4*1024 // 0x0A1000
+	// Root head dataset's own deadlist + snapshot-name map. When
+	// dmu_objset_find enumerates the pool's filesystems it holds the root
+	// head dataset (object 3) and opens/closes its deadlist; a zero
+	// deadlist obj makes dsl_deadlist_close dereference an unopened buffer
+	// and zdb -d segfaults.
+	fmtRootDLOff        = fmtSyncBpobjOff + 4*1024     // 0x0A2000 root head deadlist
+	fmtRootSnapNamesOff = fmtRootDLOff + 4*1024        // 0x0A3000 root head snap map
+	fmtInitialNextFree  = fmtRootSnapNamesOff + 4*1024 // 0x0A4000
 
 	fmtObjArraySize = 16 * 1024 // 16 KiB = 32 × 512-byte dnodes
 	fmtObjArrayObjs = fmtObjArraySize / dnodeMinSize
+
+	// fmtConfigBlkSize is the data-block size of the packed config object.
+	// 16 KiB comfortably holds our small config nvlist.
+	fmtConfigBlkSize = 16 * 1024
 
 	// MOS object numbers
 	fmtMOSPoolDirObj    = 1
 	fmtMOSDSLDirObj     = 2
 	fmtMOSDSLDatasetObj = 3
+	fmtMOSConfigObj     = 4 // packed pool config nvlist (DMU_OT_PACKED_NVLIST)
+	fmtMOSFeatReadObj   = 5 // features_for_read ZAP (empty on a no-feature pool)
+	fmtMOSFeatWriteObj  = 6 // features_for_write ZAP (empty on a no-feature pool)
+	fmtMOSFeatDescObj   = 7 // feature_descriptions ZAP (empty on a no-feature pool)
+	// DSL special-directory hierarchy (objects 8..19). dsl_pool_open()
+	// on a v5000 pool walks the root DSL dir's child map for the three
+	// special dirs $MOS / $FREE / $ORIGIN, then for $ORIGIN holds its
+	// head dataset and that head's prev-snapshot (the origin snap). Each
+	// dataset opens its deadlist; the pool also opens the free bpobj
+	// named by the pool-directory "free_bpobj" entry.
+	fmtMOSRootChildObj    = 8  // root DSL dir child map ($MOS/$FREE/$ORIGIN)
+	fmtMOSDirObj          = 9  // $MOS special DSL dir
+	fmtMOSFreeDirObj      = 10 // $FREE special DSL dir
+	fmtMOSOriginDirObj    = 11 // $ORIGIN special DSL dir
+	fmtMOSDirChildObj     = 12 // $MOS dir's (empty) child map
+	fmtMOSFreeChildObj    = 13 // $FREE dir's (empty) child map
+	fmtMOSOriginHeadObj   = 14 // $ORIGIN head dataset
+	fmtMOSOriginChildObj  = 15 // $ORIGIN dir's (empty) child map
+	fmtMOSOriginSnapObj   = 16 // origin snapshot dataset
+	fmtMOSOriginHeadDL    = 17 // $ORIGIN head dataset deadlist
+	fmtMOSOriginSnapDL    = 18 // origin snapshot deadlist
+	fmtMOSFreeBpobjObj    = 19 // pool-wide free bpobj
+	fmtMOSRootPropsObj    = 20 // root DSL dir props ZAP (empty)
+	fmtMOSDirPropsObj     = 21 // $MOS dir props ZAP (empty)
+	fmtMOSFreePropsObj    = 22 // $FREE dir props ZAP (empty)
+	fmtMOSOriginPropsObj  = 23 // $ORIGIN dir props ZAP (empty)
+	fmtMOSOriginSnapNames = 24 // $ORIGIN head dataset snapshot-name map
+	fmtMOSSyncBpobjObj    = 25 // deferred-frees ("sync") bpobj
+	fmtMOSRootDLObj       = 26 // root head dataset deadlist
+	fmtMOSRootSnapNames   = 27 // root head dataset snapshot-name map
+	// fmtMOSObjCount is the number of allocated MOS objects (1..27); it
+	// is the objset block pointer's fill count. Keep in sync with the
+	// highest fmtMOS* object number above.
+	fmtMOSObjCount = 27
+	// fmtZPLObjCount is the number of allocated ZPL objects (master node,
+	// unlinked set, root dir = 1..3).
+	fmtZPLObjCount = 3
 
 	// ZPL object numbers
 	fmtZPLMasterNode = 1
@@ -127,18 +210,78 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 		return err
 	}
 
-	// ── makeBP: convenience wrapper for makeBlkptr with compress=off ─────────
-	makeBP := func(off int64, physSize, logicalSize int, dtype uint8) blkptr {
-		return makeBlkptr(off, physSize, logicalSize, zcompressOff, dtype, 0, fmtPoolTXG)
+	// ── makeBP: convenience wrapper for makeBlkptr with compress=off and a
+	// fletcher4 block checksum computed over the physical block bytes
+	// `phys`. fletcher4 is the algorithm real `zpool create` uses for the
+	// MOS objset, dnode arrays, ZAPs and data on OpenZFS 2.3, so emitting
+	// it (with the matching blk_prop checksum-type) lets `zdb -e -p` verify
+	// our blocks during MOS/objset traversal. `phys` must be exactly the
+	// bytes written at `off`. ───────────────────────────────────────────
+	makeBP := func(off int64, physSize, logicalSize int, dtype uint8, phys []byte) blkptr {
+		bp := makeBlkptrCksum(off, physSize, logicalSize, zcompressOff, dtype, 0, fmtPoolTXG, zioChecksumFletch4)
+		setBPChecksum(&bp, phys)
+		return bp
 	}
 
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	// 1. Build ZAP blocks
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-	// Pool directory ZAP: "root_dataset" → fmtMOSDSLDirObj (2)
+	// Pool directory ZAP: "root_dataset" → 2, "config" → 4,
+	// "features_for_read" → 5, "features_for_write" → 6.
 	poolDirZAP := newMicroZAPBlock(poolBlockSize)
 	mzapInsert(poolDirZAP, dmuPoolRootDataset, fmtMOSDSLDirObj)
+	mzapInsert(poolDirZAP, dmuPoolConfig, fmtMOSConfigObj)
+	mzapInsert(poolDirZAP, dmuPoolFeaturesForRead, fmtMOSFeatReadObj)
+	mzapInsert(poolDirZAP, dmuPoolFeaturesForWrite, fmtMOSFeatWriteObj)
+	mzapInsert(poolDirZAP, dmuPoolFeatureDescriptions, fmtMOSFeatDescObj)
+	mzapInsert(poolDirZAP, dmuPoolFreeBpobj, fmtMOSFreeBpobjObj)
+	mzapInsert(poolDirZAP, dmuPoolSyncBpobj, fmtMOSSyncBpobjObj)
+
+	// Root DSL dir's child map: the three special dirs dsl_pool_open()
+	// requires. Each value is the MOS object number of that special dir.
+	rootChildZAP := newMicroZAPBlock(poolBlockSize)
+	mzapInsert(rootChildZAP, dslMOSDirName, fmtMOSDirObj)
+	mzapInsert(rootChildZAP, dslFreeDirName, fmtMOSFreeDirObj)
+	mzapInsert(rootChildZAP, dslOriginDirName, fmtMOSOriginDirObj)
+
+	// Each special dir has its own (empty) child map.
+	mosDirChildZAP := newMicroZAPBlock(poolBlockSize)
+	freeDirChildZAP := newMicroZAPBlock(poolBlockSize)
+	originDirChildZAP := newMicroZAPBlock(poolBlockSize)
+
+	// Deadlists for the $ORIGIN head dataset and the origin snapshot are
+	// empty microZAPs (mintxg → sub-bpobj); their dl_phys bonus tracks
+	// zero used/comp/uncomp.
+	originHeadDLZAP := newMicroZAPBlock(poolBlockSize)
+	originSnapDLZAP := newMicroZAPBlock(poolBlockSize)
+
+	// The bpobjs' data blocks hold arrays of blkptr_t entries; an empty
+	// bpobj (num_blkptrs = 0) needs only a zero-filled block.
+	freeBpobjBlock := make([]byte, poolBlockSize)
+	syncBpobjBlock := make([]byte, poolBlockSize)
+
+	// Empty per-dir property ZAPs (type DMU_OT_DSL_PROPS).
+	rootPropsZAP := newMicroZAPBlock(poolBlockSize)
+	mosPropsZAP := newMicroZAPBlock(poolBlockSize)
+	freePropsZAP := newMicroZAPBlock(poolBlockSize)
+	originPropsZAP := newMicroZAPBlock(poolBlockSize)
+
+	// $ORIGIN head dataset's snapshot-name map: "$ORIGIN" → the origin
+	// snapshot object, so dsl_dataset_get_snapname's zap_value_search
+	// resolves the snapshot's name.
+	originSnapNamesZAP := newMicroZAPBlock(poolBlockSize)
+	mzapInsert(originSnapNamesZAP, dslOriginDirName, fmtMOSOriginSnapObj)
+
+	// Root head dataset's deadlist (microZAP) + empty snapshot-name map.
+	rootDLZAP := newMicroZAPBlock(poolBlockSize)
+	rootSnapNamesZAP := newMicroZAPBlock(poolBlockSize)
+
+	// features_for_read / features_for_write / feature_descriptions ZAPs
+	// (all empty on a pool with no feature flags enabled).
+	featReadZAP := newMicroZAPBlock(poolBlockSize)
+	featWriteZAP := newMicroZAPBlock(poolBlockSize)
+	featDescZAP := newMicroZAPBlock(poolBlockSize)
 
 	// ZPL master node ZAP: "ROOT"→3, "VERSION"→5
 	masterNodeZAP := newMicroZAPBlock(poolBlockSize)
@@ -159,14 +302,14 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// Object 1: ZPL master node ZAP dnode
 	zplMasterDN := newDnode(dmotMasterNode, 1, dmotNone, 0)
 	zplMasterDN.datablkszsec = uint16(poolBlockSize / 512) // 8
-	zplMasterDN.setBlkptrAt(0, makeBP(fmtMasterNodeZAPOff, poolBlockSize, poolBlockSize, dmotMasterNode))
+	zplMasterDN.setBlkptrAt(0, makeBP(fmtMasterNodeZAPOff, poolBlockSize, poolBlockSize, dmotMasterNode, masterNodeZAP))
 	zplMasterDN.encode()
 	copy(zplObjArray[fmtZPLMasterNode*dnodeMinSize:], zplMasterDN.raw)
 
 	// Object 2: Unlinked set ZAP dnode
 	zplUnlinkedDN := newDnode(dmotUnlinkedSet, 1, dmotNone, 0)
 	zplUnlinkedDN.datablkszsec = uint16(poolBlockSize / 512)
-	zplUnlinkedDN.setBlkptrAt(0, makeBP(fmtUnlinkedZAPOff, poolBlockSize, poolBlockSize, dmotUnlinkedSet))
+	zplUnlinkedDN.setBlkptrAt(0, makeBP(fmtUnlinkedZAPOff, poolBlockSize, poolBlockSize, dmotUnlinkedSet, unlinkedZAP))
 	zplUnlinkedDN.encode()
 	copy(zplObjArray[fmtZPLUnlinked*dnodeMinSize:], zplUnlinkedDN.raw)
 
@@ -188,7 +331,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	saBonus := writeSABonus(rootSAAttrs, layout)
 	zplRootDN := newDnode(dmotDirContents, 1, dmotSA, uint16(len(saBonus)))
 	zplRootDN.datablkszsec = uint16(poolBlockSize / 512)
-	zplRootDN.setBlkptrAt(0, makeBP(fmtRootDirZAPOff, poolBlockSize, poolBlockSize, dmotDirContents))
+	zplRootDN.setBlkptrAt(0, makeBP(fmtRootDirZAPOff, poolBlockSize, poolBlockSize, dmotDirContents, rootDirZAP))
 	// Write bonus into dnode raw
 	bonusStart := dnodeHdrSize + 1*blkptrSize
 	copy(zplRootDN.raw[bonusStart:], saBonus)
@@ -202,7 +345,9 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// ZPL meta_dnode (object 0): describes the ZPL object array
 	zplMetaDN := newDnode(dmotDnode, 1, dmotNone, 0)
 	zplMetaDN.datablkszsec = uint16(fmtObjArraySize / 512) // 32
-	zplMetaDN.setBlkptrAt(0, makeBP(fmtZPLObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode))
+	zplMetaBP := makeBP(fmtZPLObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode, zplObjArray)
+	zplMetaBP.fill = fmtZPLObjCount
+	zplMetaDN.setBlkptrAt(0, zplMetaBP)
 	zplMetaDN.encode()
 	copy(zplObjset[0:], zplMetaDN.raw)
 	// os_type = 2 (DMU_OST_ZFS) at offset 704
@@ -216,38 +361,197 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// Object 1: Pool directory ZAP
 	poolDirDN := newDnode(dmotObjectDirectory, 1, dmotNone, 0)
 	poolDirDN.datablkszsec = uint16(poolBlockSize / 512)
-	poolDirDN.setBlkptrAt(0, makeBP(fmtPoolDirZAPOff, poolBlockSize, poolBlockSize, dmotObjectDirectory))
+	poolDirDN.setBlkptrAt(0, makeBP(fmtPoolDirZAPOff, poolBlockSize, poolBlockSize, dmotObjectDirectory, poolDirZAP))
 	poolDirDN.encode()
 	copy(mosObjArray[fmtMOSPoolDirObj*dnodeMinSize:], poolDirDN.raw)
 
-	// Object 2: DSL directory dnode (bonus = dsl_dir_phys with dd_head_dataset_obj=3)
-	dslDirBonus := make([]byte, 96) // 12 × uint64 = 96 bytes
+	// Object 2: DSL directory dnode. The bonus must be a FULL
+	// dsl_dir_phys_t: OpenZFS dsl_dir_hold_obj() asserts
+	// `doi_bonus_size >= sizeof(dsl_dir_phys_t)` (= 0x100 = 256 bytes),
+	// so a short 96-byte bonus aborts `zdb -e` / import at
+	// dsl_pool_open(). We zero-fill the trailing fields (quota, reserved,
+	// the props/deleg ZAP object ids, used-breakdown, clones, pad), which
+	// is the valid empty state for a freshly created pool.
+	dslDirBonus := make([]byte, dslDirPhysSize) // sizeof(dsl_dir_phys_t)
 	binary.LittleEndian.PutUint64(dslDirBonus[ddHeadDatasetObj:], fmtMOSDSLDatasetObj)
+	// dd_child_dir_zapobj: dsl_pool_open() walks this child map for the
+	// $MOS / $FREE / $ORIGIN special directories. Without it the lookup
+	// runs against object 0 and dsl_pool_open fails with EINVAL.
+	binary.LittleEndian.PutUint64(dslDirBonus[ddChildDirZAPObj:], fmtMOSRootChildObj)
+	binary.LittleEndian.PutUint64(dslDirBonus[ddPropsZAPObj:], fmtMOSRootPropsObj)
+	binary.LittleEndian.PutUint64(dslDirBonus[ddFlags:], dsFlagUsedBreakdown)
 	dslDirDN := newDnode(dmotDSLDir, 1, dmotDSLDir, uint16(len(dslDirBonus)))
 	copy(dslDirDN.raw[dnodeHdrSize+blkptrSize:], dslDirBonus)
 	dslDirDN.encode()
 	copy(mosObjArray[fmtMOSDSLDirObj*dnodeMinSize:], dslDirDN.raw)
 
-	// Object 3: DSL dataset dnode (bonus = dsl_dataset_phys with ds_bp → ZPL objset)
-	dslDSBonus := make([]byte, 320)
+	// Object 3: root head DSL dataset (bonus = dsl_dataset_phys with
+	// ds_bp → ZPL objset). It also needs a real deadlist and snapshot-name
+	// map: dmu_objset_find holds this dataset and opens/closes its
+	// deadlist, and a zero deadlist obj makes dsl_deadlist_close crash.
+	dslDSBonus := make([]byte, dslDatasetPhysSize)
 	binary.LittleEndian.PutUint64(dslDSBonus[dsDirObj:], fmtMOSDSLDirObj) // ds_dir_obj
-	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTime:], now)       // ds_creation_time
-	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTxg:], fmtPoolTXG) // ds_creation_txg
-	zplBP := makeBP(fmtZPLObjsetOff, poolBlockSize, poolBlockSize, dmotObjset)
+	// ds_prev_snap_obj must reference the origin snapshot: with the
+	// $ORIGIN feature present, dsl_dataset_hold_obj asserts every
+	// non-origin dataset descends from a snapshot. Real `zpool create`
+	// makes the root dataset a clone of the origin snapshot (obj 16).
+	binary.LittleEndian.PutUint64(dslDSBonus[dsPrevSnapObj:], fmtMOSOriginSnapObj)     // ds_prev_snap_obj
+	binary.LittleEndian.PutUint64(dslDSBonus[dsPrevSnapTxg:], fmtPoolTXG)              // ds_prev_snap_txg
+	binary.LittleEndian.PutUint64(dslDSBonus[dsSnapnamesZAPObj:], fmtMOSRootSnapNames) // ds_snapnames_zapobj
+	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTime:], now)                    // ds_creation_time
+	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTxg:], fmtPoolTXG)              // ds_creation_txg
+	binary.LittleEndian.PutUint64(dslDSBonus[dsDeadlistObj:], fmtMOSRootDLObj)         // ds_deadlist_obj
+	binary.LittleEndian.PutUint64(dslDSBonus[dsFlags:], dsFlagUniqueAccurate)          // ds_flags
+	zplBP := makeBP(fmtZPLObjsetOff, poolBlockSize, poolBlockSize, dmotObjset, zplObjset)
+	zplBP.fill = fmtZPLObjCount
 	encodeBlkptr(zplBP, dslDSBonus[dsBP:dsBP+blkptrSize])
 	dslDatasetDN := newDnode(dmotDSLDataset, 1, dmotDSLDataset, uint16(len(dslDSBonus)))
 	copy(dslDatasetDN.raw[dnodeHdrSize+blkptrSize:], dslDSBonus)
 	dslDatasetDN.encode()
 	copy(mosObjArray[fmtMOSDSLDatasetObj*dnodeMinSize:], dslDatasetDN.raw)
 
+	// Object 4: packed pool config nvlist (DMU_OT_PACKED_NVLIST). The MOS
+	// config carries the same identity as the label but wraps the leaf in
+	// the synthetic "root" top-level vdev (matching the "MOS Configuration"
+	// dump of a real pool). spa_load reads this to build its trusted
+	// config; without it the import fails with ENOENT on 'config'.
+	configNV := buildMOSConfigNVList(poolName, poolGUID, vdevGUID, uint64(sizeBytes), now)
+	configBlock := make([]byte, fmtConfigBlkSize)
+	copy(configBlock, configNV)
+	// OpenZFS load_nvlist() reads the packed size from the object's bonus
+	// (a single uint64 written by DMU_OT_PACKED_NVLIST_SIZE), then
+	// dmu_read()s exactly that many bytes and nvlist_unpack()s them. A
+	// missing/zero bonus size makes the read return EIO ("unable to
+	// retrieve MOS config"). Store the exact packed length in an 8-byte
+	// bonus of type DMU_OT_PACKED_NVLIST_SIZE.
+	configBonus := make([]byte, 8)
+	binary.LittleEndian.PutUint64(configBonus, uint64(len(configNV)))
+	configDN := newDnode(dmotPackedNVList, 1, dmotPackedNVListSize, uint16(len(configBonus)))
+	configDN.datablkszsec = uint16(fmtConfigBlkSize / 512)
+	configDN.used = uint64(fmtConfigBlkSize)
+	configDN.flags = dnodeFlagUsedBytes
+	configDN.setBlkptrAt(0, makeBP(fmtConfigOff, fmtConfigBlkSize, fmtConfigBlkSize, dmotPackedNVList, configBlock))
+	copy(configDN.raw[dnodeHdrSize+blkptrSize:], configBonus)
+	configDN.encode()
+	copy(mosObjArray[fmtMOSConfigObj*dnodeMinSize:], configDN.raw)
+
+	// Objects 5 & 6: features_for_read / features_for_write ZAPs. These are
+	// ordinary (empty) microZAPs of object type DMU_OT_ZAP; spa_load reads
+	// each feature's refcount from here during feature-flag checking.
+	featReadDN := newDnode(dmotZAPOther, 1, dmotNone, 0)
+	featReadDN.datablkszsec = uint16(poolBlockSize / 512)
+	featReadDN.setBlkptrAt(0, makeBP(fmtFeatReadZAPOff, poolBlockSize, poolBlockSize, dmotZAPOther, featReadZAP))
+	featReadDN.encode()
+	copy(mosObjArray[fmtMOSFeatReadObj*dnodeMinSize:], featReadDN.raw)
+
+	featWriteDN := newDnode(dmotZAPOther, 1, dmotNone, 0)
+	featWriteDN.datablkszsec = uint16(poolBlockSize / 512)
+	featWriteDN.setBlkptrAt(0, makeBP(fmtFeatWriteZAPOff, poolBlockSize, poolBlockSize, dmotZAPOther, featWriteZAP))
+	featWriteDN.encode()
+	copy(mosObjArray[fmtMOSFeatWriteObj*dnodeMinSize:], featWriteDN.raw)
+
+	featDescDN := newDnode(dmotZAPOther, 1, dmotNone, 0)
+	featDescDN.datablkszsec = uint16(poolBlockSize / 512)
+	featDescDN.setBlkptrAt(0, makeBP(fmtFeatDescZAPOff, poolBlockSize, poolBlockSize, dmotZAPOther, featDescZAP))
+	featDescDN.encode()
+	copy(mosObjArray[fmtMOSFeatDescObj*dnodeMinSize:], featDescDN.raw)
+
+	// ── DSL special-directory hierarchy (objects 8..19) ──────────────────
+	// dsl_pool_open() on a v5000 pool requires the root DSL dir to expose
+	// a child map naming $MOS / $FREE / $ORIGIN, then (for $ORIGIN) holds
+	// the head dataset and its prev-snapshot, each opening a deadlist; the
+	// pool also opens the free bpobj named by the pool directory. Helpers
+	// (putDSLDir / putDSLDataset / putZAPObj / putDeadlist / putBpobj)
+	// encode one MOS dnode each into mosObjArray.
+
+	// Object 8: root DSL dir's child map (microZAP, type DSL_DIR_CHILD_MAP).
+	putZAPObj(mosObjArray, fmtMOSRootChildObj, dmotDSLDirChildMap, fmtRootChildZAPOff, poolBlockSize, rootChildZAP, makeBP)
+
+	// Objects 9/10/11: the $MOS / $FREE / $ORIGIN special DSL dirs. $MOS
+	// and $FREE have no head dataset (head=0); $ORIGIN's head dataset is
+	// object 14. All three parent back to the root DSL dir (object 2) and
+	// own an (empty) child map.
+	putDSLDir(mosObjArray, fmtMOSDirObj, dslDirFields{
+		parentObj: fmtMOSDSLDirObj, childZAP: fmtMOSDirChildObj,
+		propsZAP: fmtMOSDirPropsObj, creation: now,
+	})
+	putDSLDir(mosObjArray, fmtMOSFreeDirObj, dslDirFields{
+		parentObj: fmtMOSDSLDirObj, childZAP: fmtMOSFreeChildObj,
+		propsZAP: fmtMOSFreePropsObj, creation: now,
+	})
+	putDSLDir(mosObjArray, fmtMOSOriginDirObj, dslDirFields{
+		parentObj: fmtMOSDSLDirObj, headDataset: fmtMOSOriginHeadObj,
+		childZAP: fmtMOSOriginChildObj, propsZAP: fmtMOSOriginPropsObj, creation: now,
+	})
+
+	// Objects 12/13/15: the three special dirs' (empty) child maps.
+	putZAPObj(mosObjArray, fmtMOSDirChildObj, dmotDSLDirChildMap, fmtMOSDirOff, poolBlockSize, mosDirChildZAP, makeBP)
+	putZAPObj(mosObjArray, fmtMOSFreeChildObj, dmotDSLDirChildMap, fmtFreeDirChildOff, poolBlockSize, freeDirChildZAP, makeBP)
+	putZAPObj(mosObjArray, fmtMOSOriginChildObj, dmotDSLDirChildMap, fmtOriginChildOff, poolBlockSize, originDirChildZAP, makeBP)
+
+	// Object 14: $ORIGIN head dataset. Its ZPL bp is a HOLE (the origin
+	// has no on-disk objset), prev_snap points at the origin snapshot
+	// (16), and it carries its own deadlist (17). dsl_pool_open holds
+	// this then its prev-snapshot.
+	putDSLDataset(mosObjArray, fmtMOSOriginHeadObj, dslDatasetFields{
+		dirObj: fmtMOSOriginDirObj, prevSnap: fmtMOSOriginSnapObj, prevSnapTxg: fmtPoolTXG,
+		snapNamesZAP: fmtMOSOriginSnapNames,
+		deadlist:     fmtMOSOriginHeadDL, creation: now, creationTxg: fmtPoolTXG,
+		guid: vdevGUIDFor(poolGUID ^ 0xA11C), flags: dsFlagUniqueAccurate,
+	})
+
+	// Object 16: the origin snapshot. next_snap points back at the head
+	// (14); num_children = 2 (matches real `zpool create`); bp HOLE.
+	putDSLDataset(mosObjArray, fmtMOSOriginSnapObj, dslDatasetFields{
+		dirObj: fmtMOSOriginDirObj, nextSnap: fmtMOSOriginHeadObj, numChildren: 2,
+		deadlist: fmtMOSOriginSnapDL, creation: now, creationTxg: fmtPoolTXG,
+		guid: vdevGUIDFor(poolGUID ^ 0x5A0F), flags: dsFlagUniqueAccurate, isSnap: true,
+	})
+
+	// Objects 17/18: the two deadlists (microZAP + dsl_deadlist_phys
+	// bonus). Empty: no sub-bpobjs, zero used/comp/uncomp.
+	putDeadlist(mosObjArray, fmtMOSOriginHeadDL, fmtOriginHeadDLOff, poolBlockSize, originHeadDLZAP, makeBP)
+	putDeadlist(mosObjArray, fmtMOSOriginSnapDL, fmtOriginSnapDLOff, poolBlockSize, originSnapDLZAP, makeBP)
+
+	// Object 19: pool-wide free bpobj (empty: bpobj header bonus, no
+	// block pointers). Named by the pool directory's "free_bpobj" key.
+	putBpobj(mosObjArray, fmtMOSFreeBpobjObj, fmtFreeBpobjOff, poolBlockSize, makeBP)
+
+	// Object 25: deferred-frees ("sync") bpobj (empty). Named by the pool
+	// directory's "sync_bplist" key; spa_load opens spa_deferred_bpobj.
+	putBpobj(mosObjArray, fmtMOSSyncBpobjObj, fmtSyncBpobjOff, poolBlockSize, makeBP)
+
+	// Objects 26/27: root head dataset's deadlist + (empty) snapshot-name
+	// map. dmu_objset_find opens and closes the deadlist while walking the
+	// pool's datasets.
+	putDeadlist(mosObjArray, fmtMOSRootDLObj, fmtRootDLOff, poolBlockSize, rootDLZAP, makeBP)
+	putZAPObj(mosObjArray, fmtMOSRootSnapNames, dmotDSLDSSnapMap, fmtRootSnapNamesOff, poolBlockSize, rootSnapNamesZAP, makeBP)
+
+	// Objects 20..23: empty per-dir property ZAPs (DMU_OT_DSL_PROPS).
+	// dsl_prop_get_dd() does zap_lookup(dd_props_zapobj, ...); each dir
+	// must therefore name a real ZAP object, not object 0.
+	putZAPObj(mosObjArray, fmtMOSRootPropsObj, dmotDSLProps, fmtRootPropsOff, poolBlockSize, rootPropsZAP, makeBP)
+	putZAPObj(mosObjArray, fmtMOSDirPropsObj, dmotDSLProps, fmtMOSPropsOff, poolBlockSize, mosPropsZAP, makeBP)
+	putZAPObj(mosObjArray, fmtMOSFreePropsObj, dmotDSLProps, fmtFreePropsOff, poolBlockSize, freePropsZAP, makeBP)
+	putZAPObj(mosObjArray, fmtMOSOriginPropsObj, dmotDSLProps, fmtOriginPropsOff, poolBlockSize, originPropsZAP, makeBP)
+
+	// Object 24: $ORIGIN head dataset's snapshot-name map (DSL_DS_SNAP_MAP).
+	putZAPObj(mosObjArray, fmtMOSOriginSnapNames, dmotDSLDSSnapMap, fmtOriginSnapNamesOff, poolBlockSize, originSnapNamesZAP, makeBP)
+
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	// 5. Build MOS objset block (4 KiB)
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	mosObjset := make([]byte, poolBlockSize)
-	// MOS meta_dnode: describes the MOS object array
+	// MOS meta_dnode: describes the MOS object array. Its block pointer's
+	// fill count must equal the number of allocated MOS objects: zdb's
+	// dump_objset() asserts object_count == usedobjs, and usedobjs is read
+	// from the objset block pointer's fill (== meta-dnode bp fill). We
+	// allocate objects 1..fmtMOSObjCount, so fill = fmtMOSObjCount.
 	mosMetaDN := newDnode(dmotDnode, 1, dmotNone, 0)
 	mosMetaDN.datablkszsec = uint16(fmtObjArraySize / 512) // 32
-	mosMetaDN.setBlkptrAt(0, makeBP(fmtMOSObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode))
+	mosMetaBP := makeBP(fmtMOSObjArrayOff, fmtObjArraySize, fmtObjArraySize, dmotDnode, mosObjArray)
+	mosMetaBP.fill = fmtMOSObjCount
+	mosMetaDN.setBlkptrAt(0, mosMetaBP)
 	mosMetaDN.encode()
 	copy(mosObjset[0:], mosMetaDN.raw)
 	// os_type = 1 (DMU_OST_META) at offset 704
@@ -268,6 +572,25 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 		{fmtMasterNodeZAPOff, masterNodeZAP},
 		{fmtUnlinkedZAPOff, unlinkedZAP},
 		{fmtRootDirZAPOff, rootDirZAP},
+		{fmtConfigOff, configBlock},
+		{fmtFeatReadZAPOff, featReadZAP},
+		{fmtFeatWriteZAPOff, featWriteZAP},
+		{fmtFeatDescZAPOff, featDescZAP},
+		{fmtRootChildZAPOff, rootChildZAP},
+		{fmtMOSDirOff, mosDirChildZAP},
+		{fmtFreeDirChildOff, freeDirChildZAP},
+		{fmtOriginChildOff, originDirChildZAP},
+		{fmtOriginHeadDLOff, originHeadDLZAP},
+		{fmtOriginSnapDLOff, originSnapDLZAP},
+		{fmtFreeBpobjOff, freeBpobjBlock},
+		{fmtRootPropsOff, rootPropsZAP},
+		{fmtMOSPropsOff, mosPropsZAP},
+		{fmtFreePropsOff, freePropsZAP},
+		{fmtOriginPropsOff, originPropsZAP},
+		{fmtOriginSnapNamesOff, originSnapNamesZAP},
+		{fmtSyncBpobjOff, syncBpobjBlock},
+		{fmtRootDLOff, rootDLZAP},
+		{fmtRootSnapNamesOff, rootSnapNamesZAP},
 	}
 	// Shift every data write past VDEV_LABEL_START_SIZE so the on-disk
 	// layout matches what real `zpool create` produces. The DVA values
@@ -281,14 +604,21 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	// 7. Build the rootbp (pointing to the MOS objset)
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-	rootBP := makeBP(fmtMOSObjsetOff, poolBlockSize, poolBlockSize, dmotObjset)
+	rootBP := makeBP(fmtMOSObjsetOff, poolBlockSize, poolBlockSize, dmotObjset, mosObjset)
+	// The objset block pointer's fill is the objset's allocated-object
+	// count (zdb prints it as "N objects" and asserts it on dump).
+	rootBP.fill = fmtMOSObjCount
 
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	// 8. Build and encode the uberblock
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-	// ub_guid_sum is the sum of every leaf vdev guid; with a single leaf
-	// it is just that leaf's guid.
-	ub := encodeUberblock(fmtPoolVersion, fmtPoolTXG, vdevGUID, now, rootBP)
+	// ub_guid_sum is the sum of EVERY vdev guid in the MOS config tree —
+	// both the synthetic root top-level vdev (whose guid == pool_guid) and
+	// the leaf. OpenZFS recomputes this from the trusted config during
+	// spa_load and rejects the pool ("uberblock guid sum doesn't match MOS
+	// guid sum") if it differs.
+	ubGuidSum := poolGUID + vdevGUID
+	ub := encodeUberblock(fmtPoolVersion, fmtPoolTXG, ubGuidSum, now, rootBP)
 
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	// 9. Build and write the four vdev labels
@@ -367,7 +697,7 @@ func buildLabel(nvBuf, ub []byte, labelOff int64, txg uint64) []byte {
 	// bytes; for our ashift=12 pools that is 4 KiB, giving 32 slots.
 	// The active uberblock lives at slot (txg % nslots). ──────────────
 	const ubBase = uberblockRegionOffset
-	slotSize := uberblockSlotSize          // 4 KiB for ashift=12
+	slotSize := uberblockSlotSize // 4 KiB for ashift=12
 	nslots := uberblockRegionSize / slotSize
 	slot := int(txg % uint64(nslots))
 	ubAt := ubBase + slot*slotSize
@@ -404,8 +734,16 @@ func buildLabelNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes, ts
 	}
 	asize &^= (int64(1) << metaslabShift) - 1
 
-	diskChild := nvList{
-		nvString("type", "disk"),
+	// The label's vdev_tree is the TOP-LEVEL vdev itself — for our single
+	// file-backed disk that is the leaf directly, NOT wrapped in a
+	// synthetic "root" node. Real `zpool create` on a file vdev writes
+	// `type: 'file'` here with guid == top_guid; the importer synthesises
+	// the enclosing root vdev on its own. Emitting our own extra "root"
+	// child made OpenZFS see a root-under-root and report "1 missing
+	// top-level vdevs" (EOVERFLOW / error=75) at vdev_tree open, which
+	// blocked `zdb -e -p` and `zpool import`.
+	vdevTree := nvList{
+		nvString("type", "file"),
 		nvUint64("id", 0),
 		nvUint64("guid", vdevGUID),
 		nvString("path", "/dev/disk/by-id/"+poolName),
@@ -415,13 +753,6 @@ func buildLabelNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes, ts
 		nvUint64("asize", uint64(asize)),
 		nvUint64("is_log", 0),
 		nvUint64("create_txg", fmtPoolTXG),
-	}
-	rootChild := nvList{
-		nvString("type", "root"),
-		nvUint64("id", 0),
-		nvUint64("guid", vdevGUID),
-		nvUint64("create_txg", fmtPoolTXG),
-		nvNVListArray("children", []nvList{diskChild}),
 	}
 	config := nvList{
 		nvUint64("version", fmtPoolVersion),
@@ -434,7 +765,188 @@ func buildLabelNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes, ts
 		nvUint64("top_guid", vdevGUID),
 		nvUint64("guid", vdevGUID),
 		nvUint64("vdev_children", 1),
-		nvNVList("vdev_tree", rootChild),
+		nvNVList("vdev_tree", vdevTree),
+		// version 5000 = feature-flags pool; OpenZFS spa_load rejects the
+		// label with "invalid label: 'features_for_read' missing" if this
+		// nvlist is absent. We enable no read-incompatible features, so an
+		// empty list is correct and lets the importer proceed.
+		nvNVList("features_for_read", nvList{}),
+	}
+	return encodeNVListFull(config)
+}
+
+// makeBPFunc is the type of Format()'s makeBP closure: it builds a
+// fletcher4-checksummed, uncompressed, level-0 block pointer for the
+// physical bytes `phys` written at `off`. The DSL-hierarchy helpers take
+// it so they can checksum their data blocks identically to the rest of
+// Format().
+type makeBPFunc func(off int64, physSize, logicalSize int, dtype uint8, phys []byte) blkptr
+
+// dnodeBonusOff is the byte offset of the bonus buffer within a dnode
+// that has nblkptr block pointers: 64-byte header + nblkptr × 128.
+func dnodeBonusOff(nblkptr int) int { return dnodeHdrSize + nblkptr*blkptrSize }
+
+// putZAPObj encodes a single-block microZAP dnode into mosObjArray at
+// object number obj. `zap` is the exact ZAP block bytes scheduled for
+// writing at byte offset off, so the block pointer's checksum is computed
+// over the real content. dtype is the DMU object type (e.g.
+// DMU_OT_DSL_DIR_CHILD_MAP for a DSL child map).
+func putZAPObj(mosObjArray []byte, obj int, dtype uint8, off int64, blockSize int, zap []byte, makeBP makeBPFunc) {
+	dn := newDnode(dtype, 1, dmotNone, 0)
+	dn.datablkszsec = uint16(blockSize / 512)
+	dn.setBlkptrAt(0, makeBP(off, blockSize, blockSize, dtype, zap))
+	dn.encode()
+	copy(mosObjArray[obj*dnodeMinSize:], dn.raw)
+}
+
+// dslDirFields are the dsl_dir_phys_t fields Format() populates.
+type dslDirFields struct {
+	parentObj   uint64
+	headDataset uint64
+	childZAP    uint64
+	propsZAP    uint64
+	creation    uint64
+}
+
+// putDSLDir encodes a DSL directory dnode (no data block — all state is
+// in the dsl_dir_phys_t bonus) into mosObjArray at object number obj.
+func putDSLDir(mosObjArray []byte, obj int, f dslDirFields) {
+	bonus := make([]byte, dslDirPhysSize)
+	le := binary.LittleEndian
+	le.PutUint64(bonus[ddCreationTime:], f.creation)
+	le.PutUint64(bonus[ddHeadDatasetObj:], f.headDataset)
+	le.PutUint64(bonus[ddParentObj:], f.parentObj)
+	le.PutUint64(bonus[ddChildDirZAPObj:], f.childZAP)
+	le.PutUint64(bonus[ddPropsZAPObj:], f.propsZAP)
+	le.PutUint64(bonus[ddFlags:], dsFlagUsedBreakdown)
+	dn := newDnode(dmotDSLDir, 1, dmotDSLDir, uint16(len(bonus)))
+	copy(dn.raw[dnodeBonusOff(1):], bonus)
+	dn.encode()
+	copy(mosObjArray[obj*dnodeMinSize:], dn.raw)
+}
+
+// dslDatasetFields are the dsl_dataset_phys_t fields Format() populates.
+// The ZPL bp is left as a HOLE (all zero) — the origin datasets have no
+// on-disk objset, matching real `zpool create`.
+type dslDatasetFields struct {
+	dirObj       uint64
+	prevSnap     uint64
+	prevSnapTxg  uint64
+	nextSnap     uint64
+	snapNamesZAP uint64
+	numChildren  uint64
+	deadlist     uint64
+	creation     uint64
+	creationTxg  uint64
+	guid         uint64
+	flags        uint64
+	isSnap       bool
+}
+
+// putDSLDataset encodes a DSL dataset dnode (state in the
+// dsl_dataset_phys_t bonus, ZPL bp = HOLE) into mosObjArray at object
+// number obj.
+func putDSLDataset(mosObjArray []byte, obj int, f dslDatasetFields) {
+	bonus := make([]byte, dslDatasetPhysSize)
+	le := binary.LittleEndian
+	le.PutUint64(bonus[dsDirObj:], f.dirObj)
+	le.PutUint64(bonus[dsPrevSnapObj:], f.prevSnap)
+	le.PutUint64(bonus[dsPrevSnapTxg:], f.prevSnapTxg)
+	le.PutUint64(bonus[dsNextSnapObj:], f.nextSnap)
+	le.PutUint64(bonus[dsSnapnamesZAPObj:], f.snapNamesZAP)
+	le.PutUint64(bonus[dsNumChildren:], f.numChildren)
+	le.PutUint64(bonus[dsCreationTime:], f.creation)
+	le.PutUint64(bonus[dsCreationTxg:], f.creationTxg)
+	le.PutUint64(bonus[dsDeadlistObj:], f.deadlist)
+	le.PutUint64(bonus[dsGUID:], f.guid)
+	le.PutUint64(bonus[dsFlags:], f.flags)
+	// ds_bp stays a HOLE (zeroed): the origin head/snapshot have no
+	// on-disk objset on a freshly created pool.
+	bonusType := uint8(dmotDSLDataset)
+	dn := newDnode(dmotDSLDataset, 1, bonusType, uint16(len(bonus)))
+	if f.isSnap {
+		dn.flags = dnodeFlagUsedBytes
+	}
+	copy(dn.raw[dnodeBonusOff(1):], bonus)
+	dn.encode()
+	copy(mosObjArray[obj*dnodeMinSize:], dn.raw)
+}
+
+// putDeadlist encodes a DSL deadlist dnode: a single-block microZAP
+// (mintxg → sub-bpobj, empty here) with a dsl_deadlist_phys_t bonus
+// (zero used/comp/uncomp). dsl_deadlist_open() requires both.
+func putDeadlist(mosObjArray []byte, obj int, off int64, blockSize int, zap []byte, makeBP makeBPFunc) {
+	bonus := make([]byte, dslDeadlistPhysSize) // zeroed dl_used/comp/uncomp
+	dn := newDnode(dmotDeadlist, 1, dmotDeadlistHdr, uint16(len(bonus)))
+	dn.datablkszsec = uint16(blockSize / 512)
+	dn.flags = dnodeFlagUsedBytes
+	dn.setBlkptrAt(0, makeBP(off, blockSize, blockSize, dmotDeadlist, zap))
+	copy(dn.raw[dnodeBonusOff(1):], bonus)
+	dn.encode()
+	copy(mosObjArray[obj*dnodeMinSize:], dn.raw)
+}
+
+// bpobjPhysSize is sizeof(the populated prefix of bpobj_phys_t) that real
+// `zpool create` writes for the free bpobj: bpo_num_blkptrs, bpo_bytes,
+// bpo_comp, bpo_uncomp, bpo_subobjs, bpo_num_subobjs = 6 × 8 = 48 bytes.
+const bpobjPhysSize = 48
+
+// putBpobj encodes an empty bpobj dnode (bpobj_phys_t bonus, zero block
+// pointers) into mosObjArray at object number obj.
+func putBpobj(mosObjArray []byte, obj int, off int64, blockSize int, makeBP makeBPFunc) {
+	block := make([]byte, blockSize) // no blkptr entries
+	bonus := make([]byte, bpobjPhysSize)
+	dn := newDnode(dmotBPObj, 1, dmotBPObjHdr, uint16(len(bonus)))
+	dn.datablkszsec = uint16(blockSize / 512)
+	dn.setBlkptrAt(0, makeBP(off, blockSize, blockSize, dmotBPObj, block))
+	copy(dn.raw[dnodeBonusOff(1):], bonus)
+	dn.encode()
+	copy(mosObjArray[obj*dnodeMinSize:], dn.raw)
+}
+
+// buildMOSConfigNVList builds the packed pool config nvlist stored in the
+// MOS "config" object. It mirrors the on-import "MOS Configuration" that
+// real `zpool create` writes: the same pool identity as the label, but
+// with vdev_tree as the synthetic "root" top-level vdev that contains the
+// single leaf as children[0]. spa_load reads this to assemble its trusted
+// config after the untrusted label config gets it as far as the MOS.
+func buildMOSConfigNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes, ts uint64) []byte {
+	const metaslabShift = 24
+	asize := int64(totalBytes) - vdevLabelStartSize - 2*vdevLabelSize
+	if asize < 0 {
+		asize = 0
+	}
+	asize &^= (int64(1) << metaslabShift) - 1
+
+	leaf := nvList{
+		nvString("type", "file"),
+		nvUint64("id", 0),
+		nvUint64("guid", vdevGUID),
+		nvString("path", "/dev/disk/by-id/"+poolName),
+		nvUint64("metaslab_array", fmtVdevMetaslabArray),
+		nvUint64("metaslab_shift", metaslabShift),
+		nvUint64("ashift", 12),
+		nvUint64("asize", uint64(asize)),
+		nvUint64("is_log", 0),
+		nvUint64("create_txg", fmtPoolTXG),
+	}
+	root := nvList{
+		nvString("type", "root"),
+		nvUint64("id", 0),
+		nvUint64("guid", poolGUID),
+		nvUint64("create_txg", fmtPoolTXG),
+		nvNVListArray("children", []nvList{leaf}),
+	}
+	config := nvList{
+		nvUint64("version", fmtPoolVersion),
+		nvString("name", poolName),
+		nvUint64("state", 0),
+		nvUint64("txg", fmtPoolTXG),
+		nvUint64("pool_guid", poolGUID),
+		nvUint64("errata", 0),
+		nvUint64("vdev_children", 1),
+		nvNVList("vdev_tree", root),
+		nvNVList("features_for_read", nvList{}),
 	}
 	return encodeNVListFull(config)
 }
