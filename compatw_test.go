@@ -97,6 +97,50 @@ func TestWriteThenZdb(t *testing.T) {
 		t.Fatalf("Close after Format: %v", err)
 	}
 
+	// ── Mutate the pool BEFORE the zdb checks ────────────────────────────
+	// A format-only pool is trivially zdb-clean because nothing was ever
+	// rewritten in place. The real gate is whether a pool we WROTE INTO is
+	// still zdb -e -bcc clean: every in-place metadata rewrite (writeDnode /
+	// updateDirZAP, and the objset/MOS/uberblock commit path) must
+	// recompute the fletcher4 block-pointer checksums all the way up the
+	// chain. Write several files, a directory, a nested file, a multi-block
+	// file (forces an indirect-block tree), and overwrite one file, then
+	// run the same zdb traversal below. Before the writer's checksum-chain
+	// fix this run reported errno 52 / a checksum mismatch on `<3,0,0,0>`.
+	fsw, err := Open(imgPath, -1)
+	if err != nil {
+		t.Fatalf("Open for write phase: %v", err)
+	}
+	if err := fsw.WriteFile("/alpha.txt", []byte("alpha contents\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile alpha: %v", err)
+	}
+	if err := fsw.WriteFile("/beta.txt", []byte("beta contents, a little longer\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile beta: %v", err)
+	}
+	if err := fsw.MkDir("/dir1", 0o755); err != nil {
+		t.Fatalf("MkDir dir1: %v", err)
+	}
+	if err := fsw.WriteFile("/dir1/nested.txt", []byte("nested file\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile nested: %v", err)
+	}
+	// Multi-block file (> 128 KiB → 128 KiB blocks + at least one indirect
+	// block), so the indirect-block BPs are exercised too.
+	big := make([]byte, 300*1024)
+	for i := range big {
+		big[i] = byte(i * 7)
+	}
+	if err := fsw.WriteFile("/big.bin", big, 0o644); err != nil {
+		t.Fatalf("WriteFile big: %v", err)
+	}
+	// Overwrite an existing file (frees old extent, reallocates, rewrites
+	// the dnode + chain a second time).
+	if err := fsw.WriteFile("/alpha.txt", []byte("alpha REWRITTEN with different length contents\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile alpha overwrite: %v", err)
+	}
+	if err := fsw.Close(); err != nil {
+		t.Fatalf("Close after writes: %v", err)
+	}
+
 	// `zdb -l <imgfile>` dumps the four vdev labels: it unpacks each
 	// label's XDR nvlist config and validates the label's embedded
 	// ZIO_CHECKSUM_LABEL self-checksum. This is the right granularity
