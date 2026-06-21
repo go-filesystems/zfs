@@ -66,7 +66,28 @@ const (
 	fmtPoolVersion = 5000      // pool feature flags version
 	fmtZPLVersion  = uint64(5) // ZPL version
 	fmtPoolTXG     = uint64(1) // genesis transaction group
+
+	// fmtVdevMetaslabArray is the MOS object id recorded in the leaf
+	// vdev's metaslab_array nvpair. Our minimal writer does not build
+	// per-metaslab spacemaps, so this is a nominal value: it makes the
+	// label nvlist complete for `zdb -l` parsing but a full metaslab
+	// load (e.g. `zpool import`) still needs the backing spacemap
+	// objects, which Format() intentionally omits.
+	fmtVdevMetaslabArray = 0
 )
+
+// vdevGUIDFor derives the single leaf vdev's guid from the pool guid.
+// It must differ from the pool guid (OpenZFS treats a leaf whose guid
+// equals the root/pool guid as a duplicate of the root and reports a
+// missing top-level vdev). The mix is deterministic so a given PoolGUID
+// always yields the same vdev guid, keeping Format() reproducible.
+func vdevGUIDFor(poolGUID uint64) uint64 {
+	g := poolGUID ^ 0x9E3779B97F4A7C15 // golden-ratio mix
+	if g == 0 {
+		g = poolGUID | 1
+	}
+	return g
+}
 
 // Format creates a new empty ZFS pool in the file at path.
 // sizeBytes must be at least 4 MiB.
@@ -86,6 +107,10 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	if poolGUID == 0 {
 		poolGUID = uint64(time.Now().UnixNano()) | 1
 	}
+	// The single leaf (= top-level) vdev needs a guid distinct from the
+	// pool guid, exactly as real `zpool create` does: pool_guid
+	// identifies the pool, top_guid/guid identify the vdev.
+	vdevGUID := vdevGUIDFor(poolGUID)
 	now := uint64(time.Now().Unix())
 
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -261,12 +286,14 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	// 8. Build and encode the uberblock
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-	ub := encodeUberblock(fmtPoolVersion, fmtPoolTXG, poolGUID, now, rootBP)
+	// ub_guid_sum is the sum of every leaf vdev guid; with a single leaf
+	// it is just that leaf's guid.
+	ub := encodeUberblock(fmtPoolVersion, fmtPoolTXG, vdevGUID, now, rootBP)
 
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	// 9. Build and write the four vdev labels
 	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-	nvBuf := buildLabelNVList(poolName, poolGUID, poolGUID, uint64(sizeBytes), now)
+	nvBuf := buildLabelNVList(poolName, poolGUID, vdevGUID, uint64(sizeBytes), now)
 
 	// Labels L0/L1 at the start, L2/L3 at the end
 	labelOffsets := []int64{
@@ -276,7 +303,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 		sizeBytes - vdevLabelSize,
 	}
 	for _, labelOff := range labelOffsets {
-		writeAt(labelOff, buildLabel(nvBuf, ub))
+		writeAt(labelOff, buildLabel(nvBuf, ub, labelOff, fmtPoolTXG))
 	}
 
 	f.Sync()
@@ -316,46 +343,84 @@ func encodeUberblock(version, txg, guidSum, ts uint64, rootBP blkptr) []byte {
 //
 //	[0x00000 .. 0x02000)  vl_pad1         (8 KiB, zeroed)
 //	[0x02000 .. 0x04000)  vl_pad2 / boot  (8 KiB, zeroed)
-//	[0x04000 .. 0x20000)  vl_vdev_phys    (112 KiB, XDR nvlist)
-//	[0x20000 .. 0x40000)  vl_uberblock    (128 KiB, 128 × 1 KiB slots)
-func buildLabel(nvBuf, ub []byte) []byte {
+//	[0x04000 .. 0x20000)  vl_vdev_phys    (112 KiB, XDR nvlist + zio_eck_t)
+//	[0x20000 .. 0x40000)  vl_uberblock    (128 KiB uberblock ring)
+//
+// labelOff is the absolute byte offset of this label within the vdev;
+// it seeds the ZIO_CHECKSUM_LABEL verifier for every checksummed region
+// (the vdev_phys nvlist and each uberblock slot). txg is the uberblock's
+// transaction group, which selects the active slot in the ring.
+func buildLabel(nvBuf, ub []byte, labelOff int64, txg uint64) []byte {
 	label := make([]byte, vdevLabelSize)
-	// vdev_phys (XDR nvlist) at offset 0x4000, max 112 KiB. Real ZFS
-	// has 8 KiB pad1 (0x0000..0x2000) plus 8 KiB pad2/boot
-	// (0x2000..0x4000) before the nvlist; the older comment that
-	// described a "4K boot block" was wrong and produced an off-by-8KiB
-	// nvlist position rejected by zdb / zpool import.
-	const nvOff = 16 * 1024 // = 0x4000
-	if len(nvBuf) > 112*1024 {
-		nvBuf = nvBuf[:112*1024]
+
+	// ── vdev_phys (XDR nvlist) at 0x4000, 112 KiB including its
+	// trailing zio_eck_t self-checksum. ───────────────────────────────
+	const nvOff = vdevPhysOffset // = 0x4000
+	nvRegion := label[nvOff : nvOff+vdevPhysSize]
+	if len(nvBuf) > vdevPhysSize-zioEckSize {
+		nvBuf = nvBuf[:vdevPhysSize-zioEckSize]
 	}
-	copy(label[nvOff:], nvBuf)
-	// uberblock slot 0 at 128K
-	ubSlot0 := uberblockRegionOffset
-	if len(ub) > uberblockSize {
-		ub = ub[:uberblockSize]
+	copy(nvRegion, nvBuf)
+	labelSelfChecksum(nvRegion, uint64(labelOff)+nvOff)
+
+	// ── uberblock ring at 0x20000. Slots are max(1<<ashift, 1 KiB)
+	// bytes; for our ashift=12 pools that is 4 KiB, giving 32 slots.
+	// The active uberblock lives at slot (txg % nslots). ──────────────
+	const ubBase = uberblockRegionOffset
+	slotSize := uberblockSlotSize          // 4 KiB for ashift=12
+	nslots := uberblockRegionSize / slotSize
+	slot := int(txg % uint64(nslots))
+	ubAt := ubBase + slot*slotSize
+	ubSlot := label[ubAt : ubAt+slotSize]
+	if len(ub) > slotSize-zioEckSize {
+		ub = ub[:slotSize-zioEckSize]
 	}
-	copy(label[ubSlot0:], ub)
+	copy(ubSlot, ub)
+	labelSelfChecksum(ubSlot, uint64(labelOff)+uint64(ubAt))
+
 	return label
 }
 
 // buildLabelNVList constructs the XDR-encoded nvlist for a vdev label.
-// This is the minimal set of fields that allows `zpool import` to identify
-// the pool.
+//
+// The field set mirrors what real `zpool create` writes (verified
+// against an OpenZFS 2.3 label dump) so that `zdb -l` reports a
+// complete config: the top-level carries pool identity plus top_guid /
+// guid / vdev_children, and the single leaf vdev under vdev_tree
+// carries id / guid / path / metaslab_array / metaslab_shift / ashift /
+// asize / is_log / create_txg.
+//
+// asize is the usable data area (total minus the four labels and the
+// boot reserve), rounded down to a metaslab boundary, matching how
+// OpenZFS derives vdev asize.
 func buildLabelNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes, ts uint64) []byte {
-	// Vdev tree: root vdev containing one disk child
+	// Usable size = total - leading label/boot reserve (4 MiB) - two
+	// trailing labels. metaslab_shift describes the metaslab size; we
+	// use a fixed 2^metaslabShift and align asize down to it.
+	const metaslabShift = 24 // 16 MiB metaslabs (OpenZFS default for small vdevs)
+	asize := int64(totalBytes) - vdevLabelStartSize - 2*vdevLabelSize
+	if asize < 0 {
+		asize = 0
+	}
+	asize &^= (int64(1) << metaslabShift) - 1
+
 	diskChild := nvList{
 		nvString("type", "disk"),
 		nvUint64("id", 0),
 		nvUint64("guid", vdevGUID),
+		nvString("path", "/dev/disk/by-id/"+poolName),
+		nvUint64("metaslab_array", fmtVdevMetaslabArray),
+		nvUint64("metaslab_shift", metaslabShift),
 		nvUint64("ashift", 12),
-		nvUint64("asize", uint64(totalBytes)),
+		nvUint64("asize", uint64(asize)),
 		nvUint64("is_log", 0),
+		nvUint64("create_txg", fmtPoolTXG),
 	}
 	rootChild := nvList{
 		nvString("type", "root"),
 		nvUint64("id", 0),
-		nvUint64("guid", poolGUID),
+		nvUint64("guid", vdevGUID),
+		nvUint64("create_txg", fmtPoolTXG),
 		nvNVListArray("children", []nvList{diskChild}),
 	}
 	config := nvList{
@@ -366,6 +431,9 @@ func buildLabelNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes, ts
 		nvUint64("pool_guid", poolGUID),
 		nvUint64("errata", 0),
 		nvUint64("timestamp", ts),
+		nvUint64("top_guid", vdevGUID),
+		nvUint64("guid", vdevGUID),
+		nvUint64("vdev_children", 1),
 		nvNVList("vdev_tree", rootChild),
 	}
 	return encodeNVListFull(config)
