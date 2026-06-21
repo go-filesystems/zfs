@@ -177,6 +177,22 @@ func (fs *zfsFS) ReadLink(path string) (string, error) {
 	return string(data), nil
 }
 
+// Symlink creates a symbolic link at linkPath whose target is the literal
+// string `target`. The target is stored as the link object's data (with the
+// symlink mode bit set), the same on-disk shape ReadLink decodes and the
+// shrink-rebuild path already emits. The parent of linkPath must exist.
+func (fs *zfsFS) Symlink(target, linkPath string) error {
+	if fs.zplDS == nil {
+		return fmt.Errorf("zfs: Symlink: pool not fully opened")
+	}
+	if fs.alloc == nil {
+		return fmt.Errorf("zfs: Symlink: no allocator (read-only pool?)")
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.symlinkLocked(target, linkPath)
+}
+
 // ── WriteFile ────────────────────────────────────────────────────────────────
 
 // WriteFile creates or overwrites the file at path with data.
