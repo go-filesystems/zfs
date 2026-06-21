@@ -204,7 +204,10 @@ func TestLZJBDecompress_ZeroOffset(t *testing.T) {
 // ── zleDecompress ─────────────────────────────────────────────────────────────
 
 func TestZLEDecompress_Literals(t *testing.T) {
-	got, err := zleDecompress([]byte("hello"), 5)
+	// OpenZFS ZLE: control byte 0x04 (= c) means len = c+1 = 5 literal bytes
+	// follow, copied verbatim.
+	src := append([]byte{0x04}, []byte("hello")...)
+	got, err := zleDecompress(src, 5)
 	if err != nil {
 		t.Fatalf("zleDecompress: %v", err)
 	}
@@ -214,8 +217,10 @@ func TestZLEDecompress_Literals(t *testing.T) {
 }
 
 func TestZLEDecompress_ZeroRun(t *testing.T) {
-	// 'a' [0x00, 0x02] 'b' → "a\x00\x00\x00b" (n = 0x02+1 = 3 zeros)
-	src := []byte{'a', 0x00, 0x02, 'b'}
+	// OpenZFS ZLE (n=64): 0x00 'a' (1 literal), then control 0x42 (= c, c>=64)
+	// encodes len = c+1 = 67 zeros minus n=64 -> 3 zeros, then 0x00 'b'.
+	// Result: "a\x00\x00\x00b".
+	src := []byte{0x00, 'a', 0x42, 0x00, 'b'}
 	got, err := zleDecompress(src, 5)
 	if err != nil {
 		t.Fatalf("zleDecompress zero-run: %v", err)
@@ -226,8 +231,9 @@ func TestZLEDecompress_ZeroRun(t *testing.T) {
 }
 
 func TestZLEDecompress_ZeroAtEnd(t *testing.T) {
-	// [0x00] alone at end of src → `si >= len(src)` after reading the zero → di++
-	src := []byte{0x00}
+	// OpenZFS ZLE (n=64): control 0x40 (= c, c>=64) -> len = c+1 = 65, 65-64 = 1
+	// zero byte, no following data.
+	src := []byte{0x40}
 	got, err := zleDecompress(src, 1)
 	if err != nil {
 		t.Fatalf("zleDecompress zero-at-end: %v", err)
