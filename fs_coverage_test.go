@@ -428,13 +428,15 @@ func TestReadDirEntries_InvalidObjNum(t *testing.T) {
 // ── allocObjectNum pool-full ──────────────────────────────────────────────────
 
 func TestAllocObjectNum_PoolFull(t *testing.T) {
-	// Fill all available object slots (4..fmtObjArrayObjs-1 = 4..31) with files.
+	// Fill all available object slots with files.
 	// fmtObjArrayObjs = fmtObjArraySize/dnodeMinSize = 16384/512 = 32
-	// Slots 0–3 are pre-used by format. Slots 4–31 = 28 available slots.
+	// Objects 1..fmtZPLObjCount are pre-used by format (master node,
+	// unlinked set, root dir, SA master/registry/layouts). Free user slots
+	// are (fmtZPLObjCount+1)..31.
 	fs := newTestFS(t)
 
-	// Create 28 files to fill all free slots.
-	for i := 0; i < fmtObjArrayObjs-4; i++ {
+	// Create exactly enough files to fill all free slots.
+	for i := 0; i < fmtObjArrayObjs-(fmtZPLObjCount+1); i++ {
 		name := "/" + string([]byte{'a' + byte(i/26), 'a' + byte(i%26)})
 		if err := fs.WriteFile(name, []byte("x"), 0o644); err != nil {
 			t.Fatalf("WriteFile %d: %v", i, err)
@@ -651,9 +653,11 @@ func TestCommitUberblock_ClosedFile(t *testing.T) {
 }
 
 func TestUpdateDirZAP_NullBP(t *testing.T) {
-	// Object 4 in a fresh pool is all-zeros → blkptrAt(0).isNull()=true → error.
+	// A free object slot (past the format-reserved objects 1..fmtZPLObjCount)
+	// is all-zeros → blkptrAt(0).isNull()=true → error.
 	fs := newTestFS(t)
-	if err := fs.updateDirZAP(4, "x", 1, false); err == nil {
+	freeObj := uint64(fmtZPLObjCount + 1)
+	if err := fs.updateDirZAP(freeObj, "x", 1, false); err == nil {
 		t.Fatal("expected error for null BP in free dnode")
 	}
 }
