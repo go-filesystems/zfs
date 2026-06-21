@@ -237,7 +237,11 @@ func TestZfsShrink_Snapshot_AutoRoutesToRebuild_InPlaceRefuses(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	zfs := fs.(*zfsFS)
-	// Inject a fake prev_snap obj into the head dataset's bonus.
+	// Spoof a user-visible snapshot: insert a named entry into the head
+	// dataset's snapshot-name ZAP (ds_snapnames_zapobj). hasSnapshots()
+	// keys off that ZAP being non-empty — ds_prev_snap_obj is always set
+	// on a v5000 pool (it points at the hidden $ORIGIN snapshot) so it is
+	// no longer a snapshot indicator.
 	mos := zfs.zplDS.mos
 	dslDirDN, err := mos.readObject(fmtMOSDSLDirObj)
 	if err != nil {
@@ -253,17 +257,29 @@ func TestZfsShrink_Snapshot_AutoRoutesToRebuild_InPlaceRefuses(t *testing.T) {
 		t.Fatalf("read DSL dataset: %v", err)
 	}
 	dsBonus := dsDN.bonusData()
-	// Write 0xDEAD into dsPrevSnapObj.
+	snapZAPObj := uint64(0)
 	for i := 0; i < 8; i++ {
-		dsBonus[dsPrevSnapObj+i] = byte((uint64(0xDEAD) >> (8 * i)) & 0xFF)
+		snapZAPObj |= uint64(dsBonus[dsSnapnamesZAPObj+i]) << (8 * i)
 	}
-	if err := mos.writeObject(headDS, dsDN); err != nil {
-		t.Fatalf("write spoofed DS bonus: %v", err)
+	if snapZAPObj == 0 {
+		t.Fatalf("head dataset has no snapnames ZAP to spoof")
 	}
-	// Persist the modified MOS objset block back to disk so that
-	// hasSnapshots() (which reads through fs.f) sees it.
-	// writeObject already wrote the modified object array block; the
-	// inspector reads from the same physical location.
+	snapDN, err := mos.readObject(snapZAPObj)
+	if err != nil {
+		t.Fatalf("read snapnames ZAP dnode: %v", err)
+	}
+	// Read the ZAP's data block, insert "snap1" → some object, write back.
+	blk, err := readDataBlock(zfs.f, zfs.partOffset, snapDN, 0)
+	if err != nil {
+		t.Fatalf("read snapnames ZAP block: %v", err)
+	}
+	if err := mzapInsert(blk, "snap1", 0xDEAD); err != nil {
+		t.Fatalf("insert spoof snapshot: %v", err)
+	}
+	bp := snapDN.blkptrAt(0)
+	if _, err := zfs.f.WriteAt(blk, zfs.partOffset+bp.dvaOffset(0)); err != nil {
+		t.Fatalf("persist spoofed snapnames ZAP: %v", err)
+	}
 
 	if !zfs.hasSnapshots() {
 		t.Fatalf("spoof failed: hasSnapshots still false")

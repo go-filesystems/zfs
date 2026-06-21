@@ -152,11 +152,23 @@ func mzapDelete(blk []byte, key string) error {
 	return fmt.Errorf("zfs: mzap: key %q not found", key)
 }
 
+// mzapDefaultSalt is the per-ZAP hash salt written into mz_salt. OpenZFS
+// asserts (zap_micro.c:zap_hash) that the salt is non-zero — a zero salt
+// crashes any consumer that performs a zap_lookup (e.g. `zdb -e -p`
+// walking the MOS pool directory). Real ZFS picks a random salt per
+// objset; microZAP lookup recomputes the hash from salt+name and matches
+// on the stored name, so any fixed non-zero value is correct and keeps
+// Format() reproducible. The value is the constant OpenZFS uses to seed
+// zap_create's salt before randomisation (spa_get_random fallback) and is
+// a convenient distinctive non-zero marker.
+const mzapDefaultSalt = uint64(0x0123456789abcdef)
+
 // newMicroZAPBlock creates a new 4096-byte micro-ZAP block.
 func newMicroZAPBlock(blockSize int) []byte {
 	blk := make([]byte, blockSize)
 	binary.LittleEndian.PutUint64(blk[0:8], zbtMicro)
-	// mz_salt and mz_normflags are 0 for simple use
+	// mz_salt (bytes 8:16) must be non-zero; mz_normflags (16:24) = 0.
+	binary.LittleEndian.PutUint64(blk[8:16], mzapDefaultSalt)
 	return blk
 }
 

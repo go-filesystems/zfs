@@ -31,6 +31,11 @@ const (
 	dnodeMinSize = 512
 	dnodeHdrSize = 64 // size of dnode header before blkptrs
 
+	// dnodeFlagUsedBytes is DNODE_FLAG_USED_BYTES: dn_used counts bytes
+	// (not 512B sectors). OpenZFS sets it on objects whose dn_used we want
+	// interpreted directly in bytes.
+	dnodeFlagUsedBytes = 0x1
+
 	// DMU object types (dmu_object_type_t)
 	dmotNone               = 0
 	dmotObjectDirectory    = 1 // MOS pool dir
