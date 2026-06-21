@@ -76,6 +76,14 @@ func nvUint64(name string, val uint64) nvPair {
 	return nvPair{name: name, typ: nvDataTypeUint64, nelem: 1, data: b}
 }
 
+// nvBoolean returns an nvPair holding a DATA_TYPE_BOOLEAN — a name with
+// no value (nelem 0, empty data). ZFS records an enabled feature flag in
+// the label's "features_for_read" nvlist as exactly this: a boolean
+// nvpair keyed by the feature's GUID (e.g. "com.delphix:spacemap_histogram").
+func nvBoolean(name string) nvPair {
+	return nvPair{name: name, typ: nvDataTypeBoolean, nelem: 0, data: nil}
+}
+
 // nvString returns an nvPair holding a string.
 func nvString(name, val string) nvPair {
 	// XDR string: 4 bytes length (BE) + bytes + padding to 4-byte boundary
