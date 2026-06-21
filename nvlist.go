@@ -137,16 +137,31 @@ func encodeNVList(pairs nvList) []byte {
 }
 
 // encodeNVPair encodes a single nvPair into XDR bytes.
+//
+// On-disk shape (all fields big-endian, matching OpenZFS nvs_xdr):
+//
+//	encoded_size (int32) — total bytes of this pair on disk
+//	decoded_size (int32) — size of the native nvpair_t once unpacked
+//	name_len     (int32) — strlen(name), WITHOUT the trailing NUL
+//	name         — name_len bytes, zero-padded to a 4-byte boundary
+//	               (the implied NUL falls inside that padding)
+//	type         (int32) — DATA_TYPE_*
+//	nelem        (int32)
+//	data         — type-dependent XDR value
+//
+// Earlier revisions emitted name_len = strlen+1 and the NUL byte in the
+// stream, and set decoded_size = encoded_size. Both diverged from the
+// spec and made zdb / zpool import fail to unpack the label nvlist.
 func encodeNVPair(p nvPair) []byte {
-	// name_len including null + XDR pad
-	nameBytes := append([]byte(p.name), 0)
-	namePad := xdrPad(len(nameBytes))
-	nameEncoded := append(nameBytes, namePad...)
+	nameLen := len(p.name)                     // strlen, no NUL
+	namePadded := (nameLen + 3) &^ 3           // round up to 4-byte XDR boundary
+	nameEncoded := make([]byte, namePadded)
+	copy(nameEncoded, p.name)
 
 	// Pair content (after encoded_size and decoded_size):
-	// name_len (4) + name + type (4) + nelem (4) + data
+	// name_len (4) + name (padded) + type (4) + nelem (4) + data
 	pairContent := make([]byte, 0, 4+len(nameEncoded)+4+4+len(p.data))
-	pairContent = appendInt32BE(pairContent, int32(len(nameBytes))) // name_len w/ null
+	pairContent = appendInt32BE(pairContent, int32(nameLen))
 	pairContent = append(pairContent, nameEncoded...)
 	pairContent = appendInt32BE(pairContent, p.typ)
 	pairContent = appendInt32BE(pairContent, p.nelem)
@@ -154,13 +169,60 @@ func encodeNVPair(p nvPair) []byte {
 
 	// encoded_size = 4 (encoded_size field) + 4 (decoded_size) + len(pairContent)
 	encodedSize := int32(4 + 4 + len(pairContent))
-	decodedSize := encodedSize // approximate
+	decodedSize := nvpairDecodedSize(nameLen, p)
 
 	var out []byte
 	out = appendInt32BE(out, encodedSize)
 	out = appendInt32BE(out, decodedSize)
 	out = append(out, pairContent...)
 	return out
+}
+
+// nvpairHdrNative is sizeof(nvpair_t) in OpenZFS userland: four 32-bit
+// fields (nvp_size, nvp_name_sz, nvp_value_elem, nvp_type). The name
+// (with its NUL) is laid out immediately after, the whole header+name
+// rounded up to 8 bytes, then the native value (also 8-aligned).
+const nvpairHdrNative = 16
+
+func align8(n int) int { return (n + 7) &^ 7 }
+
+// nvpairDecodedSize computes decoded_size: the number of bytes the pair
+// occupies as a native nvpair_t once unpacked. Verified byte-for-byte
+// against labels written by real `zpool create` (see the commit that
+// introduced it). The formula is:
+//
+//	align8(sizeof(nvpair_t) + namelen + 1) + native_value_size
+func nvpairDecodedSize(nameLen int, p nvPair) int32 {
+	hdr := align8(nvpairHdrNative + nameLen + 1)
+	var val int
+	switch p.typ {
+	case nvDataTypeUint64, nvDataTypeInt64,
+		nvDataTypeUint32, nvDataTypeInt32,
+		nvDataTypeUint16, nvDataTypeInt16,
+		nvDataTypeUint8, nvDataTypeInt8,
+		nvDataTypeByte, nvDataTypeBoolValue:
+		// Scalars are stored as a single 8-byte native slot.
+		val = 8
+	case nvDataTypeString:
+		// data = 4-byte XDR length + string bytes (NUL-padded to 4).
+		// Native string = strlen+1 rounded to 8.
+		strLen := 0
+		if len(p.data) >= 4 {
+			strLen = int(binary.BigEndian.Uint32(p.data[:4]))
+		}
+		val = align8(strLen + 1)
+	case nvDataTypeUint64Array, nvDataTypeInt64Array:
+		val = align8(8 * int(p.nelem))
+	case nvDataTypeNVList:
+		// One native nvlist_t handle.
+		val = 24
+	case nvDataTypeNVListArray:
+		// nelem native nvlist_t handles, 32 bytes apiece.
+		val = 32 * int(p.nelem)
+	default:
+		val = align8(len(p.data))
+	}
+	return int32(hdr + val)
 }
 
 // encodeNVListFull encodes an nvList with the spec-compliant 4-byte
