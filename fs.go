@@ -554,6 +554,30 @@ func (fs *zfsFS) DeleteFile(path string) error {
 		return fmt.Errorf("zfs: DeleteFile %q: is a directory", path)
 	}
 
+	// Hard-link aware unlink: if more than one directory entry points at
+	// this inode, dropping one name must not free the inode's data. Just
+	// decrement the SA links count, rewrite the SA bonus, and remove the
+	// directory entry. The inode (and its data) stays live for the other
+	// name(s). Only when the last link is removed do we reclaim extents
+	// and zero the dnode.
+	attrs, err := fs.zplDS.readAttrs(objNum)
+	if err != nil {
+		return fmt.Errorf("zfs: DeleteFile %q: read attrs: %w", path, err)
+	}
+	if attrs.links > 1 {
+		attrs.links--
+		saBonus := writeSABonus(attrs, fs.zplDS.saLayout)
+		copy(dn.bonusData(), saBonus)
+		dn.encode()
+		if err := fs.writeDnode(objNum, dn); err != nil {
+			return fmt.Errorf("zfs: DeleteFile %q: rewrite SA: %w", path, err)
+		}
+		if err := fs.updateDirZAP(parentObjNum, name, 0, true); err != nil {
+			return fmt.Errorf("zfs: DeleteFile %q: update dir: %w", path, err)
+		}
+		return fs.commitUberblock()
+	}
+
 	// Reclaim every data / indirect extent referenced by the dnode
 	// before zeroing it out. Without this the bump-pointer allocator
 	// leaks pool space on every DeleteFile and long write/delete loops
@@ -568,6 +592,80 @@ func (fs *zfsFS) DeleteFile(path string) error {
 	// Remove from parent directory ZAP
 	if err := fs.updateDirZAP(parentObjNum, name, 0, true); err != nil {
 		return fmt.Errorf("zfs: DeleteFile %q: update dir: %w", path, err)
+	}
+
+	return fs.commitUberblock()
+}
+
+// ── Link ─────────────────────────────────────────────────────────────────────
+
+// Link adds a new directory entry at newPath that points at the same
+// inode as oldPath (a POSIX hard link). The source must not be a
+// directory and newPath must not already exist. The source inode's SA
+// links count is incremented.
+func (fs *zfsFS) Link(oldPath, newPath string) error {
+	if fs.zplDS == nil {
+		return fmt.Errorf("zfs: Link: pool not fully opened")
+	}
+	if fs.alloc == nil {
+		return fmt.Errorf("zfs: Link: no allocator (read-only pool?)")
+	}
+	oldPath = cleanPath(oldPath)
+	newPath = cleanPath(newPath)
+	newParentPath, newName := parentAndBase(newPath)
+	if newName == "/" {
+		return fmt.Errorf("zfs: Link: cannot link to /")
+	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	// Resolve the source inode.
+	srcObjNum, err := fs.zplDS.lookupPath(fs.f, fs.partOffset, oldPath)
+	if err != nil {
+		return &os.PathError{Op: "link", Path: oldPath, Err: errNotFound}
+	}
+	srcDN, err := fs.zplDS.zplOS.readObject(srcObjNum)
+	if err != nil {
+		return fmt.Errorf("zfs: Link %q: %w", oldPath, err)
+	}
+	if srcDN.typ == dmotDirContents {
+		return fmt.Errorf("zfs: Link %q: is a directory", oldPath)
+	}
+
+	// Resolve the destination parent and reject an existing newPath.
+	newParentObj, err := fs.zplDS.lookupPath(fs.f, fs.partOffset, newParentPath)
+	if err != nil {
+		return &os.PathError{Op: "link", Path: newParentPath, Err: errNotFound}
+	}
+	if ex, _ := fs.zplDS.lookupEntry(fs.f, fs.partOffset, newParentObj, newName); ex != 0 {
+		return &os.PathError{Op: "link", Path: newPath, Err: os.ErrExist}
+	}
+
+	// Derive the directory-entry type bits from the source mode.
+	attrs, err := fs.zplDS.readAttrs(srcObjNum)
+	if err != nil {
+		return fmt.Errorf("zfs: Link %q: read attrs: %w", oldPath, err)
+	}
+	typBits := uint64(8) // DT_REG
+	if attrs.mode&0o170000 == 0o120000 {
+		typBits = 10 // DT_LNK
+	}
+
+	// Add the new directory entry pointing at the same inode.
+	dirEntry := (typBits << 60) | srcObjNum
+	if err := fs.updateDirZAP(newParentObj, newName, dirEntry, false); err != nil {
+		return fmt.Errorf("zfs: Link: update dir: %w", err)
+	}
+
+	// Bump the inode's SA links count and rewrite the SA bonus.
+	attrs.links++
+	saBonus := writeSABonus(attrs, fs.zplDS.saLayout)
+	copy(srcDN.bonusData(), saBonus)
+	srcDN.encode()
+	if err := fs.writeDnode(srcObjNum, srcDN); err != nil {
+		// Best-effort rollback of the directory entry we just added.
+		_ = fs.updateDirZAP(newParentObj, newName, 0, true)
+		return fmt.Errorf("zfs: Link: rewrite SA: %w", err)
 	}
 
 	return fs.commitUberblock()
