@@ -901,14 +901,22 @@ func (fs *zfsFS) commitUberblock() error {
 	now := uint64(time.Now().Unix())
 	ub := encodeUberblock(fs.info.Version, fs.curTxg, fs.info.GUIDSum, now, rootBP)
 
-	slot := int(fs.curTxg % uberblockSlots)
+	// Uberblock ring slots are uberblockSlotSize (4 KiB for ashift=12);
+	// the active slot is txg % nslots, matching OpenZFS and what zdb /
+	// zpool import expect. Each slot carries a ZIO_CHECKSUM_LABEL
+	// self-checksum seeded with the slot's absolute offset.
+	nslots := uberblockRegionSize / uberblockSlotSize
+	slot := int(fs.curTxg % uint64(nslots))
 	for label := 0; label < 2; label++ {
 		// Uberblock ring lives inside the leading label area, NOT in the
 		// data area — use labelOffset (raw partition start) here, not
 		// partOffset (which is data-area-shifted by VDEV_LABEL_START_SIZE).
-		ubOff := fs.labelOffset + int64(label)*vdevLabelSize +
-			uberblockRegionOffset + int64(slot)*uberblockSize
-		fs.f.WriteAt(ub, ubOff)
+		labelOff := fs.labelOffset + int64(label)*vdevLabelSize
+		ubAt := uberblockRegionOffset + slot*uberblockSlotSize
+		slotBuf := make([]byte, uberblockSlotSize)
+		copy(slotBuf, ub)
+		labelSelfChecksum(slotBuf, uint64(labelOff+int64(ubAt)))
+		fs.f.WriteAt(slotBuf, labelOff+int64(ubAt))
 	}
 	return nil
 }
