@@ -27,6 +27,22 @@ const (
 
 	// Keys in the pool directory ZAP
 	dmuPoolRootDataset = "root_dataset"
+	// dmuPoolConfig is DMU_POOL_CONFIG: the pool directory entry whose
+	// value is the MOS object holding the packed pool config nvlist.
+	// OpenZFS spa_load fails with "couldn't get 'config' value in MOS
+	// directory" (ENOENT) when it is absent on a feature-flags pool.
+	dmuPoolConfig = "config"
+	// dmuPoolFeaturesForRead / dmuPoolFeaturesForWrite are the MOS pool
+	// directory entries pointing at the per-feature refcount ZAPs. On a
+	// version-5000 (feature-flags) pool spa_load requires both during the
+	// "Checking feature flags" phase; their ZAPs may be empty when no
+	// read/write-incompatible features are enabled.
+	dmuPoolFeaturesForRead  = "features_for_read"
+	dmuPoolFeaturesForWrite = "features_for_write"
+	// dmuPoolFeatureDescriptions is the MOS pool directory entry pointing
+	// at the ZAP that maps each feature's guid → human description.
+	// spa_load requires it on a feature-flags pool.
+	dmuPoolFeatureDescriptions = "feature_descriptions"
 
 	// dsl_dir_phys_t field offsets in bonus (uint64 LE, dnode has bonustype=DMU_OT_DSL_DIR)
 	ddCreationTime      = 0  // uint64
@@ -37,6 +53,28 @@ const (
 	ddUsedBytes         = 40 // uint64
 	ddCompressedBytes   = 48 // uint64
 	ddUncompressedBytes = 56 // uint64
+	ddPropsZAPObj       = 80 // uint64 (dd_props_zapobj, field 11)
+	// dslDirPhysSize is sizeof(dsl_dir_phys_t) in OpenZFS: 19 named
+	// uint64 fields (creation_time, head_dataset_obj, parent_obj,
+	// origin_obj, child_dir_zapobj, used_bytes, compressed_bytes,
+	// uncompressed_bytes, quota, reserved, props_zapobj, deleg_zapobj,
+	// flags) + dd_used_breakdown[DD_USED_NUM=5] + dd_clones + dd_pad[13]
+	// = 32 × 8 = 256 bytes. dsl_dir_hold_obj() asserts the dnode's bonus
+	// is at least this large, so Format() must emit a full-size bonus.
+	dslDirPhysSize = 256
+	// ddFlags is the byte offset of dd_flags within dsl_dir_phys_t
+	// (field 13: creation_time, head_dataset_obj, parent_obj, origin_obj,
+	// child_dir_zapobj, used_bytes, compressed_bytes, uncompressed_bytes,
+	// quota, reserved, props_zapobj, deleg_zapobj, flags).
+	ddFlags = 96
+	// dsFlagUsedBreakdown is DD_FLAG_USED_BREAKDOWN (1<<0): the dir's
+	// dd_used_breakdown[] fields are valid. Real `zpool create` sets it
+	// on the root DSL dir (flags = 1).
+	dsFlagUsedBreakdown = 1
+	// dsFlagUniqueAccurate is DS_FLAG_UNIQUE_ACCURATE (1<<2): a dataset's
+	// ds_unique_bytes is exact. Real `zpool create` sets it (flags = 4)
+	// on the $ORIGIN head dataset and the origin snapshot.
+	dsFlagUniqueAccurate = 4
 
 	// dsl_dataset_phys_t field offsets in bonus (bonustype=DMU_OT_DSL_DATASET)
 	dsDirObj            = 0   // uint64
@@ -56,6 +94,31 @@ const (
 	dsGUID              = 112 // uint64
 	dsFlags             = 120 // uint64
 	dsBP                = 128 // blkptr_t (128 bytes) = the ZPL object set block pointer
+	// dslDatasetPhysSize is sizeof(dsl_dataset_phys_t): 16 named uint64
+	// fields, then ds_bp (128B blkptr) at 128, then ds_next_clones_obj,
+	// ds_props_obj, ds_userrefs_obj and ds_pad[5] = 0x140 (320) bytes.
+	// OpenZFS dsl_dataset_hold_obj rejects a smaller bonus.
+	dslDatasetPhysSize = 320
+	// dslDeadlistPhysSize is sizeof(dsl_deadlist_phys_t): dl_used,
+	// dl_comp, dl_uncomp + dl_pad[37] = 40 × 8 = 320 bytes. A deadlist
+	// object's bonus must be at least this large for dsl_deadlist_open.
+	dslDeadlistPhysSize = 320
+
+	// Special DSL directory names held under the root dir's child map.
+	// dsl_pool_open() requires all three on a v5000 pool: MOS_DIR_NAME
+	// ($MOS, space accounting for MOS-resident objects), FREE_DIR_NAME
+	// ($FREE, async-destroy free space) and ORIGIN_DIR_NAME ($ORIGIN,
+	// the origin of all clones).
+	dslMOSDirName    = "$MOS"
+	dslFreeDirName   = "$FREE"
+	dslOriginDirName = "$ORIGIN"
+	// dmuPoolFreeBpobj is DMU_POOL_FREE_BPOBJ: the pool-directory entry
+	// naming the pool-wide free bpobj. dsl_pool_open() (>= DEADLISTS)
+	// requires it.
+	dmuPoolFreeBpobj = "free_bpobj"
+	// dmuPoolSyncBpobj is DMU_POOL_SYNC_BPOBJ: the pool-directory entry
+	// naming the deferred-frees bpobj. spa_load_impl() requires it.
+	dmuPoolSyncBpobj = "sync_bplist"
 
 	// ZPL master node keys
 	zplKeyRoot    = "ROOT"
