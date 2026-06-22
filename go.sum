@@ -1,2 +1,6 @@
+github.com/go-volumes/gpt v0.0.0-20260622072431-e1d6ba3b531c h1:dpQtmDhaRvMiaQWByqrS2VY9yG75d4sdy6BOxbUZM1s=
+github.com/go-volumes/gpt v0.0.0-20260622072431-e1d6ba3b531c/go.mod h1:eBAzPkLd8zHkg3WiYGk70M4g6PYY8S5K4JP+kEMs0mw=
+github.com/go-volumes/safeio v0.0.0-20260622072324-7f8eb19f6f8c h1:rOwNQiP0VPnyUcRjiVq9QTOCJkN9heon0325hZdFLaQ=
+github.com/go-volumes/safeio v0.0.0-20260622072324-7f8eb19f6f8c/go.mod h1:QQdGwEUmPSdzD+OPq+ZcKso9ljssqgBXNk0/9z7moho=
 github.com/klauspost/compress v1.18.6 h1:2jupLlAwFm95+YDR+NwD2MEfFO9d4z4Prjl1XXDjuao=
 github.com/klauspost/compress v1.18.6/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=

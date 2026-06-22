@@ -68,23 +68,23 @@ const (
 // saAttrSize maps standard ZPL attribute IDs to their fixed size in bytes.
 // Variable-size attrs (symlink, pad) have size 0 here.
 var saAttrSize = map[uint16]int{
-	zplAtime:   16,
-	zplMtime:   16,
-	zplCtime:   16,
-	zplCrtime:  16,
-	zplGen:     8,
-	zplMode:    8,
-	zplSize:    8,
-	zplParent:  8,
-	zplLinks:   8,
-	zplXattr:   8,
-	zplRdev:    8,
-	zplFlags:   8,
-	zplUID:     8,
-	zplGID:     8,
-	zplPad:     32, // ZPL_PAD: 4 × uint64
-	zplDACLCount: 8, // ZPL_DACL_COUNT
-	zplSymlink: 0, // variable
+	zplAtime:     16,
+	zplMtime:     16,
+	zplCtime:     16,
+	zplCrtime:    16,
+	zplGen:       8,
+	zplMode:      8,
+	zplSize:      8,
+	zplParent:    8,
+	zplLinks:     8,
+	zplXattr:     8,
+	zplRdev:      8,
+	zplFlags:     8,
+	zplUID:       8,
+	zplGID:       8,
+	zplPad:       32, // ZPL_PAD: 4 × uint64
+	zplDACLCount: 8,  // ZPL_DACL_COUNT
+	zplSymlink:   0,  // variable
 }
 
 // saMasterNode holds the SA layer metadata for a ZPL dataset.

@@ -906,16 +906,16 @@ func TestStress_RAIDProfileSweep(t *testing.T) {
 			isRAIDZ := layout == "raidz1" || layout == "raidz2" || layout == "raidz3"
 
 			var (
-				wg                sync.WaitGroup
-				singleOpens       atomic.Int64
-				singleOpenErrs    atomic.Int64
-				multiOpens        atomic.Int64
-				multiOpenErrs     atomic.Int64
-				reads             atomic.Int64
-				readErrs          atomic.Int64
-				lastSingleErr     atomic.Pointer[string]
-				lastMultiOpenErr  atomic.Pointer[string]
-				lastMultiReadErr  atomic.Pointer[string]
+				wg               sync.WaitGroup
+				singleOpens      atomic.Int64
+				singleOpenErrs   atomic.Int64
+				multiOpens       atomic.Int64
+				multiOpenErrs    atomic.Int64
+				reads            atomic.Int64
+				readErrs         atomic.Int64
+				lastSingleErr    atomic.Pointer[string]
+				lastMultiOpenErr atomic.Pointer[string]
+				lastMultiReadErr atomic.Pointer[string]
 			)
 			wg.Add(readers)
 			start := time.Now()
