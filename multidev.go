@@ -20,10 +20,10 @@ import (
 // multiVdevPool wraps a slice of leaf-vdev backends and implements
 // blockBackend by routing each ReadAt through the vdev tree.
 type multiVdevPool struct {
-	primary  blockBackend  // for Sync/Size/Truncate/Close passthrough
-	leaves   []blockBackend // ordered by vdev id
-	tree     *vdev          // root of the vdev tree
-	partOff  int64          // partition offset (raw, same on every leaf)
+	primary blockBackend   // for Sync/Size/Truncate/Close passthrough
+	leaves  []blockBackend // ordered by vdev id
+	tree    *vdev          // root of the vdev tree
+	partOff int64          // partition offset (raw, same on every leaf)
 
 	mu sync.Mutex
 }

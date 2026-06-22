@@ -64,12 +64,12 @@ func extractRAIDFixture(t *testing.T, layout string) []string {
 
 // raidLayoutExpectations describes what the fixture contains.
 type raidLayoutExpectations struct {
-	poolName    string
-	dataset     string // "<pool>/data"
-	helloMD5    string
-	blobMD5     string
-	helloBytes  int
-	blobBytes   int
+	poolName   string
+	dataset    string // "<pool>/data"
+	helloMD5   string
+	blobMD5    string
+	helloBytes int
+	blobBytes  int
 }
 
 func raidLayoutInfo(layout string) raidLayoutExpectations {
@@ -99,7 +99,7 @@ func raidLayoutInfo(layout string) raidLayoutExpectations {
 		poolName: pool,
 		// OpenDataset's "dataset" arg is the path under the pool root
 		// (the pool name is the implicit container, not a segment).
-		dataset: "data",
+		dataset:    "data",
 		helloMD5:   helloMD5[layout],
 		blobMD5:    blobMD5[layout],
 		helloBytes: len(fmt.Sprintf("hello-from-%s\n", layout)),

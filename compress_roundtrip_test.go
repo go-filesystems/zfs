@@ -162,19 +162,19 @@ func refZLEEncode(in []byte) []byte {
 // lz4Payloads returns a spread of inputs that exercise literals-only,
 // short matches, long (extended) matches, and extended literal runs.
 func lz4Payloads() map[string][]byte {
-	rep := bytes.Repeat([]byte("ABCD"), 300)                  // 1200 bytes, long matches
-	mixed := append([]byte("the quick brown fox "), rep...)   // literals then matches
-	zeros := make([]byte, 777)                                // long zero run -> big match
-	textRun := bytes.Repeat([]byte("xyz123"), 64)             // extended-length matches
+	rep := bytes.Repeat([]byte("ABCD"), 300)                   // 1200 bytes, long matches
+	mixed := append([]byte("the quick brown fox "), rep...)    // literals then matches
+	zeros := make([]byte, 777)                                 // long zero run -> big match
+	textRun := bytes.Repeat([]byte("xyz123"), 64)              // extended-length matches
 	literals := []byte("abcdefghijklmnopqrstuvwxyz0123456789") // all-literal (incompressible-ish)
 	return map[string][]byte{
-		"repetitive":  rep,
-		"mixed":       mixed,
-		"zeros":       zeros,
-		"textRun":     textRun,
-		"literals":    literals,
-		"single":      {0x42},
-		"empty":       {},
+		"repetitive": rep,
+		"mixed":      mixed,
+		"zeros":      zeros,
+		"textRun":    textRun,
+		"literals":   literals,
+		"single":     {0x42},
+		"empty":      {},
 	}
 }
 
@@ -196,10 +196,10 @@ func TestLZ4Decompress_RoundTripRealData(t *testing.T) {
 
 func TestZLEDecompress_RoundTripRealData(t *testing.T) {
 	cases := map[string][]byte{
-		"sparse":   append(append([]byte("head"), make([]byte, 500)...), []byte("tail")...),
-		"allZero":  make([]byte, 333),
-		"noZero":   []byte("dense data with no zero bytes at all"),
-		"altZero":  {1, 0, 2, 0, 0, 3, 0, 0, 0, 4},
+		"sparse":  append(append([]byte("head"), make([]byte, 500)...), []byte("tail")...),
+		"allZero": make([]byte, 333),
+		"noZero":  []byte("dense data with no zero bytes at all"),
+		"altZero": {1, 0, 2, 0, 0, 3, 0, 0, 0, 4},
 	}
 	for name, want := range cases {
 		t.Run(name, func(t *testing.T) {

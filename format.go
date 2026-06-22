@@ -534,7 +534,7 @@ func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error) {
 	// the watermark instead of raising the births.) The prev_snap_obj link
 	// to the origin snapshot is unchanged, so dsl_dataset_hold_obj's
 	// "every non-origin dataset descends from a snapshot" invariant holds.
-	binary.LittleEndian.PutUint64(dslDSBonus[dsPrevSnapTxg:], 0) // ds_prev_snap_txg
+	binary.LittleEndian.PutUint64(dslDSBonus[dsPrevSnapTxg:], 0)                       // ds_prev_snap_txg
 	binary.LittleEndian.PutUint64(dslDSBonus[dsSnapnamesZAPObj:], fmtMOSRootSnapNames) // ds_snapnames_zapobj
 	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTime:], now)                    // ds_creation_time
 	binary.LittleEndian.PutUint64(dslDSBonus[dsCreationTxg:], fmtPoolTXG)              // ds_creation_txg

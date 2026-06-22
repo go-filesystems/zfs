@@ -50,10 +50,26 @@ type raidzMap struct {
 	data    []raidzCol // length == acols - nparity
 }
 
+// validRaidzGeom reports whether a RAID-Z geometry is sane. dcols (number
+// of children) must be at least 2 and nparity must be a real parity count
+// strictly smaller than dcols (1..3 in practice), otherwise dataCols =
+// dcols-nparity is zero or negative and the column math divides by zero or
+// makeslices a negative length. The geometry comes straight from the
+// attacker-controlled vdev_tree nvlist, so it must be checked before use.
+func validRaidzGeom(dcols, nparity int) bool {
+	return dcols >= 2 && nparity >= 1 && nparity < dcols
+}
+
 // raidzMapAlloc computes the column layout for a logical IO at sector
 // offset b with size s sectors, on a RAID-Z vdev with `dcols` children
 // and `nparity` parity columns. Sector size = 1 << ashift.
+//
+// The caller must have validated the geometry with validRaidzGeom;
+// raidzMapAlloc returns nil for an invalid geometry rather than panicking.
 func raidzMapAlloc(b, s uint64, dcols, nparity int, ashift uint) *raidzMap {
+	if !validRaidzGeom(dcols, nparity) {
+		return nil
+	}
 	dataCols := dcols - nparity
 	q := s / uint64(dataCols)
 	r := s % uint64(dataCols)
@@ -116,7 +132,13 @@ func raidzRead(children []io.ReaderAt, dataArea int64, offset, size int64, npari
 	}
 	b := uint64(offset / sectorSize)
 	s := uint64(size / sectorSize)
+	if !validRaidzGeom(len(children), nparity) {
+		return nil, fmt.Errorf("zfs: raidz read: invalid geometry dcols=%d nparity=%d", len(children), nparity)
+	}
 	rm := raidzMapAlloc(b, s, len(children), nparity, ashift)
+	if rm == nil {
+		return nil, fmt.Errorf("zfs: raidz read: invalid geometry dcols=%d nparity=%d", len(children), nparity)
+	}
 
 	out := make([]byte, 0, size)
 	for _, dc := range rm.data {
