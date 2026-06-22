@@ -1,3 +1,9 @@
+github.com/go-encryptions/ccm v0.0.0-20260620055113-74db323be0b2 h1:Gky3CPkbtx6TdLJKw/liSsljOz561HDE0gGXoABDObI=
+github.com/go-encryptions/ccm v0.0.0-20260620055113-74db323be0b2/go.mod h1:0XHNptBliXAeC9Ikl/maTnmj6+VWeJ5vZElyTprdYWI=
+github.com/go-encryptions/zfscrypt v0.0.0-20260622110329-4dc309d90ba1 h1:wvb5iMDteCIzjfmaS8WAg/2joF6+F+AW9Lapr0MVJtA=
+github.com/go-encryptions/zfscrypt v0.0.0-20260622110329-4dc309d90ba1/go.mod h1:PzuGFDE4GvnezFgPEbaBdKFaPFsDdxIF8DpaqgdsvUQ=
+github.com/go-filesystems/interface v0.0.0-20260622072638-0b01d4fb163f h1:5HnRecjgsND+ESeX7EgGNvYL5ofL+bzJTqcvcSGo1BI=
+github.com/go-filesystems/interface v0.0.0-20260622072638-0b01d4fb163f/go.mod h1:9WZHAmuKzDWHFtncQuJ3rJYWnAcgX3VsupSqYITgftE=
 github.com/go-volumes/gpt v0.0.0-20260622072431-e1d6ba3b531c h1:dpQtmDhaRvMiaQWByqrS2VY9yG75d4sdy6BOxbUZM1s=
 github.com/go-volumes/gpt v0.0.0-20260622072431-e1d6ba3b531c/go.mod h1:eBAzPkLd8zHkg3WiYGk70M4g6PYY8S5K4JP+kEMs0mw=
 github.com/go-volumes/safeio v0.0.0-20260622072324-7f8eb19f6f8c h1:rOwNQiP0VPnyUcRjiVq9QTOCJkN9heon0325hZdFLaQ=
