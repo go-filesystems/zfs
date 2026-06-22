@@ -627,6 +627,11 @@ func (fs *zfsFS) writeMOSObject(objNum uint64, dn *dnode) error {
 	if bp.isNull() {
 		return fmt.Errorf("zfs: writeMOSObject: MOS meta_dnode BP[%d] is null", blockID)
 	}
+	if blockID >= 1 {
+		// recommitChain reuses the upper blocks' on-disk fills and skips
+		// re-checksumming them unless flagged dirty; this write changes one.
+		fs.mosUpperDirty = true
+	}
 	blkData, err := readBlock(fs.f, fs.partOffset, bp)
 	if err != nil {
 		return fmt.Errorf("zfs: writeMOSObject: read MOS object array: %w", err)

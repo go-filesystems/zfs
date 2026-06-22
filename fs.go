@@ -30,6 +30,11 @@ type fsFields struct {
 	// 2^msShift bytes each.
 	msShift int
 	msCount int
+	// mosUpperDirty is set when a MOS object beyond the first dnode block
+	// (block 0) is written in the current transaction — only Snapshot does
+	// this. recommitChain uses it to skip re-reading/re-checksumming the
+	// upper MOS blocks on the common write path.
+	mosUpperDirty bool
 }
 
 // ── Stat ─────────────────────────────────────────────────────────────────────
@@ -1395,6 +1400,14 @@ func (fs *zfsFS) recommitChain() (blkptr, error) {
 		if bp.isNull() {
 			continue
 		}
+		if !fs.mosUpperDirty {
+			// No MOS object beyond block 0 was written this txg (the common
+			// case — only Snapshot allocates into the upper blocks), so this
+			// block's bytes and BP checksum are unchanged. Reuse its on-disk
+			// fill instead of paying a 16 KiB read + fletcher4 on every write.
+			totalFill += bp.fill
+			continue
+		}
 		blk, err := readPhys(bp)
 		if err != nil {
 			return blkptr{}, fmt.Errorf("read MOS object array block %d: %w", b, err)
@@ -1405,6 +1418,7 @@ func (fs *zfsFS) recommitChain() (blkptr, error) {
 		encodeBlkptr(bp, mosObjsetBlk[off:off+blkptrSize])
 		totalFill += bp.fill
 	}
+	fs.mosUpperDirty = false
 
 	if err := writePhys(rootBP, mosObjsetBlk); err != nil {
 		return blkptr{}, fmt.Errorf("write MOS objset: %w", err)

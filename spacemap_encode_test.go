@@ -14,15 +14,16 @@ import (
 // in coverage_extra_test.go, which landed on main.)
 func TestSnapshotIndirectCopy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "snapind.img")
-	const size = 96 * 1024 * 1024
+	const size = 16 * 1024 * 1024
 	ifs, err := Format(path, size, FormatConfig{PoolName: "snapind"})
 	if err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	fs := ifs.(*zfsFS)
 
-	// >128 KiB → multi-block file routed through indirect block pointers.
-	data := make([]byte, 2*1024*1024)
+	// >128 KiB (several 128 KiB blocks) → routed through indirect block
+	// pointers. Kept small so snapshot's deep-copy stays cheap under -race.
+	data := make([]byte, 384*1024)
 	for i := range data {
 		data[i] = byte(i*31 + 7)
 	}
