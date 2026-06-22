@@ -100,8 +100,24 @@ func parseVdevTree(nv parsedNVList) (*vdev, error) {
 			}
 		}
 	}
+	// H1: for a RAID-Z vdev the attacker-controlled nparity/children count
+	// must form a sane geometry (nparity>=1, nparity<dcols, dcols>=2);
+	// otherwise dcols-nparity is zero/negative and every later read divides
+	// by zero or makeslices a negative length. Reject it at parse time so a
+	// malicious vdev_tree fails the open cleanly.
+	if v.typ == vdevTypeRAIDZ {
+		dcols := len(v.children)
+		if v.nparity > uint64(maxRaidzParity) || !validRaidzGeom(dcols, int(v.nparity)) {
+			return nil, fmt.Errorf("zfs: invalid raidz geometry: %d children, nparity %d",
+				dcols, v.nparity)
+		}
+	}
 	return v, nil
 }
+
+// maxRaidzParity bounds nparity before the narrowing int conversion in the
+// geometry check, so a huge uint64 nparity cannot wrap to a small int.
+const maxRaidzParity = 3
 
 // readVdevTree reads label 0 from `r` (already positioned at the
 // partition start) and returns the parsed vdev_tree.

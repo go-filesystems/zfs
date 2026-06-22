@@ -17,6 +17,8 @@ import (
 	"hash/fnv"
 	"io"
 	"strings"
+
+	"github.com/go-volumes/safeio"
 )
 
 const (
@@ -32,6 +34,15 @@ const (
 	zapLeafHashShift   = 16
 	zapLeafHashTabSize = 1 << zapLeafHashShift // entries in leaf hash table
 	zapLeafChunkSize   = 24                    // sizeof(struct zap_leaf_chunk)
+
+	// maxZapPtrtblShift caps zt_shift (log2 of the number of pointer-table
+	// entries). OpenZFS zap_ptrtbl never exceeds a few million entries; 24
+	// (=16M pointers) is already far past any real ZAP and keeps 1<<shift
+	// from overflowing or producing a multi-exabyte loop bound.
+	maxZapPtrtblShift = 24
+	// maxZapLeafs caps zap_num_leafs, used only to bound the leaf-walk
+	// early-exit; the per-iteration storage bound is the real safety net.
+	maxZapLeafs = 1 << 24
 )
 
 // zapLookup looks up key in the ZAP dnode and returns its uint64 value.
@@ -239,12 +250,41 @@ func parseFatZAP(r io.ReaderAt, partOff int64, dn *dnode, hdrBlock []byte) (map[
 	ptrtblShift := le.Uint64(hdrBlock[zapHdrPtrtblShift:])
 	numLeafs := le.Uint64(hdrBlock[zapHdrNumLeafsOff:])
 
+	// H4: zt_shift and zap_num_leafs come straight off disk. A hostile
+	// zt_shift (e.g. 63) makes numPtrs = 1<<63 and a hostile numLeafs makes
+	// the "stop after numLeafs+1 leaves" condition useless, so the pointer-
+	// table loop would re-read leaf blocks up to 2^63 times → effectively a
+	// hang. Cap the pointer count to what the pointer table storage can
+	// actually address, and cap numLeafs the same way. The embedded table
+	// occupies the back half of the header block (8 bytes per pointer); an
+	// external table is at most one data block of the dnode. Either way the
+	// true upper bound on distinct leaf pointers is far below 2^63.
+	if ptrtblShift > maxZapPtrtblShift {
+		ptrtblShift = maxZapPtrtblShift
+	}
+	if numLeafs > maxZapLeafs {
+		numLeafs = maxZapLeafs
+	}
+
 	result := make(map[string]uint64)
-	visited := make(map[uint64]bool)
+	var visited safeio.VisitSet
 
 	// Walk pointer table to enumerate leaf blocks (avoiding duplicates)
 	numPtrs := uint64(1) << ptrtblShift
 	ptrtblBlknum := le.Uint64(hdrBlock[zapHdrPtrtblOff:]) // zt_blk (0 = embedded)
+
+	// Hard cap on pointer-table iterations: a pointer table can hold at most
+	// (block size / 8) pointers. For the embedded case it is the header
+	// block; for the external case it is one data block. Bound the loop by
+	// numPtrs but never more than the storage can hold.
+	maxPtrs := uint64(len(hdrBlock) / 8)
+	if ptrtblBlknum == 0 {
+		// embedded table lives in the back half only
+		maxPtrs = uint64(len(hdrBlock)/2) / 8
+	}
+	if numPtrs > maxPtrs {
+		numPtrs = maxPtrs
+	}
 
 	// Embedded ptrtbl lives in the SECOND HALF of the header block
 	// (OpenZFS ZAP_EMBEDDED_PTRTBL_SHIFT = block_shift - 3 - 1; ptrtbl
@@ -253,7 +293,15 @@ func parseFatZAP(r io.ReaderAt, partOff int64, dn *dnode, hdrBlock []byte) (map[
 	// header — which was never true on real ZFS.
 	embeddedPtrtblOff := len(hdrBlock) / 2
 
-	for i := uint64(0); i < numPtrs && uint64(len(visited)) < numLeafs+1; i++ {
+	// Read the external pointer table once (not per-iteration) when present.
+	var extPtBlk []byte
+	if ptrtblBlknum != 0 {
+		if blk, err := readDataBlock(r, partOff, dn, ptrtblBlknum); err == nil {
+			extPtBlk = blk
+		}
+	}
+
+	for i := uint64(0); i < numPtrs && uint64(visited.Len()) < numLeafs+1; i++ {
 		var leafBlkNum uint64
 		if ptrtblBlknum == 0 {
 			ptrOff := embeddedPtrtblOff + int(i)*8
@@ -262,21 +310,20 @@ func parseFatZAP(r io.ReaderAt, partOff int64, dn *dnode, hdrBlock []byte) (map[
 			}
 			leafBlkNum = le.Uint64(hdrBlock[ptrOff:])
 		} else {
-			// External pointer table
-			ptBlk, err := readDataBlock(r, partOff, dn, ptrtblBlknum)
-			if err != nil {
-				break
-			}
+			// External pointer table — bound the loop by the table's
+			// actual byte length so a hostile numPtrs cannot run past it.
 			ptrOff := i * 8
-			if int(ptrOff)+8 > len(ptBlk) {
+			if extPtBlk == nil || int(ptrOff)+8 > len(extPtBlk) {
 				break
 			}
-			leafBlkNum = le.Uint64(ptBlk[ptrOff:])
+			leafBlkNum = le.Uint64(extPtBlk[ptrOff:])
 		}
-		if leafBlkNum == 0 || visited[leafBlkNum] {
+		// safeio.VisitSet breaks cycles and de-dups: a pointer table that
+		// repeatedly references the same leaf (or forms a loop) is visited
+		// at most once per distinct block number.
+		if leafBlkNum == 0 || !visited.Add(leafBlkNum) {
 			continue
 		}
-		visited[leafBlkNum] = true
 
 		leafBlk, err := readDataBlock(r, partOff, dn, leafBlkNum)
 		if err != nil {
@@ -373,13 +420,32 @@ func parseFatZAPLeaf(blk []byte) (map[string]uint64, error) {
 		valIntLen := int(blk[off+1])
 		valNumInts := int(le.Uint16(blk[off+10:]))
 
+		// H3: nameLen and numInts*intLen are attacker-controlled uint16s.
+		// They can never legitimately exceed the bytes the leaf block's
+		// array chunks can hold (chunkCount * 21). Clamp both to that
+		// bound so a hostile value cannot drive an oversized allocation in
+		// readZAPLeafValue or an unbounded builder in readZAPLeafString.
+		maxArrayBytes := chunkCount * 21
+		if maxArrayBytes < 0 {
+			maxArrayBytes = 0
+		}
+		if nameLen > maxArrayBytes {
+			nameLen = maxArrayBytes
+		}
+
 		// Read name from chained array chunks
 		name := readZAPLeafString(blk, chunksStart, chunkCount, nameChunk, nameLen)
 		if name == "" {
 			continue
 		}
 
-		// Read value (uint64 or smaller ints, all assembled into uint64)
+		// Read value (uint64 or smaller ints, all assembled into uint64).
+		// Clamp valNumInts so numInts*intLen cannot exceed the leaf's array
+		// capacity (H3); valIntLen is a single byte (<=255) so the product
+		// is then safely bounded.
+		if valIntLen > 0 && valNumInts > maxArrayBytes/valIntLen {
+			valNumInts = maxArrayBytes / valIntLen
+		}
 		val := readZAPLeafValue(blk, chunksStart, chunkCount, valChunk, valNumInts, valIntLen)
 		result[name] = val
 	}
@@ -391,7 +457,14 @@ func readZAPLeafString(blk []byte, chunksStart, nchunks, startChunk, nameLen int
 	var sb strings.Builder
 	chunkIdx := startChunk
 	remaining := nameLen
-	for remaining > 0 && chunkIdx < nchunks {
+	// H3: the le_next chain can form a cycle (A→B→A). VisitSet stops the
+	// walk the moment a chunk index repeats, so a malicious chain cannot
+	// loop even if the per-byte progress invariant were ever defeated.
+	var visited safeio.VisitSet
+	for remaining > 0 && chunkIdx >= 0 && chunkIdx < nchunks {
+		if !visited.Add(uint64(chunkIdx)) {
+			break
+		}
 		off := chunksStart + chunkIdx*zapLeafChunkSize
 		if off+zapLeafChunkSize > len(blk) {
 			break
@@ -427,10 +500,21 @@ func readZAPLeafValue(blk []byte, chunksStart, nchunks, startChunk, numInts, int
 		return 0
 	}
 	totalBytes := numInts * intLen
+	// H3: numInts*intLen is bounded by the caller against the leaf's array
+	// capacity, but guard the allocation defensively against a negative or
+	// overflowing product here too.
+	if totalBytes < 0 {
+		return 0
+	}
 	buf := make([]byte, totalBytes)
 	chunkIdx := startChunk
 	copied := 0
-	for copied < totalBytes && chunkIdx < nchunks {
+	// VisitSet breaks a cyclic le_next chain (H3).
+	var visited safeio.VisitSet
+	for copied < totalBytes && chunkIdx >= 0 && chunkIdx < nchunks {
+		if !visited.Add(uint64(chunkIdx)) {
+			break
+		}
 		off := chunksStart + chunkIdx*zapLeafChunkSize
 		if off+zapLeafChunkSize > len(blk) {
 			break
