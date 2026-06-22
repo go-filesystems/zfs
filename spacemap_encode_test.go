@@ -1,54 +1,17 @@
 package filesystem_zfs
 
 import (
-	"encoding/binary"
 	"path/filepath"
 	"testing"
 )
-
-// TestEncodeSpaceMapLogTwoWord covers the two-word space-map entry path: a
-// single allocated run larger than one single-word entry can hold
-// (smRunMaxUnits << smShift = 128 MiB) must be split, and runs beyond that
-// emit the two-word form (encodeSMTwoWord). Decoding the stream back must
-// recover the original byte length.
-func TestEncodeSpaceMapLogTwoWord(t *testing.T) {
-	const run = int64(300) * 1024 * 1024 // 300 MiB > 128 MiB single-word cap
-	log := encodeSpaceMapLog([]smRange{{off: 0, length: run, typ: smAlloc}})
-	if len(log)%8 != 0 || len(log) == 0 {
-		t.Fatalf("log length %d not a positive multiple of 8", len(log))
-	}
-
-	// Replay: sum the run lengths (single- and two-word) back to `run`.
-	var total int64
-	for i := 0; i+8 <= len(log); i += 8 {
-		w := binary.LittleEndian.Uint64(log[i:])
-		if w>>62 == sm2Prefix { // two-word entry
-			r := int64((w>>spaVdevBits)&((1<<sm2RunBits)-1)) + 1
-			total += r << smShift
-			i += 8
-			continue
-		}
-		r := int64(w&((1<<smRunBits)-1)) + 1
-		total += r << smShift
-	}
-	if total != run {
-		t.Fatalf("decoded run total = %d, want %d", total, run)
-	}
-
-	// Also exercise encodeSMTwoWord directly with a non-zero vdev/offset.
-	w0, w1 := encodeSMTwoWord(int64(64)*1024*1024, int64(200)*1024*1024, 0, smAlloc)
-	if w0>>62 != sm2Prefix {
-		t.Fatalf("two-word entry missing 0b11 prefix: %#x", w0)
-	}
-	if (w1>>sm2OffsetBits)&1 != smAlloc {
-		t.Fatalf("two-word entry type bit wrong: %#x", w1)
-	}
-}
 
 // TestSnapshotIndirectCopy exercises the snapshot deep-copy of a file large
 // enough to use indirect block pointers (copyBlkptrTree's level>0 branch and
 // the full copyObjsetTree path), then confirms both the live file and the
 // snapshot read back identically after a reopen.
+//
+// (The two-word space-map encoding is covered by TestEncodeSpaceMapLogTwoWord
+// in coverage_extra_test.go, which landed on main.)
 func TestSnapshotIndirectCopy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "snapind.img")
 	const size = 96 * 1024 * 1024
