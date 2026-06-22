@@ -1000,7 +1000,11 @@ func TestDeleteFile_WriteDnodeFails(t *testing.T) {
 	// Use a read-only file handle: ReadAt works (lookups succeed) but WriteAt fails
 	// in writeDnode → the error branch at line 376 fires.
 	path := filepath.Join(t.TempDir(), "pool.img")
-	ifs, err := Format(path, 8*1024*1024, FormatConfig{PoolName: "testcov"});var fs *zfsFS;if err==nil { fs = ifs.(*zfsFS) }
+	ifs, err := Format(path, 8*1024*1024, FormatConfig{PoolName: "testcov"})
+	var fs *zfsFS
+	if err == nil {
+		fs = ifs.(*zfsFS)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1046,7 +1050,11 @@ func TestDeleteDir_WriteDnodeFails(t *testing.T) {
 	// Use a read-only file handle: ReadAt works (lookups succeed) but WriteAt fails
 	// in writeDnode → the error branch fires.
 	path := filepath.Join(t.TempDir(), "pool.img")
-	ifs, err := Format(path, 8*1024*1024, FormatConfig{PoolName: "testcov"});var fs *zfsFS;if err==nil { fs = ifs.(*zfsFS) }
+	ifs, err := Format(path, 8*1024*1024, FormatConfig{PoolName: "testcov"})
+	var fs *zfsFS
+	if err == nil {
+		fs = ifs.(*zfsFS)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1175,7 +1183,11 @@ func TestWriteDnode_WriteAtFails(t *testing.T) {
 	// WriteAt fails in writeDnode (covers fs.go line 559).
 	// Use a read-only file handle: ReadAt succeeds but WriteAt returns EBADF.
 	path := filepath.Join(t.TempDir(), "pool.img")
-	ifs, err := Format(path, 8*1024*1024, FormatConfig{PoolName: "testcov"});var fs *zfsFS;if err==nil { fs = ifs.(*zfsFS) }
+	ifs, err := Format(path, 8*1024*1024, FormatConfig{PoolName: "testcov"})
+	var fs *zfsFS
+	if err == nil {
+		fs = ifs.(*zfsFS)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1251,7 +1263,11 @@ func TestUpdateDirZAP_WriteAtFails(t *testing.T) {
 	// WriteAt fails in updateDirZAP (covers fs.go line 603).
 	// Use a read-only file handle: readBlock (ReadAt) succeeds, WriteAt returns EBADF.
 	path := filepath.Join(t.TempDir(), "pool.img")
-	ifs, err := Format(path, 8*1024*1024, FormatConfig{PoolName: "testcov"});var fs *zfsFS;if err==nil { fs = ifs.(*zfsFS) }
+	ifs, err := Format(path, 8*1024*1024, FormatConfig{PoolName: "testcov"})
+	var fs *zfsFS
+	if err == nil {
+		fs = ifs.(*zfsFS)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

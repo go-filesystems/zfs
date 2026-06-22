@@ -25,11 +25,31 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/go-volumes/safeio"
 )
 
 const (
 	dnodeMinSize = 512
 	dnodeHdrSize = 64 // size of dnode header before blkptrs
+
+	// minIndblkshift is the smallest legal dn_indblkshift. An indirect
+	// block must hold at least one blkptr_t (128 bytes), so the body size
+	// 1<<indblkshift must be >= 128 → indblkshift >= 7. A smaller value
+	// makes bpsPerBlock=0 and divides by zero in findDataBP; reject it.
+	minIndblkshift = 7
+	// maxIndblkshift caps the indirect-block body size at 16 MiB
+	// (1<<24). OpenZFS uses at most SPA_MAXBLOCKSHIFT=24; a larger shift
+	// is an attacker trying to force a huge allocation in readBlock.
+	maxIndblkshift = 24
+	// maxNlevels caps dn_nlevels. OpenZFS DN_MAX_LEVELS is 30 in theory
+	// but real objects never exceed a handful; bound the indirect-block
+	// fan-out depth to defeat amplification from a hostile nlevels=255.
+	maxNlevels = 6
+	// maxDnodeDataBytes caps the total bytes readDnodeData will assemble
+	// from a single dnode independent of the device size, a second line
+	// of defence behind the device-size ceiling.
+	maxDnodeDataBytes = 1 << 32 // 4 GiB
 
 	// dnodeFlagUsedBytes is DNODE_FLAG_USED_BYTES: dn_used counts bytes
 	// (not 512B sectors). OpenZFS sets it on objects whose dn_used we want
@@ -240,6 +260,21 @@ func findDataBP(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64) (blkptr
 		return dn.blkptrAt(int(blockID)), nil
 	}
 
+	// H2(c): reject a hostile dn_nlevels (up to 255 on disk) so the
+	// indirect-block traversal cannot be turned into a fan-out
+	// amplification bomb. A legitimate object never exceeds maxNlevels.
+	if dn.nlevels > maxNlevels {
+		return blkptr{}, fmt.Errorf("zfs: dnode nlevels %d exceeds max %d", dn.nlevels, maxNlevels)
+	}
+
+	// H2(a): dn_indblkshift < minIndblkshift would make an indirect block
+	// hold zero blkptrs (bpsPerBlock=0) and divide by zero below; an
+	// oversized shift would force a huge readBlock allocation. Reject both.
+	if dn.indblkshift < minIndblkshift || dn.indblkshift > maxIndblkshift {
+		return blkptr{}, fmt.Errorf("zfs: dnode indblkshift %d out of range [%d,%d]",
+			dn.indblkshift, minIndblkshift, maxIndblkshift)
+	}
+
 	// Multi-level: start from level dn.nlevels-1 down to level 1
 	// Each indirect block contains (indirBlockSize / 128) block pointers.
 	indirBlockSz := int(1) << dn.indblkshift // bytes per indirect block body
@@ -272,7 +307,14 @@ func findDataBP(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64) (blkptr
 		covered /= bpsPerBlock
 		idx := remaining / covered
 		remaining = remaining % covered
-		bp = parseBlkptr(indirData[idx*blkptrSize : idx*blkptrSize+blkptrSize])
+		// H2(b): idx is derived from the attacker-controlled blockID and
+		// geometry; a short/garbage indirect block (or an idx beyond the
+		// blkptrs it actually holds) must error, not slice out of bounds.
+		off := int(idx) * blkptrSize
+		if err := safeio.CheckBounds(off, blkptrSize, len(indirData)); err != nil {
+			return blkptr{}, fmt.Errorf("zfs: indirect blkptr idx %d: %w", idx, err)
+		}
+		bp = parseBlkptr(indirData[off : off+blkptrSize])
 	}
 	return bp, nil
 }
@@ -286,8 +328,31 @@ func readDnodeData(r io.ReaderAt, partOff int64, dn *dnode) ([]byte, error) {
 	if blkSz == 0 {
 		return nil, nil
 	}
+	// C1: dn_maxblkid is attacker-controlled (up to ~2^64). The naive
+	// `make([]byte, 0, int(n)*blkSz)` overflows int and either panics with
+	// "cap out of range" or asks for an impossible allocation → OOM. Bound
+	// the total byte count (n*blkSz) against a fixed ceiling using
+	// safeio.MakeBytes BEFORE allocating, then cap the read loop to the
+	// number of blocks that fit, so a hostile maxblkid yields a clean error
+	// instead of crashing the host.
 	n := dn.maxblkid + 1
-	data := make([]byte, 0, int(n)*blkSz)
+	if n == 0 { // maxblkid == MaxUint64 wrapped to 0
+		return nil, fmt.Errorf("zfs: dnode maxblkid overflow")
+	}
+	// total = n*blkSz computed without overflow; reject if it doesn't fit
+	// in the maxDnodeDataBytes ceiling.
+	maxBlocks := uint64(maxDnodeDataBytes) / uint64(blkSz)
+	if n > maxBlocks {
+		return nil, fmt.Errorf("zfs: dnode data %d blocks × %d exceeds ceiling %d",
+			n, blkSz, maxDnodeDataBytes)
+	}
+	total := int64(n) * int64(blkSz)
+	// Validate total against the ceiling (also rejects total<0); on success
+	// total is safe to use as the slice capacity.
+	if _, err := safeio.MakeBytes(total, maxDnodeDataBytes); err != nil {
+		return nil, err
+	}
+	data := make([]byte, 0, int(total))
 	for i := uint64(0); i < n; i++ {
 		blk, err := readDataBlock(r, partOff, dn, i)
 		if err != nil {

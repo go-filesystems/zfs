@@ -2,12 +2,14 @@ package filesystem_zfs
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"time"
 
 	filesystem "github.com/go-filesystems/interface"
+	"github.com/go-volumes/gpt"
 )
 
 // Verify FS implements the common filesystem interface.
@@ -76,12 +78,12 @@ func (info Info) UberblockRegionOffset(partOffset int64) int64 {
 
 // zfsFS represents an opened ZFS image (unexported concrete type).
 type zfsFS struct {
-	f          blockBackend
-	partOffset int64     // DATA AREA start in `f` (= raw partition start + VDEV_LABEL_START_SIZE)
-	labelOffset int64    // raw partition start in `f` — for label / uberblock / grow operations
-	info       Info
-	crypt      *cryptCtx // non-nil only when opened via OpenFromDeviceDatasetWithKey
-	fsFields   // extra fields defined in fs.go
+	f           blockBackend
+	partOffset  int64 // DATA AREA start in `f` (= raw partition start + VDEV_LABEL_START_SIZE)
+	labelOffset int64 // raw partition start in `f` — for label / uberblock / grow operations
+	info        Info
+	crypt       *cryptCtx // non-nil only when opened via OpenFromDeviceDatasetWithKey
+	fsFields              // extra fields defined in fs.go
 }
 
 // blockBackend is the interface backing zfsFS. The read path uses
@@ -416,90 +418,66 @@ func parseUberblock(buf []byte, off int64, label int, slot int) (Info, error) {
 	}, nil
 }
 
+// partitionOffset locates the byte offset of the ZFS partition within r.
+//
+// M1: the bespoke GPT/MBR parsers (which trusted on-disk LBAs and entry
+// counts without bounds-checking them against the device) are replaced by
+// the shared, hardened go-volumes/gpt parser. gpt validates every length,
+// count, and offset against the device size in int64 arithmetic, so a
+// malicious partition table can no longer overflow an offset or read out of
+// bounds. The historical fallback is preserved: an image with NO partition
+// table (gpt.ErrNoTable) is treated as a bare whole-image pool at offset 0.
+//
+// partIndex >= 0 selects an explicit slot; partIndex < 0 auto-selects the
+// first populated partition.
 func partitionOffset(r io.ReaderAt, partIndex int) (int64, error) {
-	var sig [8]byte
-	if _, err := r.ReadAt(sig[:], sectorSize); err == nil && string(sig[:]) == "EFI PART" {
-		return gptPartOffset(r, partIndex)
+	devSize := deviceSizeOf(r)
+	if devSize <= 0 {
+		// No way to bound the table safely; fall back to whole-image mode
+		// rather than guessing a size that could mis-validate the table.
+		return 0, nil
 	}
 
-	var magic [2]byte
-	if _, err := r.ReadAt(magic[:], 510); err == nil && magic[0] == 0x55 && magic[1] == 0xAA {
-		return mbrPartOffset(r, partIndex)
+	var p gpt.Partition
+	var err error
+	if partIndex >= 0 {
+		p, err = gpt.ByIndex(r, devSize, partIndex)
+	} else {
+		p, err = gpt.First(r, devSize)
 	}
-
-	return 0, nil
+	if err != nil {
+		// A bare filesystem (no GPT/MBR) means "the pool is the whole
+		// image": offset 0, no error — preserving the prior behaviour.
+		// When auto-selecting (partIndex < 0) a table that exists but has
+		// no populated partition is likewise treated as whole-image, since
+		// the pool then lives at the image start.
+		if errors.Is(err, gpt.ErrNoTable) {
+			return 0, nil
+		}
+		if partIndex < 0 && errors.Is(err, gpt.ErrNotFound) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("zfs: locate partition: %w", err)
+	}
+	return p.StartOffset, nil
 }
 
-func gptPartOffset(r io.ReaderAt, partIndex int) (int64, error) {
-	hdr := make([]byte, 92)
-	if _, err := r.ReadAt(hdr, sectorSize); err != nil {
-		return 0, fmt.Errorf("zfs: read GPT header: %w", err)
-	}
-	le := binary.LittleEndian
-	partEntryLBA := le.Uint64(hdr[72:])
-	numParts := le.Uint32(hdr[80:])
-	entrySize := le.Uint32(hdr[84:])
-	if entrySize < 128 {
-		return 0, fmt.Errorf("zfs: unexpected GPT entry size %d", entrySize)
-	}
-
-	tableOff := int64(partEntryLBA) * sectorSize
-	buf := make([]byte, entrySize)
-	for index := uint32(0); index < numParts; index++ {
-		if _, err := r.ReadAt(buf, tableOff+int64(index)*int64(entrySize)); err != nil {
-			break
+// deviceSizeOf returns the byte size of r when it exposes one (every
+// blockBackend does via Size(); *os.File via Stat). It returns 0 when the
+// size cannot be determined, in which case the caller falls back to
+// whole-image mode.
+func deviceSizeOf(r io.ReaderAt) int64 {
+	switch s := r.(type) {
+	case interface{ Size() (int64, error) }:
+		if n, err := s.Size(); err == nil {
+			return n
 		}
-		var typeGUID [16]byte
-		copy(typeGUID[:], buf[:16])
-		startLBA := le.Uint64(buf[32:])
-
-		if partIndex >= 0 {
-			if int(index) != partIndex {
-				continue
-			}
-			if typeGUID == [16]byte{} || startLBA == 0 {
-				return 0, fmt.Errorf("zfs: GPT partition index %d not found", partIndex)
-			}
-			return int64(startLBA) * sectorSize, nil
-		}
-
-		if typeGUID != [16]byte{} && startLBA != 0 {
-			return int64(startLBA) * sectorSize, nil
+	case interface{ Size() int64 }:
+		return s.Size()
+	case interface{ Stat() (os.FileInfo, error) }:
+		if fi, err := s.Stat(); err == nil {
+			return fi.Size()
 		}
 	}
-
-	if partIndex >= 0 {
-		return 0, fmt.Errorf("zfs: GPT partition index %d not found", partIndex)
-	}
-	return 0, fmt.Errorf("zfs: no populated GPT partition found")
-}
-
-func mbrPartOffset(r io.ReaderAt, partIndex int) (int64, error) {
-	table := make([]byte, 64)
-	if _, err := r.ReadAt(table, 446); err != nil {
-		return 0, fmt.Errorf("zfs: read MBR partition table: %w", err)
-	}
-	for index := 0; index < 4; index++ {
-		entry := table[index*16:]
-		startLBA := binary.LittleEndian.Uint32(entry[8:])
-
-		if partIndex >= 0 {
-			if index != partIndex {
-				continue
-			}
-			if startLBA == 0 {
-				return 0, fmt.Errorf("zfs: MBR partition index %d not found", partIndex)
-			}
-			return int64(startLBA) * sectorSize, nil
-		}
-
-		if startLBA != 0 {
-			return int64(startLBA) * sectorSize, nil
-		}
-	}
-
-	if partIndex >= 0 {
-		return 0, fmt.Errorf("zfs: MBR partition index %d not found", partIndex)
-	}
-	return 0, nil
+	return 0
 }

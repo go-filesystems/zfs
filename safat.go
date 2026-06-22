@@ -250,10 +250,10 @@ func buildFatZAPObject(blockSize int, salt uint64, entries []fatZAPEntry) (hdr, 
 	// zt_numblks=0, zt_shift = embedded ptrtbl shift.
 	embedShift := bs - 3 - 1
 	le.PutUint64(hdr[zapHdrPtrtblShift:], uint64(embedShift))
-	le.PutUint64(hdr[zapHdrFreeblkOff:], 2)            // next free block (0,1 used)
-	le.PutUint64(hdr[zapHdrNumLeafsOff:], 1)           // one leaf
+	le.PutUint64(hdr[zapHdrFreeblkOff:], 2)  // next free block (0,1 used)
+	le.PutUint64(hdr[zapHdrNumLeafsOff:], 1) // one leaf
 	le.PutUint64(hdr[zapHdrNumEntrOff:], uint64(len(entries)))
-	le.PutUint64(hdr[0x50:], salt)                     // zap_salt
+	le.PutUint64(hdr[0x50:], salt) // zap_salt
 	// Embedded pointer table: (1<<embedShift) uint64 slots in the back half,
 	// each pointing at leaf block 1.
 	embeddedOff := blockSize / 2

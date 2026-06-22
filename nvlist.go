@@ -29,33 +29,33 @@ const (
 	// UINT64 was 11 instead of 8, STRING was 14 instead of 9) —
 	// self-consistent with the lib's encoder but incompatible with
 	// every real ZFS pool. Reset to the canonical OpenZFS values.
-	nvDataTypeUnknown      = 0
-	nvDataTypeBoolean      = 1
-	nvDataTypeByte         = 2
-	nvDataTypeInt16        = 3
-	nvDataTypeUint16       = 4
-	nvDataTypeInt32        = 5
-	nvDataTypeUint32       = 6
-	nvDataTypeInt64        = 7
-	nvDataTypeUint64       = 8
-	nvDataTypeString       = 9
-	nvDataTypeByteArray    = 10
-	nvDataTypeInt16Array   = 11
-	nvDataTypeUint16Array  = 12
-	nvDataTypeInt32Array   = 13
-	nvDataTypeUint32Array  = 14
-	nvDataTypeInt64Array   = 15
-	nvDataTypeUint64Array  = 16
-	nvDataTypeStringArray  = 17
-	nvDataTypeHRTime       = 18
-	nvDataTypeNVList       = 19
-	nvDataTypeNVListArray  = 20
-	nvDataTypeBoolValue    = 21
-	nvDataTypeInt8         = 22
-	nvDataTypeUint8        = 23
-	nvDataTypeBoolArray    = 24
-	nvDataTypeInt8Array    = 25
-	nvDataTypeUint8Array   = 26
+	nvDataTypeUnknown     = 0
+	nvDataTypeBoolean     = 1
+	nvDataTypeByte        = 2
+	nvDataTypeInt16       = 3
+	nvDataTypeUint16      = 4
+	nvDataTypeInt32       = 5
+	nvDataTypeUint32      = 6
+	nvDataTypeInt64       = 7
+	nvDataTypeUint64      = 8
+	nvDataTypeString      = 9
+	nvDataTypeByteArray   = 10
+	nvDataTypeInt16Array  = 11
+	nvDataTypeUint16Array = 12
+	nvDataTypeInt32Array  = 13
+	nvDataTypeUint32Array = 14
+	nvDataTypeInt64Array  = 15
+	nvDataTypeUint64Array = 16
+	nvDataTypeStringArray = 17
+	nvDataTypeHRTime      = 18
+	nvDataTypeNVList      = 19
+	nvDataTypeNVListArray = 20
+	nvDataTypeBoolValue   = 21
+	nvDataTypeInt8        = 22
+	nvDataTypeUint8       = 23
+	nvDataTypeBoolArray   = 24
+	nvDataTypeInt8Array   = 25
+	nvDataTypeUint8Array  = 26
 )
 
 // nvPair represents a name-value pair.
@@ -161,8 +161,8 @@ func encodeNVList(pairs nvList) []byte {
 // stream, and set decoded_size = encoded_size. Both diverged from the
 // spec and made zdb / zpool import fail to unpack the label nvlist.
 func encodeNVPair(p nvPair) []byte {
-	nameLen := len(p.name)                     // strlen, no NUL
-	namePadded := (nameLen + 3) &^ 3           // round up to 4-byte XDR boundary
+	nameLen := len(p.name)           // strlen, no NUL
+	namePadded := (nameLen + 3) &^ 3 // round up to 4-byte XDR boundary
 	nameEncoded := make([]byte, namePadded)
 	copy(nameEncoded, p.name)
 

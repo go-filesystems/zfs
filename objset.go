@@ -81,6 +81,13 @@ func (os *objset) readObject(objNum uint64) (*dnode, error) {
 		blkSz = 16384 // 128KB / some block size; typically 16384 for objsets
 	}
 
+	// M3: objNum is attacker-controlled (e.g. from a ZAP value). Reject a
+	// value so large that objNum*dnSz overflows uint64, which would wrap to
+	// a small byteOff and read the wrong (or an in-bounds-but-wrong) dnode.
+	if objNum > (^uint64(0))/dnSz {
+		return nil, fmt.Errorf("zfs: object number %d overflows object array offset", objNum)
+	}
+
 	byteOff := objNum * dnSz
 	blockID := byteOff / blkSz
 	offsetInBlock := int(byteOff % blkSz)
