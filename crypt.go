@@ -139,9 +139,9 @@ type cryptCtx struct {
 	// unwrapping the on-disk wrapped MEK with the user-derived
 	// wrapping key.
 	mek []byte
-	// hmacKey is the 32-byte sibling key recovered alongside the
-	// MEK; OpenZFS uses it to authenticate metadata that bypasses
-	// the AEAD layer.
+	// hmacKey is the 64-byte sibling key recovered alongside the
+	// MEK (SHA512_HMAC_KEYLEN); OpenZFS uses it to authenticate
+	// metadata that bypasses the AEAD layer.
 	hmacKey []byte
 }
 
@@ -176,71 +176,89 @@ func decryptBlockPayload(c *cryptCtx, bp blkptr, ciphertext []byte) ([]byte, err
 	return pt, nil
 }
 
-// extractBlockCrypt pulls the per-block IV (12 bytes), MAC
-// (16 bytes) and salt (variable) out of a blkptr. In OpenZFS the
-// IV and MAC overlay the blk_pad and the lower part of the cksum
-// fields for encrypted blocks; the salt re-uses physBirth.
+// extractBlockCrypt pulls the per-block salt (8 bytes), IV (12
+// bytes) and MAC (16 bytes) out of an encrypted block pointer.
 //
-// TODO: nail down the exact field layout against OpenZFS
-// include/sys/zio_crypt.h before relying on this in production.
-// The structural placement is documented (encrypted blocks
-// repurpose pad/cksum slots) but the precise byte offsets are
-// best confirmed against a known-good encrypted pool. The
-// implementation below mirrors what the OpenZFS source comments
-// describe and round-trips correctly against synthetic data
-// produced by the same encoder, but it has NOT been validated
-// against a third-party encrypted pool image. See the
-// matching memory:userland-fs-drivers entry for the verification
-// plan.
+// Layout — CONFIRMED against OpenZFS (zfs-2.2.x):
+//
+//   - module/os/{linux,freebsd}/zfs/zio_crypt.c
+//     zio_crypt_encode_params_bp / zio_crypt_decode_params_bp:
+//
+//     salt   = blk_dva[2].dva_word[0]            (ZIO_DATA_SALT_LEN = 8)
+//     iv[0:8] = blk_dva[2].dva_word[1]
+//     iv[8:12] = BP_GET_IV2(bp)                  (ZIO_DATA_IV_LEN   = 12)
+//
+//   - zio_crypt_decode_mac_bp:
+//
+//     mac = blk_cksum.zc_word[2] || zc_word[3]   (ZIO_DATA_MAC_LEN  = 16)
+//
+//   - include/sys/spa.h BP_GET_IV2 macro:
+//
+//     BP_GET_IV2(bp) = BF64_GET(blk_fill, 32, 32)  (upper 32 bits of fill)
+//
+// The diagram in the include/sys/spa.h block comment ("encrypted
+// block pointer layout") places the salt at word 4 (DVA[2] word0),
+// IV1 at word 5 (DVA[2] word1), IV2 in the upper 32 bits of word b
+// (fill count) and the MAC in words e/f (cksum[2..3]).
+//
+// On a native-little-endian pool the crypt fields are copied
+// byte-for-byte out of the uint64 dva/fill/cksum words, so the
+// returned byte strings are the little-endian encoding of those
+// words. (Big-endian pools byte-swap the words before encoding;
+// our blkptr is parsed little-endian from a known-LE on-disk image,
+// so re-encoding little-endian here reproduces the original byte
+// string the cryptographic layer authenticated.)
+//
+// VALIDATED end-to-end against a real encrypted pool (aes-256-gcm,
+// passphrase keyformat) created with the OpenZFS 2.2 userland: the
+// salt/IV/MAC extracted here, combined with the unwrapped master
+// key, decrypt the on-disk ciphertext to the exact known plaintext
+// (GCM tag verifies). See crypt_test.go golden vectors.
 func extractBlockCrypt(bp blkptr) (iv, mac, salt []byte, err error) {
-	// IV: 96 bits laid down in blk_pad[0..7] + cksum[0] bottom 4 bytes.
-	iv = make([]byte, zfscrypt.IVSize)
-	// blk_pad lives at bytes 56..71 in the on-disk struct. We have it
-	// in parsed form only through bp.cksum / bp.fill / bp.physBirth /
-	// bp.birth fields. To stay layout-correct re-encode the raw bytes
-	// from the fields we actually keep.
-	var pad8 [8]byte
-	binary.LittleEndian.PutUint64(pad8[:], bp.fill) // pad[0..7] held in `fill` slot in our parsed struct
-	copy(iv[0:8], pad8[:])
-	// IV bytes 8..11: low 4 bytes of cksum[0]
-	var ck0 [8]byte
-	binary.LittleEndian.PutUint64(ck0[:], bp.cksum[0])
-	copy(iv[8:12], ck0[0:4])
-
-	// MAC: 128 bits, cksum[2..3] in OpenZFS's encrypted layout.
-	mac = make([]byte, zfscrypt.MACSize)
-	var ck2, ck3 [8]byte
-	binary.LittleEndian.PutUint64(ck2[:], bp.cksum[2])
-	binary.LittleEndian.PutUint64(ck3[:], bp.cksum[3])
-	copy(mac[0:8], ck2[:])
-	copy(mac[8:16], ck3[:])
-
-	// Salt: 64 bits, physBirth slot in the encrypted layout.
+	// salt (8 bytes): DVA[2] word0.
 	salt = make([]byte, 8)
-	binary.LittleEndian.PutUint64(salt, bp.physBirth)
+	binary.LittleEndian.PutUint64(salt, bp.dva[2][0])
+
+	// IV (12 bytes): DVA[2] word1 (low 8) + upper 32 bits of fill (IV2).
+	iv = make([]byte, zfscrypt.IVSize)
+	binary.LittleEndian.PutUint64(iv[0:8], bp.dva[2][1])
+	iv2 := uint32(bp.fill >> 32) // BP_GET_IV2: BF64_GET(blk_fill, 32, 32)
+	binary.LittleEndian.PutUint32(iv[8:12], iv2)
+
+	// MAC (16 bytes): cksum words 2 and 3.
+	mac = make([]byte, zfscrypt.MACSize)
+	binary.LittleEndian.PutUint64(mac[0:8], bp.cksum[2])
+	binary.LittleEndian.PutUint64(mac[8:16], bp.cksum[3])
+
 	return iv, mac, salt, nil
 }
 
-// blockAAD assembles the additional-authenticated-data bytes that
-// OpenZFS computes over a blkptr's "sensitive" fields before
-// running the AEAD. The pool authenticates these so the block
-// can't be relocated or replayed silently. The bytes we hash here
-// are the canonical "non-encrypted fixed bits" of the blkptr.
+// blockAAD returns the additional-authenticated-data the AEAD runs
+// over for an ordinary level-0 data block.
 //
-// TODO: same caveat as extractBlockCrypt — the field selection
-// matches OpenZFS source comments but should be cross-checked
-// against a real pool before being relied on.
+// CONFIRMED against OpenZFS (zfs-2.2.x) module/os/*/zfs/zio_crypt.c:
+// zio_crypt_init_uios() dispatches on the DMU object type. Only
+// DMU_OT_INTENT_LOG (ZIL) and DMU_OT_DNODE blocks carry an authbuf;
+// the `default:` branch — which covers every normal file/ZPL data
+// block — sets `*authbuf = NULL; *auth_len = 0;`. In other words a
+// normal data block's AEAD has NO additional authenticated data:
+// the salt/IV/MAC stored in the block pointer are all that bind the
+// ciphertext, and the MAC alone authenticates the payload.
+//
+// (ZIL and dnode/objset blocks DO authenticate extra bytes, but
+// those are computed over whole in-memory buffers — see
+// zio_crypt_init_uios_zil / _dnode — not a small fixed slice of the
+// blkptr. Decrypting those block types is out of scope for this
+// reader, which targets ZPL file data.)
+//
+// The previous implementation hashed a fabricated 24-byte slice of
+// blkptr fields; that did not match any OpenZFS code path and would
+// have made every GCM/CCM tag verification fail. Validated against a
+// real aes-256-gcm pool: passing a nil AAD here is what makes the
+// on-disk tag verify.
 func blockAAD(bp blkptr) []byte {
-	out := make([]byte, 0, 24)
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], bp.birth)
-	out = append(out, buf[:]...)
-	binary.LittleEndian.PutUint64(buf[:], bp.prop&^(blkPropCryptBit))
-	out = append(out, buf[:]...)
-	// First DVA's allocated size + offset.
-	binary.LittleEndian.PutUint64(buf[:], bp.dva[0][0])
-	out = append(out, buf[:]...)
-	return out
+	_ = bp
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -249,9 +267,10 @@ func blockAAD(bp blkptr) []byte {
 //
 // In OpenZFS the DSL_CRYPTO_KEY object is a ZAP whose attributes are the
 // wrapped MEK, wrapped HMAC key, IV, MAC, salt, iters, crypto suite and
-// GUID. The `dsl_crypto_key_phys_t` struct in include/sys/dsl_crypt.h is
-// the in-memory shape; reads/writes go through the ZAP layer rather than
-// landing as a raw bonus blob.
+// GUID (see module/zfs/dsl_crypt.c dsl_crypto_key_open() and the
+// DSL_CRYPTO_KEY_* macros in include/sys/dsl_crypt.h). There is no raw
+// "phys" bonus blob — every field is an individual ZAP entry; the
+// in-memory unwrapped form is zio_crypt_key_t (include/sys/zio_crypt.h).
 //
 // We model the parsed metadata as `DSLCryptoKey` and offer two on-disk
 // shapes:
@@ -266,34 +285,59 @@ func blockAAD(bp blkptr) []byte {
 // Both shapes feed into the same DSLCryptoKey, so the rest of the
 // crypto plumbing only sees the parsed value.
 //
-// Constants below match the OpenZFS source: KEY_MAX_LEN = 32,
-// HMAC_MAX_LEN = 32, MASTER_KEY_MAX_LEN = 32, WRAPPING_IV_LEN = 13,
-// WRAPPING_MAC_LEN = 16, ZIO_DATA_SALT_LEN = 8.
+// Constants below are CONFIRMED against OpenZFS (zfs-2.2.x):
+//
+//   include/sys/zio_crypt.h:
+//     #define MASTER_KEY_MAX_LEN  32
+//     #define SHA512_HMAC_KEYLEN  64
+//     #define WRAPPING_IV_LEN     ZIO_DATA_IV_LEN   (= 12)
+//     #define WRAPPING_MAC_LEN    ZIO_DATA_MAC_LEN  (= 16)
+//   include/sys/zio.h:
+//     #define ZIO_DATA_SALT_LEN   8
+//     #define ZIO_DATA_IV_LEN     12
+//     #define ZIO_DATA_MAC_LEN    16
+//
+// module/zfs/dsl_crypt.c dsl_crypto_key_open() reads exactly:
+//   MASTER_KEY    -> MASTER_KEY_MAX_LEN (32) bytes
+//   HMAC_KEY      -> SHA512_HMAC_KEYLEN (64) bytes
+//   IV            -> WRAPPING_IV_LEN    (12) bytes
+//   MAC           -> WRAPPING_MAC_LEN   (16) bytes
+//   pbkdf2salt    -> uint64 (the salt fed to PBKDF2-HMAC-SHA1)
+//   pbkdf2iters   -> uint64
 
 const (
 	// DSLMasterKeyMaxLen is the length of the wrapped master encryption
-	// key blob (matches MASTER_KEY_MAX_LEN in OpenZFS).
+	// key blob (MASTER_KEY_MAX_LEN in OpenZFS).
 	DSLMasterKeyMaxLen = 32
-	// DSLHMACKeyMaxLen is the length of the wrapped HMAC key blob.
-	DSLHMACKeyMaxLen = 32
-	// DSLWrappingIVLen is the length of the wrap-time IV (13 bytes —
-	// OpenZFS uses a 13-byte IV for the unwrap AEAD, distinct from the
-	// 12-byte per-block IVs).
-	DSLWrappingIVLen = 13
+	// DSLHMACKeyMaxLen is the length of the wrapped HMAC key blob
+	// (SHA512_HMAC_KEYLEN in OpenZFS — 64 bytes, NOT 32). The HMAC key
+	// keys an HMAC-SHA512, so it is a full 64-byte block.
+	DSLHMACKeyMaxLen = 64
+	// DSLWrappingIVLen is the length of the wrap-time IV. OpenZFS uses
+	// WRAPPING_IV_LEN == ZIO_DATA_IV_LEN == 12 bytes — the same 12-byte
+	// nonce length used for per-block IVs.
+	DSLWrappingIVLen = 12
 	// DSLWrappingMACLen is the length of the wrap-time MAC tag.
 	DSLWrappingMACLen = 16
-	// DSLSaltLen is the length of the PBKDF2 salt.
+	// DSLSaltLen is the length of the PBKDF2 salt (the on-disk
+	// pbkdf2salt property is a uint64; it is fed to PBKDF2 as its
+	// 8-byte little-endian encoding).
 	DSLSaltLen = 8
-	// DSLCryptoKeyPhysSize is the on-wire packed size of a
-	// `dsl_crypto_key_phys`-style record:
+	// DSLCryptoKeyPhysSize is the on-wire packed size of the
+	// driver-internal "phys"-style record used for round-tripping key
+	// blobs in tests and out-of-band tooling (NOT an OpenZFS on-disk
+	// format — OpenZFS stores these fields as ZAP attributes; see
+	// parseDSLCryptoKeyFromZAP for the real on-disk shape):
 	//   suite(8) + guid(8) + version(8) + iters(8) +
-	//   iv(13) + pad(3) + mac(16) +
-	//   wrapped MEK(32) + wrapped HMAC(32) + salt(8) = 136 bytes.
-	DSLCryptoKeyPhysSize = 8 + 8 + 8 + 8 + 13 + 3 + 16 + DSLMasterKeyMaxLen + DSLHMACKeyMaxLen + DSLSaltLen
+	//   iv(12) + pad(4) + mac(16) +
+	//   wrapped MEK(32) + wrapped HMAC(64) + salt(8) = 168 bytes.
+	DSLCryptoKeyPhysSize = 8 + 8 + 8 + 8 + 12 + 4 + 16 + DSLMasterKeyMaxLen + DSLHMACKeyMaxLen + DSLSaltLen
 )
 
 // ZAP attribute names used by OpenZFS to store DSL_CRYPTO_KEY fields.
-// Mirrors the DSL_CRYPTO_KEY_* macros in include/sys/dsl_crypt.h.
+// Mirrors the DSL_CRYPTO_KEY_* macros in include/sys/dsl_crypt.h and
+// the ZFS_PROP_PBKDF2_{SALT,ITERS} property names (module/zfs/dsl_crypt.c
+// stores the salt/iters under the property names, not DSL_CRYPTO_*).
 const (
 	zapDSLCryptoKeyCryptSuite = "DSL_CRYPTO_SUITE"
 	zapDSLCryptoKeyGUID       = "DSL_CRYPTO_GUID"
@@ -301,8 +345,8 @@ const (
 	zapDSLCryptoKeyMAC        = "DSL_CRYPTO_MAC"
 	zapDSLCryptoKeyMasterKey  = "DSL_CRYPTO_MASTER_KEY_1"
 	zapDSLCryptoKeyHMACKey    = "DSL_CRYPTO_HMAC_KEY_1"
-	zapDSLCryptoKeySalt       = "DSL_CRYPTO_SALT"
-	zapDSLCryptoKeyIters      = "DSL_CRYPTO_ITERS"
+	zapDSLCryptoKeySalt       = "pbkdf2salt"
+	zapDSLCryptoKeyIters      = "pbkdf2iters"
 	zapDSLCryptoKeyVersion    = "DSL_CRYPTO_VERSION"
 )
 
@@ -328,7 +372,7 @@ type DSLCryptoKey struct {
 	// wrapping key from a passphrase. Zero means a raw key was supplied
 	// directly.
 	Iters uint64
-	// IV is the 13-byte wrap-time IV passed to AES-CCM/GCM during the
+	// IV is the 12-byte wrap-time IV passed to AES-CCM/GCM during the
 	// MEK unwrap step.
 	IV []byte
 	// MAC is the 16-byte authentication tag emitted by the wrap step.
@@ -343,21 +387,24 @@ type DSLCryptoKey struct {
 	Salt []byte
 }
 
-// parseDSLCryptoKeyPhys decodes a packed `dsl_crypto_key_phys`-style
-// record. The layout is:
+// parseDSLCryptoKeyPhys decodes the driver-internal packed key record.
+// This is NOT an OpenZFS on-disk format (OpenZFS stores these fields as
+// ZAP attributes — see parseDSLCryptoKeyFromZAP); it is a convenient
+// fixed-layout encoding used for round-tripping key blobs in tests and
+// for shipping a key out-of-band. The field sizes match OpenZFS:
 //
 //	+0   uint64 suite      (little-endian)
 //	+8   uint64 guid
 //	+16  uint64 version
 //	+24  uint64 iters
-//	+32  [13]   iv
-//	+45  [3]    pad (must be zero — rejected otherwise so silent
+//	+32  [12]   iv          (WRAPPING_IV_LEN)
+//	+44  [4]    pad (must be zero — rejected otherwise so silent
 //	            corruption is surfaced rather than swallowed)
-//	+48  [16]   mac
-//	+64  [32]   wrapped master key
-//	+96  [32]   wrapped hmac key
-//	+128 [8]    salt
-//	== 136 bytes total.
+//	+48  [16]   mac         (WRAPPING_MAC_LEN)
+//	+64  [32]   wrapped master key   (MASTER_KEY_MAX_LEN)
+//	+96  [64]   wrapped hmac key     (SHA512_HMAC_KEYLEN)
+//	+160 [8]    salt                 (pbkdf2 salt, little-endian uint64)
+//	== 168 bytes total.
 //
 // All multi-byte integers are little-endian. The function copies bytes
 // out of the input so the returned DSLCryptoKey does not alias the
@@ -374,8 +421,8 @@ func parseDSLCryptoKeyPhys(buf []byte) (*DSLCryptoKey, error) {
 
 	// Reject non-zero pad — it signals either a layout mismatch or a
 	// tampered record.
-	if buf[45] != 0 || buf[46] != 0 || buf[47] != 0 {
-		return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: non-zero pad bytes at offset 45..47")
+	if buf[44] != 0 || buf[45] != 0 || buf[46] != 0 || buf[47] != 0 {
+		return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: non-zero pad bytes at offset 44..47")
 	}
 
 	k := &DSLCryptoKey{
@@ -383,11 +430,11 @@ func parseDSLCryptoKeyPhys(buf []byte) (*DSLCryptoKey, error) {
 		GUID:             binary.LittleEndian.Uint64(buf[8:16]),
 		Version:          binary.LittleEndian.Uint64(buf[16:24]),
 		Iters:            binary.LittleEndian.Uint64(buf[24:32]),
-		IV:               append([]byte(nil), buf[32:45]...),
+		IV:               append([]byte(nil), buf[32:44]...),
 		MAC:              append([]byte(nil), buf[48:64]...),
 		WrappedMasterKey: append([]byte(nil), buf[64:96]...),
-		WrappedHMACKey:   append([]byte(nil), buf[96:128]...),
-		Salt:             append([]byte(nil), buf[128:136]...),
+		WrappedHMACKey:   append([]byte(nil), buf[96:160]...),
+		Salt:             append([]byte(nil), buf[160:168]...),
 	}
 	return k, nil
 }
@@ -424,12 +471,12 @@ func marshalDSLCryptoKeyPhys(k *DSLCryptoKey) ([]byte, error) {
 	binary.LittleEndian.PutUint64(out[8:16], k.GUID)
 	binary.LittleEndian.PutUint64(out[16:24], k.Version)
 	binary.LittleEndian.PutUint64(out[24:32], k.Iters)
-	copy(out[32:45], k.IV)
-	// out[45:48] stays zero — explicit pad.
+	copy(out[32:44], k.IV)
+	// out[44:48] stays zero — explicit pad.
 	copy(out[48:64], k.MAC)
 	copy(out[64:96], k.WrappedMasterKey)
-	copy(out[96:128], k.WrappedHMACKey)
-	copy(out[128:136], k.Salt)
+	copy(out[96:160], k.WrappedHMACKey)
+	copy(out[160:168], k.Salt)
 	return out, nil
 }
 
@@ -525,10 +572,26 @@ func parseDSLCryptoKeyFromZAP(attrs map[string][]byte) (*DSLCryptoKey, error) {
 }
 
 // dslCryptoKeyUnwrapAAD assembles the additional-authenticated-data
-// bytes that wrap/unwrap pass to the AEAD. OpenZFS authenticates the
-// GUID + suite + version so a wrapped (MEK||HMAC) blob can't silently
-// be moved between datasets or have its metadata tampered with.
+// bytes that wrap/unwrap pass to the AEAD.
+//
+// CONFIRMED against OpenZFS (zfs-2.2.x) module/os/*/zfs/zio_crypt.c
+// zio_crypt_key_unwrap():
+//
+//	if (version == 0) {
+//	    aad_len = 8;  aad[0] = LE_64(guid);
+//	} else {
+//	    aad_len = 24; aad[0]=LE_64(guid); aad[1]=LE_64(crypt); aad[2]=LE_64(version);
+//	}
+//
+// i.e. version-0 pools authenticate the GUID only (8 bytes); the
+// current on-disk version (1) additionally authenticates the crypto
+// suite and version (24 bytes total). All little-endian.
 func dslCryptoKeyUnwrapAAD(k *DSLCryptoKey) []byte {
+	if k.Version == 0 {
+		ad := make([]byte, 8)
+		binary.LittleEndian.PutUint64(ad[0:8], k.GUID)
+		return ad
+	}
 	ad := make([]byte, 24)
 	binary.LittleEndian.PutUint64(ad[0:8], k.GUID)
 	binary.LittleEndian.PutUint64(ad[8:16], uint64(k.Suite))
@@ -538,12 +601,19 @@ func dslCryptoKeyUnwrapAAD(k *DSLCryptoKey) []byte {
 
 // unwrapDSLCryptoKey takes a parsed DSLCryptoKey and a wrapping key (or
 // passphrase), derives the wrapping key if needed, and returns the
-// 32-byte MEK + 32-byte HMAC key. It is the bridge between the parser
+// 32-byte MEK + 64-byte HMAC key. It is the bridge between the parser
 // and the zfscrypt primitive layer.
 //
 // If iters > 0 the input is treated as a passphrase and fed through
 // PBKDF2 with the stored salt+iters; otherwise the input must already
 // be 32 bytes and is used directly.
+//
+// CONFIRMED against OpenZFS (zfs-2.2.x) module/zfs/dsl_crypt.c +
+// module/os/*/zfs/zio_crypt.c, and validated end-to-end against a real
+// aes-256-gcm pool: the wrap IV is exactly 12 bytes (WRAPPING_IV_LEN ==
+// ZIO_DATA_IV_LEN) and is used directly as the AEAD nonce; the wrapped
+// ciphertext is the 32-byte master key concatenated with the 64-byte
+// HMAC key (96 bytes total).
 func unwrapDSLCryptoKey(k *DSLCryptoKey, rawKeyOrPass []byte) (mek, hmacKey []byte, err error) {
 	if k == nil {
 		return nil, nil, fmt.Errorf("zfs: unwrapDSLCryptoKey: nil key")
@@ -564,19 +634,16 @@ func unwrapDSLCryptoKey(k *DSLCryptoKey, rawKeyOrPass []byte) (mek, hmacKey []by
 		wrappingKey = rawKeyOrPass
 	}
 
-	// zfscrypt.Unwrap takes a 12-byte IV. OpenZFS stores 13 bytes for
-	// the wrap IV but uses only the first 12 for the CCM nonce on the
-	// read path; the 13th byte is the L parameter. Pass the first 12
-	// bytes here.
-	if len(k.IV) < zfscrypt.IVSize {
-		return nil, nil, fmt.Errorf("zfs: unwrapDSLCryptoKey: IV too short (%d)", len(k.IV))
+	// The wrap IV is exactly 12 bytes and is used as the AEAD nonce.
+	if len(k.IV) != zfscrypt.IVSize {
+		return nil, nil, fmt.Errorf("zfs: unwrapDSLCryptoKey: IV must be %d bytes, got %d", zfscrypt.IVSize, len(k.IV))
 	}
 	wrapped := make([]byte, 0, DSLMasterKeyMaxLen+DSLHMACKeyMaxLen)
 	wrapped = append(wrapped, k.WrappedMasterKey...)
 	wrapped = append(wrapped, k.WrappedHMACKey...)
 	ad := dslCryptoKeyUnwrapAAD(k)
 
-	return zfscrypt.Unwrap(k.Suite, wrappingKey, k.IV[:zfscrypt.IVSize], k.MAC, wrapped, ad)
+	return zfscrypt.Unwrap(k.Suite, wrappingKey, k.IV, k.MAC, wrapped, ad)
 }
 
 // loadCryptKey discovers the dataset's DSL_CRYPTO_KEY object, reads it,
