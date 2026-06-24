@@ -43,6 +43,13 @@ type allocator struct {
 	nextFree  int64 // next free byte offset for the bump pointer
 	limitOff  int64 // exclusive upper bound; do not allocate at or above this offset
 	blockSize int   // granularity of allocations
+	// msSize is the metaslab size (2^metaslab_shift). When non-zero the
+	// bump pointer never hands out an extent that straddles a metaslab
+	// boundary: ZFS claims each block entirely within the metaslab holding
+	// its starting DVA, so a straddling block fails `zdb -bcc`'s zio_claim.
+	// Zero disables the constraint (degenerate tiny images with no metaslab
+	// accounting).
+	msSize int64
 	// freeBySize maps aligned-up extent size → list of free extents of
 	// exactly that size. Same-size hits are O(1) pop; different-size
 	// hits fall through to a linear scan over all classes.
@@ -50,8 +57,10 @@ type allocator struct {
 }
 
 // newAllocator creates an allocator that can allocate blocks between
-// startOff (inclusive) and limitOff (exclusive).
-func newAllocator(startOff, limitOff int64, blockSize int) *allocator {
+// startOff (inclusive) and limitOff (exclusive). msSize is the metaslab
+// size used to keep allocations from straddling metaslab boundaries (0 to
+// disable).
+func newAllocator(startOff, limitOff int64, blockSize int, msSize int64) *allocator {
 	if blockSize <= 0 {
 		blockSize = poolBlockSize
 	}
@@ -59,6 +68,7 @@ func newAllocator(startOff, limitOff int64, blockSize int) *allocator {
 		nextFree:   alignUp(startOff, int64(blockSize)),
 		limitOff:   limitOff,
 		blockSize:  blockSize,
+		msSize:     msSize,
 		freeBySize: make(map[int64][]freeExtent),
 	}
 }
@@ -100,7 +110,20 @@ func (a *allocator) alloc(size int) (int64, error) {
 		return e.off, nil
 	}
 
-	// 3. Fall back to the bump pointer.
+	// 3. Fall back to the bump pointer. Never let an extent straddle a
+	// metaslab boundary: park the tail gap of the current metaslab on the
+	// free list (so it is not mistaken for allocated space) and restart at
+	// the boundary. sz <= msSize always (max block 128 KiB << metaslab ≥ 1
+	// MiB), so a single skip suffices.
+	if a.msSize > 0 && sz <= a.msSize {
+		boundary := (a.nextFree/a.msSize + 1) * a.msSize
+		if a.nextFree+sz > boundary {
+			if gap := boundary - a.nextFree; gap > 0 && boundary <= a.limitOff {
+				a.freeBySize[gap] = append(a.freeBySize[gap], freeExtent{off: a.nextFree, size: gap})
+				a.nextFree = boundary
+			}
+		}
+	}
 	if a.nextFree+sz > a.limitOff {
 		return 0, fmt.Errorf("zfs: allocator: out of space (need %d, free %d)", sz, a.freeSpaceLocked())
 	}
