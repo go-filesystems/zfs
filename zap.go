@@ -82,6 +82,35 @@ func zapListAll(r io.ReaderAt, partOff int64, dn *dnode) (map[string]uint64, err
 	}
 }
 
+// zapListAllRaw returns every key→value entry in the ZAP dnode with the
+// value bytes preserved, unlike zapListAll which collapses each value to
+// a uint64. It is the reader an on-disk object whose ZAP holds byte
+// arrays needs — e.g. a DSL_CRYPTO_KEY object, whose wrapped master key
+// (32 B), wrapped HMAC key (64 B), IV (12 B) and MAC (16 B) attributes
+// cannot survive the uint64 collapse. Integer-typed attributes are
+// normalised to little-endian so binary.LittleEndian decodes them.
+func zapListAllRaw(r io.ReaderAt, partOff int64, dn *dnode) (map[string][]byte, error) {
+	if dn.nblkptr == 0 || dn.blkptrAt(0).isNull() {
+		return nil, fmt.Errorf("zfs: zap: null block pointer")
+	}
+	blk0, err := readDataBlock(r, partOff, dn, 0)
+	if err != nil {
+		return nil, fmt.Errorf("zfs: zap: read block 0: %w", err)
+	}
+	if len(blk0) < 8 {
+		return nil, fmt.Errorf("zfs: zap: block too small")
+	}
+	blockType := binary.LittleEndian.Uint64(blk0[:8])
+	switch blockType {
+	case zbtMicro:
+		return parseMicroZAPRaw(blk0), nil
+	case zbtHeader:
+		return parseFatZAPRaw(r, partOff, dn, blk0)
+	default:
+		return nil, fmt.Errorf("zfs: zap: unknown block type 0x%X", blockType)
+	}
+}
+
 // ── Micro-ZAP ───────────────────────────────────────────────────────────────
 
 // parseMicroZAP parses a micro-ZAP block.
@@ -106,6 +135,25 @@ func parseMicroZAP(blk []byte) (map[string]uint64, error) {
 		result[name] = val
 	}
 	return result, nil
+}
+
+// parseMicroZAPRaw is parseMicroZAP's byte-preserving twin. A micro-ZAP
+// can only hold uint64 values, so each entry's raw form is the 8-byte
+// little-endian encoding — the same convention parseFatZAPRaw uses for
+// integer attributes.
+func parseMicroZAPRaw(blk []byte) map[string][]byte {
+	result := make(map[string][]byte)
+	n := (len(blk) - mzapHdrSize) / mzapEntSize
+	for i := 0; i < n; i++ {
+		base := mzapHdrSize + i*mzapEntSize
+		ent := blk[base : base+mzapEntSize]
+		if ent[14] == 0 {
+			continue
+		}
+		name := nullTerminated(ent[14 : 14+mzapNameLen])
+		result[name] = append([]byte(nil), ent[0:8]...)
+	}
+	return result
 }
 
 // ── Micro-ZAP write ──────────────────────────────────────────────────────────
@@ -231,15 +279,64 @@ const (
 	zapHdrPtrtblSize  = 128 // size of header before embedded ptrtbl
 )
 
-// parseFatZAP reads all entries from a fat-ZAP object.
+// parseFatZAP reads all entries from a fat-ZAP object, collapsing each
+// value to a uint64 (the historical contract used by every metadata ZAP
+// whose values are object numbers or counts). For ZAPs that store
+// byte-array values (e.g. a DSL_CRYPTO_KEY object) use parseFatZAPRaw.
 func parseFatZAP(r io.ReaderAt, partOff int64, dn *dnode, hdrBlock []byte) (map[string]uint64, error) {
+	result := make(map[string]uint64)
+	err := walkFatZAPLeaves(r, partOff, dn, hdrBlock, func(leafBlk []byte) {
+		entries, err := parseFatZAPLeaf(leafBlk)
+		if err != nil {
+			return
+		}
+		for k, v := range entries {
+			result[k] = v
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// parseFatZAPRaw is parseFatZAP's byte-preserving twin: it returns the
+// full value bytes of every entry instead of collapsing them to a
+// uint64. Integer-typed attributes are normalised to little-endian (see
+// readZAPLeafRawValue) so callers can decode them with
+// binary.LittleEndian, matching ZFS's native in-memory representation on
+// the little-endian pools this reader targets.
+func parseFatZAPRaw(r io.ReaderAt, partOff int64, dn *dnode, hdrBlock []byte) (map[string][]byte, error) {
+	result := make(map[string][]byte)
+	err := walkFatZAPLeaves(r, partOff, dn, hdrBlock, func(leafBlk []byte) {
+		entries, err := parseFatZAPLeafRaw(leafBlk)
+		if err != nil {
+			return
+		}
+		for k, v := range entries {
+			result[k] = v
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// walkFatZAPLeaves validates a fat-ZAP header block, walks its pointer
+// table, and invokes visit once for each distinct leaf block. The
+// hardened traversal (bounded pointer count, cycle/dup elision via
+// safeio.VisitSet, tolerant per-leaf reads) is shared by both the
+// uint64 (parseFatZAP) and raw (parseFatZAPRaw) decoders so it is
+// tested and hardened in exactly one place.
+func walkFatZAPLeaves(r io.ReaderAt, partOff int64, dn *dnode, hdrBlock []byte, visit func(leafBlk []byte)) error {
 	le := binary.LittleEndian
 	if len(hdrBlock) < 128 {
-		return nil, fmt.Errorf("zfs: fat-zap: header block too small")
+		return fmt.Errorf("zfs: fat-zap: header block too small")
 	}
 	magic := le.Uint64(hdrBlock[8:])
 	if magic != zapMagic {
-		return nil, fmt.Errorf("zfs: fat-zap: bad magic 0x%X", magic)
+		return fmt.Errorf("zfs: fat-zap: bad magic 0x%X", magic)
 	}
 
 	// Pointer table info — zt_shift is a uint64 (not uint32) at the new
@@ -266,7 +363,6 @@ func parseFatZAP(r io.ReaderAt, partOff int64, dn *dnode, hdrBlock []byte) (map[
 		numLeafs = maxZapLeafs
 	}
 
-	result := make(map[string]uint64)
 	var visited safeio.VisitSet
 
 	// Walk pointer table to enumerate leaf blocks (avoiding duplicates)
@@ -329,15 +425,9 @@ func parseFatZAP(r io.ReaderAt, partOff int64, dn *dnode, hdrBlock []byte) (map[
 		if err != nil {
 			continue
 		}
-		entries, err := parseFatZAPLeaf(leafBlk)
-		if err != nil {
-			continue
-		}
-		for k, v := range entries {
-			result[k] = v
-		}
+		visit(leafBlk)
 	}
-	return result, nil
+	return nil
 }
 
 // Fat-ZAP leaf block (zap_leaf_phys_t):
@@ -353,55 +443,64 @@ func parseFatZAP(r io.ReaderAt, partOff int64, dn *dnode, hdrBlock []byte) (map[
 const zapLeafMagic = uint32(0x2AB1EAF)
 
 func parseFatZAPLeaf(blk []byte) (map[string]uint64, error) {
+	result := make(map[string]uint64)
+	err := iterateFatZAPLeafEntries(blk, func(name string, chunksStart, chunkCount, valChunk, valNumInts, valIntLen int) {
+		result[name] = readZAPLeafValue(blk, chunksStart, chunkCount, valChunk, valNumInts, valIntLen)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// parseFatZAPLeafRaw is parseFatZAPLeaf's byte-preserving twin: it
+// returns each entry's full value bytes (normalised to little-endian for
+// multi-byte integer attributes) rather than a single uint64.
+func parseFatZAPLeafRaw(blk []byte) (map[string][]byte, error) {
+	result := make(map[string][]byte)
+	err := iterateFatZAPLeafEntries(blk, func(name string, chunksStart, chunkCount, valChunk, valNumInts, valIntLen int) {
+		result[name] = readZAPLeafRawValue(blk, chunksStart, chunkCount, valChunk, valNumInts, valIntLen)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// iterateFatZAPLeafEntries validates a fat-ZAP leaf block and calls fn
+// for every ZAP_CHUNK_ENTRY it contains, having already resolved and
+// bounds-clamped the entry's name and value descriptors. The
+// value-decoding step is left to fn so the uint64 and raw decoders share
+// the security-critical header parsing, hash-table sizing, name
+// reassembly and H3 clamps.
+func iterateFatZAPLeafEntries(blk []byte, fn func(name string, chunksStart, chunkCount, valChunk, valNumInts, valIntLen int)) error {
 	le := binary.LittleEndian
 	if len(blk) < 48 {
-		return nil, fmt.Errorf("zfs: fat-zap leaf: too short")
+		return fmt.Errorf("zfs: fat-zap leaf: too short")
 	}
 	blockType := le.Uint64(blk[0:])
 	if blockType != zbtLeaf {
-		return nil, fmt.Errorf("zfs: fat-zap leaf: bad block type 0x%X", blockType)
+		return fmt.Errorf("zfs: fat-zap leaf: bad block type 0x%X", blockType)
 	}
 	lhMagic := le.Uint32(blk[24:])
 	if lhMagic != zapLeafMagic {
-		return nil, fmt.Errorf("zfs: fat-zap leaf: bad magic 0x%X", lhMagic)
+		return fmt.Errorf("zfs: fat-zap leaf: bad magic 0x%X", lhMagic)
 	}
 
-	// lh_nfree + lh_nentries at offsets 28 and 30 (uint16)
-	lhNfatries := int(le.Uint16(blk[30:]))
-	// lh_prefix_len (uint16 at offset 32) = number of bits in hash prefix
-	prefixLen := int(le.Uint16(blk[32:]))
-	// lh_freelist (uint16 at offset 34)
-	// Block-table starts at 48 (header is 48 bytes)
-	// Hash table: 2^(16 - prefix_len) uint16 entries ? Actually the hash table size is:
-	// ZAP_LEAF_HASH_NUMENTRIES = ZAP_LEAF_HASH_SIZE(bs) = (bs - sizeof(zap_leaf_phys_t)) / 3 / ...
-	// This is getting complex. Let me use an approximate approach:
-	// Collect chunks from the block, ignoring the hash table.
-
-	_ = lhNfatries
-	_ = prefixLen // suppress unused
-
 	// OpenZFS ZAP_LEAF_HASH_NUMENTRIES = 1 << (block_shift - 5), and
-	// hash table = NUMENTRIES * sizeof(uint16) = blockSize/16. The
-	// previous code used lh_prefix_len (hash prefix bit count) which
-	// for a single-leaf fat-zap is 0, giving a 2-byte table — wrong by
-	// ~512×.
-	_ = prefixLen
+	// hash table = NUMENTRIES * sizeof(uint16) = blockSize/16. Using
+	// lh_prefix_len (hash prefix bit count) — 0 for a single-leaf
+	// fat-zap — would give a 2-byte table, wrong by ~512×.
 	hashTabSz := len(blk) / 16
 	chunksStart := 48 + hashTabSz
 	chunkCount := (len(blk) - chunksStart) / zapLeafChunkSize
 
-	result := make(map[string]uint64, lhNfatries)
 	// Walk chunks looking for entry chunks (type 252 = ZAP_CHUNK_ENTRY).
 	// ZAP_CHUNK_ENTRY = 252, ZAP_CHUNK_ARRAY = 251, ZAP_CHUNK_FREE = 253
-	const (
-		chunkTypeEntry = 252
-		chunkTypeArray = 251
-		chunkTypeFree  = 253
-	)
+	const chunkTypeEntry = 252
 	for i := 0; i < chunkCount; i++ {
 		off := chunksStart + i*zapLeafChunkSize
-		chunkType := blk[off]
-		if chunkType != chunkTypeEntry {
+		if blk[off] != chunkTypeEntry {
 			continue
 		}
 		// Entry chunk layout (24 bytes):
@@ -424,7 +523,8 @@ func parseFatZAPLeaf(blk []byte) (map[string]uint64, error) {
 		// They can never legitimately exceed the bytes the leaf block's
 		// array chunks can hold (chunkCount * 21). Clamp both to that
 		// bound so a hostile value cannot drive an oversized allocation in
-		// readZAPLeafValue or an unbounded builder in readZAPLeafString.
+		// readZAPLeafValue/readZAPLeafRawValue or an unbounded builder in
+		// readZAPLeafString.
 		maxArrayBytes := chunkCount * 21
 		if maxArrayBytes < 0 {
 			maxArrayBytes = 0
@@ -439,17 +539,15 @@ func parseFatZAPLeaf(blk []byte) (map[string]uint64, error) {
 			continue
 		}
 
-		// Read value (uint64 or smaller ints, all assembled into uint64).
 		// Clamp valNumInts so numInts*intLen cannot exceed the leaf's array
 		// capacity (H3); valIntLen is a single byte (<=255) so the product
 		// is then safely bounded.
 		if valIntLen > 0 && valNumInts > maxArrayBytes/valIntLen {
 			valNumInts = maxArrayBytes / valIntLen
 		}
-		val := readZAPLeafValue(blk, chunksStart, chunkCount, valChunk, valNumInts, valIntLen)
-		result[name] = val
+		fn(name, chunksStart, chunkCount, valChunk, valNumInts, valIntLen)
 	}
-	return result, nil
+	return nil
 }
 
 // readZAPLeafString reads a string stored in chained array chunks.
@@ -558,6 +656,71 @@ func readZAPLeafValue(blk []byte, chunksStart, nchunks, startChunk, numInts, int
 		}
 	}
 	return val
+}
+
+// readZAPLeafRawValue reads a value's full byte string from the array
+// chunks chained off startChunk. Byte-array attributes (intLen == 1) are
+// returned verbatim; multi-byte integer arrays (intLen 2/4/8) are decoded
+// big-endian off disk and re-emitted little-endian so callers can decode
+// them with binary.LittleEndian — the same value the uint64 decoder
+// (readZAPLeafValue) yields, and the native-endian byte order OpenZFS
+// feeds a uint64 attribute (e.g. the PBKDF2 salt) into its consumers on a
+// little-endian pool.
+func readZAPLeafRawValue(blk []byte, chunksStart, nchunks, startChunk, numInts, intLen int) []byte {
+	if intLen <= 0 || numInts <= 0 {
+		return nil
+	}
+	if intLen > 8 {
+		intLen = 8
+	}
+	totalBytes := numInts * intLen
+	if totalBytes < 0 {
+		return nil
+	}
+	buf := make([]byte, totalBytes)
+	chunkIdx := startChunk
+	copied := 0
+	// VisitSet breaks a cyclic le_next chain (H3).
+	var visited safeio.VisitSet
+	for copied < totalBytes && chunkIdx >= 0 && chunkIdx < nchunks {
+		if !visited.Add(uint64(chunkIdx)) {
+			break
+		}
+		off := chunksStart + chunkIdx*zapLeafChunkSize
+		if off+zapLeafChunkSize > len(blk) {
+			break
+		}
+		if blk[off] != 251 { // ZAP_CHUNK_ARRAY
+			break
+		}
+		dataOff := off + 1
+		copyLen := 21
+		if copyLen > totalBytes-copied {
+			copyLen = totalBytes - copied
+		}
+		copy(buf[copied:], blk[dataOff:dataOff+copyLen])
+		copied += copyLen
+		chunkIdx = int(binary.LittleEndian.Uint16(blk[off+22:]))
+		if chunkIdx == 0xFFFF {
+			break
+		}
+	}
+	if intLen == 1 {
+		return buf
+	}
+	// Re-encode each big-endian on-disk integer as little-endian.
+	out := make([]byte, totalBytes)
+	for i := 0; i < numInts; i++ {
+		seg := buf[i*intLen : (i+1)*intLen]
+		var v uint64
+		for _, b := range seg {
+			v = v<<8 | uint64(b)
+		}
+		for j := 0; j < intLen; j++ {
+			out[i*intLen+j] = byte(v >> (8 * j))
+		}
+	}
+	return out
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
