@@ -304,7 +304,9 @@ func sampleZAPAttrs(k *DSLCryptoKey) map[string][]byte {
 		return b
 	}
 	return map[string][]byte{
-		zapDSLCryptoKeyCryptSuite: u64(uint64(k.Suite)),
+		// DSL_CRYPTO_SUITE is stored on disk as a zio_crypt_type_t value,
+		// not the compacted zfscrypt.Suite number.
+		zapDSLCryptoKeyCryptSuite: u64(zioCryptFromSuite(k.Suite)),
 		zapDSLCryptoKeyGUID:       u64(k.GUID),
 		zapDSLCryptoKeyVersion:    u64(k.Version),
 		zapDSLCryptoKeyIters:      u64(k.Iters),
@@ -473,8 +475,8 @@ func TestDSLCryptoKeyUnwrapAADStable(t *testing.T) {
 	if binary.LittleEndian.Uint64(ad1[0:8]) != k.GUID {
 		t.Errorf("AAD[0:8] != GUID")
 	}
-	if binary.LittleEndian.Uint64(ad1[8:16]) != uint64(k.Suite) {
-		t.Errorf("AAD[8:16] != suite")
+	if binary.LittleEndian.Uint64(ad1[8:16]) != zioCryptFromSuite(k.Suite) {
+		t.Errorf("AAD[8:16] != on-disk zio_crypt suite")
 	}
 	if binary.LittleEndian.Uint64(ad1[16:24]) != k.Version {
 		t.Errorf("AAD[16:24] != version")
@@ -585,13 +587,13 @@ func TestUnwrapDSLCryptoKeyValidation(t *testing.T) {
 	})
 }
 
-// TestOpenFromDeviceDatasetWithKeyLocatorNotWired exercises the public
-// entry point end-to-end. Until the DSL-tree walker is wired the entry
-// point surfaces a clearly-named "locator not wired" error rather than
-// silently mis-decrypting. The parser/marshaller/ZAP-decoder this
-// commit lands are exercised directly by the round-trip tests above —
-// the locator wiring is the next step (see TODO in loadCryptKey).
-func TestOpenFromDeviceDatasetWithKeyLocatorNotWired(t *testing.T) {
+// TestOpenFromDeviceDatasetWithKeyNullRootBP exercises the public entry
+// point against a device whose uberblock root block pointer is null
+// (a zeroed image). The open must fail cleanly before any crypto work
+// rather than panicking or returning an undecrypted FS. The full
+// success path is covered end-to-end against a real encrypted pool in
+// crypt_pool_test.go.
+func TestOpenFromDeviceDatasetWithKeyNullRootBP(t *testing.T) {
 	dev := newMemBackend(256 * 1024)
 
 	prev := openReadInfo
@@ -608,10 +610,20 @@ func TestOpenFromDeviceDatasetWithKeyLocatorNotWired(t *testing.T) {
 
 	_, err := OpenFromDeviceDatasetWithKey(dev, -1, "ROOT", []byte("hunter2"))
 	if err == nil {
-		t.Fatalf("expected loadCryptKey locator-not-wired error")
+		t.Fatalf("expected open against a null root BP to fail")
 	}
-	if !strings.Contains(err.Error(), "DSL_CRYPTO_KEY") {
-		t.Errorf("error %q does not point at the locator TODO", err)
+	if !strings.Contains(err.Error(), "null root block pointer") {
+		t.Errorf("error %q does not mention the null root BP", err)
+	}
+}
+
+// TestLoadCryptKeyEmptyPassphrase covers the early empty-key guard in
+// loadCryptKey without needing a pool image.
+func TestLoadCryptKeyEmptyPassphrase(t *testing.T) {
+	fs := &zfsFS{}
+	err := fs.loadCryptKey(blkptr{}, "secret", nil)
+	if err == nil || !strings.Contains(err.Error(), "empty passphrase") {
+		t.Fatalf("want empty-passphrase error, got %v", err)
 	}
 }
 

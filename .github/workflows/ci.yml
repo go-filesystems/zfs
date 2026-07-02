@@ -99,10 +99,15 @@ jobs:
           set -euo pipefail
           total=$(go tool cover -func=cover.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
           echo "total coverage: ${total}%"
-          # Repo's current statement coverage is 85.4%; gate just below it so
-          # an accidental regression fails CI while noise does not.
-          awk -v c="$total" 'BEGIN { exit !(c+0 >= 85.0) }' \
-            || { echo "coverage ${total}% < 85.0% gate"; exit 1; }
+          # Repo's current statement coverage is 86.4% (the native-encryption
+          # read path — DSL_CRYPTO_KEY locator, objset/dnode/indirect block
+          # handling — landed with unit + real-pool fixture tests). Gate just
+          # below it so an accidental regression fails CI while noise does not.
+          # The residual to 100% is dominated by defensive corrupt-pool error
+          # branches (a malformed MOS / DSL-dir chain) that need a
+          # deliberately-corrupted on-disk fixture to reach.
+          awk -v c="$total" 'BEGIN { exit !(c+0 >= 86.0) }' \
+            || { echo "coverage ${total}% < 86.0% gate"; exit 1; }
 
       - name: Upload coverage report
         if: always()

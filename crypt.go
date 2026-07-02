@@ -25,11 +25,13 @@ package filesystem_zfs
 //     parseDSLCryptoKeyPhys, parseDSLCryptoKeyFromZAP,
 //     marshalDSLCryptoKeyPhys, unwrapDSLCryptoKey, AAD helper) —
 //     implemented and unit-tested in this file.
-//   * Remaining: walk the DSL tree from the dataset to its
-//     DSL_CRYPTO_KEY object and feed those bytes through the
-//     parser. That step needs vectors from a real encrypted pool
-//     to validate end-to-end; until it is wired loadCryptKey
-//     returns a clearly-named "locator not wired" error.
+//   * DSL-tree locator (loadCryptKey → locateDSLCryptoKey /
+//     findCryptoKeyObj): walks the MOS from the uberblock root BP to
+//     the dataset's DSL directory, resolves its DD_FIELD_CRYPTO_KEY_OBJ
+//     (following the parent chain for inherited keys), reads the
+//     crypto-key ZAP off disk via zapListAllRaw and feeds it to the
+//     parser. Validated end-to-end against a real aes-256-gcm
+//     passphrase pool (crypt_pool_test.go).
 
 import (
 	"encoding/binary"
@@ -69,14 +71,12 @@ var _ io.ReaderAt = (*cryptingReader)(nil)
 // — every cleartext consumer (Stat / ListDir / ReadFile / …)
 // works unchanged.
 //
-// Status: crypto primitives (github.com/go-encryptions/ccm +
-// .../zfscrypt) and the DSL_CRYPTO_KEY on-disk parser
-// (parseDSLCryptoKeyPhys / parseDSLCryptoKeyFromZAP) are in
-// place. The remaining piece is the dataset-walker that locates
-// the DSL_CRYPTO_KEY object for a given dataset and feeds its
-// bytes through the parser; until that lands loadCryptKey
-// surfaces a clear "locator not wired" error so callers don't
-// silently get an undecrypted FS.
+// Status: fully wired. The crypto primitives (github.com/go-encryptions/ccm
+// + .../zfscrypt), the DSL_CRYPTO_KEY on-disk parser
+// (parseDSLCryptoKeyPhys / parseDSLCryptoKeyFromZAP) and the DSL-tree
+// walker that locates a dataset's DSL_CRYPTO_KEY object (loadCryptKey →
+// locateDSLCryptoKey) are all in place and validated end-to-end against a
+// real aes-256-gcm passphrase pool (see crypt_pool_test.go).
 func OpenFromDeviceDatasetWithKey(dev BlockBackend, partIndex int, datasetPath string, wrappingKeyOrPassphrase []byte) (FS, error) {
 	off, err := openPartitionOffset(dev, partIndex)
 	if err != nil {
@@ -91,7 +91,20 @@ func OpenFromDeviceDatasetWithKey(dev BlockBackend, partIndex int, datasetPath s
 	fs := &zfsFS{f: dev, partOffset: off + vdevLabelStartSize, info: info, labelOffset: off}
 	fs.curTxg = info.TransactionGroup
 
-	if err := fs.loadCryptKey(wrappingKeyOrPassphrase); err != nil {
+	// Read the pool's root block pointer (uberblock.ub_rootbp) once; both
+	// the crypto-key locator and the dataset open below navigate from it.
+	rootBPBuf := make([]byte, blkptrSize)
+	if _, err := dev.ReadAt(rootBPBuf, info.Offset+40); err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("zfs: read root block pointer: %w", err)
+	}
+	rootBP := parseBlkptr(rootBPBuf)
+	if rootBP.isNull() {
+		dev.Close()
+		return nil, fmt.Errorf("zfs: null root block pointer")
+	}
+
+	if err := fs.loadCryptKey(rootBP, datasetPath, wrappingKeyOrPassphrase); err != nil {
 		dev.Close()
 		return nil, err
 	}
@@ -99,20 +112,14 @@ func OpenFromDeviceDatasetWithKey(dev BlockBackend, partIndex int, datasetPath s
 	// readBlock sees the crypt context.
 	fs.f = &cryptingReader{blockBackend: dev, crypt: fs.crypt}
 
-	rootBPBuf := make([]byte, blkptrSize)
-	if _, e2 := fs.f.ReadAt(rootBPBuf, info.Offset+40); e2 == nil {
-		rootBP := parseBlkptr(rootBPBuf)
-		if !rootBP.isNull() {
-			if ds, e3 := openNamedDataset(fs.f, off, rootBP, datasetPath); e3 == nil {
-				fs.zplDS = ds
-				if sz, e4 := fs.f.Size(); e4 == nil {
-					fs.initAllocator(sz)
-				}
-			} else if datasetPath != "" {
-				fs.f.Close()
-				return nil, fmt.Errorf("zfs: open dataset %q: %w", datasetPath, e3)
-			}
+	if ds, e3 := openNamedDataset(fs.f, fs.partOffset, rootBP, datasetPath); e3 == nil {
+		fs.zplDS = ds
+		if sz, e4 := fs.f.Size(); e4 == nil {
+			fs.initAllocator(sz)
 		}
+	} else if datasetPath != "" {
+		fs.f.Close()
+		return nil, fmt.Errorf("zfs: open dataset %q: %w", datasetPath, e3)
 	}
 	return fs, nil
 }
@@ -143,6 +150,11 @@ type cryptCtx struct {
 	// MEK (SHA512_HMAC_KEYLEN); OpenZFS uses it to authenticate
 	// metadata that bypasses the AEAD layer.
 	hmacKey []byte
+	// version is the DSL_CRYPTO_KEY format version. It selects the
+	// per-block dnode AAD shape (the blkptr_auth_buf gained an 8-byte
+	// pad and the non-portable blk_prop masking changed between
+	// versions 0 and 1).
+	version uint64
 }
 
 // readBlockEncrypted is the encryption-aware physical-read helper.
@@ -167,9 +179,18 @@ func decryptBlockPayload(c *cryptCtx, bp blkptr, ciphertext []byte) ([]byte, err
 	if err != nil {
 		return nil, fmt.Errorf("zfs: derive block key: %w", err)
 	}
-	ad := blockAAD(bp)
 
-	pt, err := zfscrypt.DecryptBlock(c.suite, key, iv, mac, ciphertext, ad)
+	// Dnode blocks are only PARTIALLY encrypted: the dnode cores and
+	// their block pointers stay in plaintext (for scrub/claim) and only
+	// the encrypted bonus buffers are ciphered, gathered into one AEAD
+	// stream with a constructed AAD. Every other encrypted block type
+	// (ZPL file data, directory ZAP contents, …) is a normal whole-block
+	// AEAD with no additional authenticated data.
+	if bp.dmuType() == dmotDnode {
+		return decryptDnodeBlock(c, key, iv, mac, ciphertext)
+	}
+
+	pt, err := zfscrypt.DecryptBlock(c.suite, key, iv, mac, ciphertext, blockAAD(bp))
 	if err != nil {
 		return nil, fmt.Errorf("zfs: decrypt block: %w", err)
 	}
@@ -350,6 +371,68 @@ const (
 	zapDSLCryptoKeyVersion    = "DSL_CRYPTO_VERSION"
 )
 
+// zio_crypt_type_t on-disk values (OpenZFS include/sys/zio_crypt.h).
+// The DSL_CRYPTO_SUITE attribute and the version≥1 unwrap AAD both use
+// this numbering, which is NOT the same as the compacted
+// github.com/go-encryptions/zfscrypt.Suite numbering (that library omits
+// the INHERIT/ON/OFF entries, so its AES256GCM is 6 where the on-disk
+// value is 8). suiteFromZioCrypt / zioCryptFromSuite bridge the two: the
+// DSLCryptoKey and the crypto primitives work in zfscrypt.Suite space,
+// while everything that touches the wire (the SUITE attribute and the
+// AAD) uses zio_crypt space.
+const (
+	zioCryptAES128CCM = 3
+	zioCryptAES192CCM = 4
+	zioCryptAES256CCM = 5
+	zioCryptAES128GCM = 6
+	zioCryptAES192GCM = 7
+	zioCryptAES256GCM = 8
+)
+
+// suiteFromZioCrypt maps an on-disk zio_crypt_type_t value to the
+// zfscrypt.Suite the driver and crypto primitives use. ok is false for
+// inherit/on/off and any out-of-range value.
+func suiteFromZioCrypt(v uint64) (zfscrypt.Suite, bool) {
+	switch v {
+	case zioCryptAES128CCM:
+		return zfscrypt.AES128CCM, true
+	case zioCryptAES192CCM:
+		return zfscrypt.AES192CCM, true
+	case zioCryptAES256CCM:
+		return zfscrypt.AES256CCM, true
+	case zioCryptAES128GCM:
+		return zfscrypt.AES128GCM, true
+	case zioCryptAES192GCM:
+		return zfscrypt.AES192GCM, true
+	case zioCryptAES256GCM:
+		return zfscrypt.AES256GCM, true
+	default:
+		return 0, false
+	}
+}
+
+// zioCryptFromSuite is the inverse of suiteFromZioCrypt: it returns the
+// on-disk zio_crypt_type_t value for a zfscrypt.Suite, used to rebuild
+// the exact bytes OpenZFS authenticated in the unwrap AAD.
+func zioCryptFromSuite(s zfscrypt.Suite) uint64 {
+	switch s {
+	case zfscrypt.AES128CCM:
+		return zioCryptAES128CCM
+	case zfscrypt.AES192CCM:
+		return zioCryptAES192CCM
+	case zfscrypt.AES256CCM:
+		return zioCryptAES256CCM
+	case zfscrypt.AES128GCM:
+		return zioCryptAES128GCM
+	case zfscrypt.AES192GCM:
+		return zioCryptAES192GCM
+	case zfscrypt.AES256GCM:
+		return zioCryptAES256GCM
+	default:
+		return uint64(s)
+	}
+}
+
 // DSLCryptoKey is the parsed form of a ZFS dataset's DSL_CRYPTO_KEY
 // object. It carries everything the unwrap step needs: the AEAD suite,
 // the wrap-time IV+MAC, the wrapped (MEK||HMAC) blob, and the PBKDF2
@@ -513,11 +596,14 @@ func parseDSLCryptoKeyFromZAP(attrs map[string][]byte) (*DSLCryptoKey, error) {
 		return append([]byte(nil), v...), nil
 	}
 
+	// DSL_CRYPTO_SUITE is an on-disk zio_crypt_type_t value; translate it
+	// into the zfscrypt.Suite space the rest of the driver works in.
 	rawSuite, err := getU64(zapDSLCryptoKeyCryptSuite)
 	if err != nil {
 		return nil, err
 	}
-	if rawSuite > 0xff || zfscrypt.Suite(rawSuite).KeyLen() == 0 {
+	suite, ok := suiteFromZioCrypt(rawSuite)
+	if !ok {
 		return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY ZAP attrs: invalid crypto suite %d", rawSuite)
 	}
 	guid, err := getU64(zapDSLCryptoKeyGUID)
@@ -559,7 +645,7 @@ func parseDSLCryptoKeyFromZAP(attrs map[string][]byte) (*DSLCryptoKey, error) {
 	}
 
 	return &DSLCryptoKey{
-		Suite:            zfscrypt.Suite(rawSuite),
+		Suite:            suite,
 		GUID:             guid,
 		Version:          version,
 		Iters:            iters,
@@ -594,7 +680,9 @@ func dslCryptoKeyUnwrapAAD(k *DSLCryptoKey) []byte {
 	}
 	ad := make([]byte, 24)
 	binary.LittleEndian.PutUint64(ad[0:8], k.GUID)
-	binary.LittleEndian.PutUint64(ad[8:16], uint64(k.Suite))
+	// OpenZFS authenticates the on-disk zio_crypt_type_t value here, not
+	// the compacted zfscrypt.Suite number.
+	binary.LittleEndian.PutUint64(ad[8:16], zioCryptFromSuite(k.Suite))
 	binary.LittleEndian.PutUint64(ad[16:24], k.Version)
 	return ad
 }
@@ -646,21 +734,149 @@ func unwrapDSLCryptoKey(k *DSLCryptoKey, rawKeyOrPass []byte) (mek, hmacKey []by
 	return zfscrypt.Unwrap(k.Suite, wrappingKey, k.IV, k.MAC, wrapped, ad)
 }
 
+// ddFieldCryptoKeyObj names the ZAP attribute OpenZFS stores on an
+// encrypted dataset's DSL directory object; its uint64 value is the MOS
+// object number of that dataset's DSL_CRYPTO_KEY. See
+// include/sys/dsl_dir.h (DD_FIELD_CRYPTO_KEY_OBJ) and
+// module/zfs/dsl_crypt.c dsl_dir_hold_obj(), which does
+// zap_lookup(mos, ddobj, DD_FIELD_CRYPTO_KEY_OBJ, …). The "com.datto:"
+// prefix reflects the feature's original authorship (Datto's native
+// encryption).
+const ddFieldCryptoKeyObj = "com.datto:crypto_key_obj"
+
+// maxDSLDirParentWalk bounds the walk up the DSL directory parent chain
+// when locating a dataset's crypto key. Real DSL dir hierarchies are a
+// handful of levels deep (rpool/ROOT/distro); the cap only defends
+// against a corrupt parent pointer that forms a chain.
+const maxDSLDirParentWalk = 64
+
 // loadCryptKey discovers the dataset's DSL_CRYPTO_KEY object, reads it,
 // derives the wrapping key from the caller-supplied passphrase (or raw
 // key), and unwraps the MEK + HMAC key. Populates fs.crypt on success.
 //
-// The on-disk discovery half (walking the DSL tree from the dataset
-// down to the DSL_CRYPTO_KEY ZAP object and pulling its attributes
-// off-disk) is not wired here yet because it needs vectors from a real
-// encrypted pool to validate. The parser, marshaller, ZAP-attr decoder
-// and unwrap helper that consume those bytes are all implemented and
-// directly tested via crypt_test.go fixtures; this function will be
-// the thin glue that calls them once the dataset-walker side lands.
-//
-// Until the dataset walker is in place we return a clearly-named
-// "metadata locator not wired" error so callers can distinguish it
-// from a corrupt-pool error.
-func (fs *zfsFS) loadCryptKey(rawKeyOrPass []byte) error {
-	return fmt.Errorf("zfs: DSL_CRYPTO_KEY dataset locator not yet wired (parser is implemented — see parseDSLCryptoKeyPhys / parseDSLCryptoKeyFromZAP; the missing piece is walking the DSL tree to the dataset's crypto-key object)")
+// rootBP is the pool's uberblock root block pointer; datasetPath is the
+// "/"-separated path (relative to the pool root, optionally with a
+// trailing "@snap") of the dataset whose key to load. The locator reads
+// only cleartext MOS metadata — the object set, DSL directory chain and
+// crypto-key ZAP are never encrypted — so it runs against the raw device
+// before the crypting reader is installed.
+func (fs *zfsFS) loadCryptKey(rootBP blkptr, datasetPath string, rawKeyOrPass []byte) error {
+	if len(rawKeyOrPass) == 0 {
+		return fmt.Errorf("zfs: DSL_CRYPTO_KEY: empty passphrase / key")
+	}
+	key, err := locateDSLCryptoKey(fs.f, fs.partOffset, rootBP, datasetPath)
+	if err != nil {
+		return err
+	}
+	mek, hmacKey, err := unwrapDSLCryptoKey(key, rawKeyOrPass)
+	if err != nil {
+		return fmt.Errorf("zfs: DSL_CRYPTO_KEY unwrap: %w", err)
+	}
+	fs.crypt = &cryptCtx{suite: key.Suite, mek: mek, hmacKey: hmacKey, version: key.Version}
+	return nil
+}
+
+// locateDSLCryptoKey walks the MOS from the pool root block pointer to
+// the named dataset's DSL directory, resolves that directory's
+// DSL_CRYPTO_KEY object (following the parent chain for datasets that
+// inherit their key from an ancestor encryption root), reads the
+// crypto-key ZAP off disk and returns the parsed key.
+func locateDSLCryptoKey(r io.ReaderAt, partOff int64, rootBP blkptr, datasetPath string) (*DSLCryptoKey, error) {
+	// A trailing "@snap" selects a snapshot, which shares the head
+	// dataset's crypto key — drop it before the DSL-dir walk.
+	dsPath, _ := splitSnapSuffix(datasetPath)
+
+	mos, err := openObjset(r, partOff, rootBP)
+	if err != nil {
+		return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: open MOS: %w", err)
+	}
+	if mos.osType != dmuOSTMeta {
+		return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: MOS has unexpected type %d", mos.osType)
+	}
+
+	poolDirDN, err := mos.readObject(mosPoolDirObj)
+	if err != nil {
+		return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: read pool dir object: %w", err)
+	}
+	poolDirEntries, err := zapListAll(r, partOff, poolDirDN)
+	if err != nil {
+		return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: pool dir ZAP: %w", err)
+	}
+	dirObj, ok := poolDirEntries[dmuPoolRootDataset]
+	if !ok {
+		return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: pool dir missing 'root_dataset' key")
+	}
+
+	// Walk the child-dir chain to the requested dataset's DSL directory
+	// (mirrors openNamedDataset's Step 2.5).
+	for _, segment := range splitPath(dsPath) {
+		dslDirDN, err := mos.readObject(dirObj)
+		if err != nil {
+			return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: read DSL dir %d on the way to %q: %w", dirObj, dsPath, err)
+		}
+		bonus := dslDirDN.bonusData()
+		if len(bonus) < ddChildDirZAPObj+8 {
+			return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: DSL dir %d bonus too short for childDirZAP", dirObj)
+		}
+		childZAP := binary.LittleEndian.Uint64(bonus[ddChildDirZAPObj:])
+		if childZAP == 0 {
+			return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: DSL dir %d has no children resolving %q", dirObj, dsPath)
+		}
+		childDN, err := mos.readObject(childZAP)
+		if err != nil {
+			return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: read child-dir ZAP %d: %w", childZAP, err)
+		}
+		children, err := zapListAll(r, partOff, childDN)
+		if err != nil {
+			return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: parse child-dir ZAP %d: %w", childZAP, err)
+		}
+		next, ok := children[segment]
+		if !ok {
+			return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: dataset segment %q not found under DSL dir %d (have: %v)", segment, dirObj, childKeys(children))
+		}
+		dirObj = next
+	}
+
+	cryptoObj, err := findCryptoKeyObj(r, partOff, mos, dirObj)
+	if err != nil {
+		return nil, err
+	}
+
+	ckDN, err := mos.readObject(cryptoObj)
+	if err != nil {
+		return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: read crypto-key object %d: %w", cryptoObj, err)
+	}
+	attrs, err := zapListAllRaw(r, partOff, ckDN)
+	if err != nil {
+		return nil, fmt.Errorf("zfs: DSL_CRYPTO_KEY: read crypto-key ZAP %d: %w", cryptoObj, err)
+	}
+	return parseDSLCryptoKeyFromZAP(attrs)
+}
+
+// findCryptoKeyObj resolves the DSL_CRYPTO_KEY object number for the DSL
+// directory dslDirObj. Each encrypted dataset's DSL directory is a ZAP
+// carrying a DD_FIELD_CRYPTO_KEY_OBJ entry; a dataset that inherits its
+// key from an ancestor encryption root may not carry the entry itself,
+// so we walk up the dd_parent_obj chain until we find one.
+func findCryptoKeyObj(r io.ReaderAt, partOff int64, mos *objset, dslDirObj uint64) (uint64, error) {
+	cur := dslDirObj
+	for depth := 0; cur != 0 && depth < maxDSLDirParentWalk; depth++ {
+		dslDirDN, err := mos.readObject(cur)
+		if err != nil {
+			return 0, fmt.Errorf("zfs: DSL_CRYPTO_KEY: read DSL dir %d: %w", cur, err)
+		}
+		if obj, err := zapLookup(r, partOff, dslDirDN, ddFieldCryptoKeyObj); err == nil && obj != 0 {
+			return obj, nil
+		}
+		bonus := dslDirDN.bonusData()
+		if len(bonus) < ddParentObj+8 {
+			break
+		}
+		parent := binary.LittleEndian.Uint64(bonus[ddParentObj:])
+		if parent == cur {
+			break
+		}
+		cur = parent
+	}
+	return 0, fmt.Errorf("zfs: DSL_CRYPTO_KEY: dataset is not encrypted or has no %q entry up the DSL-dir chain", ddFieldCryptoKeyObj)
 }
