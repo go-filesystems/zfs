@@ -30,55 +30,83 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
 )
 
-// extractCryptoFixture decompresses testdata/crypto/<name>.tar.zst into a
-// temp dir and returns the path of the single d0.img vdev.
+// cryptoFixtureCache decompresses each testdata/crypto/<name>.tar.zst
+// exactly once per test run and caches the raw d0.img bytes. Each test
+// then gets its own on-disk copy (the reader opens the image O_RDWR), so
+// the 128 MiB vdev is decompressed once rather than per-test — keeping
+// the encryption fixture cheap on the -race CI lane.
+var (
+	cryptoFixtureOnce sync.Map // name -> *sync.Once
+	cryptoFixtureData sync.Map // name -> []byte
+)
+
+func decompressCryptoFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	onceI, _ := cryptoFixtureOnce.LoadOrStore(name, &sync.Once{})
+	once := onceI.(*sync.Once)
+	var loadErr error
+	once.Do(func() {
+		src := filepath.Join("testdata", "crypto", name+".tar.zst")
+		f, err := os.Open(src)
+		if err != nil {
+			loadErr = err
+			return
+		}
+		defer f.Close()
+		zr, err := zstd.NewReader(f)
+		if err != nil {
+			loadErr = err
+			return
+		}
+		defer zr.Close()
+		tr := tar.NewReader(zr)
+		for {
+			hdr, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				loadErr = err
+				return
+			}
+			if hdr.Typeflag != tar.TypeReg {
+				continue
+			}
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				loadErr = err
+				return
+			}
+			cryptoFixtureData.Store(name, data)
+			return
+		}
+	})
+	if loadErr != nil {
+		t.Fatalf("decompress fixture %s: %v", name, loadErr)
+	}
+	d, ok := cryptoFixtureData.Load(name)
+	if !ok {
+		t.Fatalf("fixture %s contained no regular file", name)
+	}
+	return d.([]byte)
+}
+
+// extractCryptoFixture writes a fresh, writable copy of the cached vdev
+// image into the test's temp dir and returns its path.
 func extractCryptoFixture(t *testing.T, name string) string {
 	t.Helper()
-	src := filepath.Join("testdata", "crypto", name+".tar.zst")
-	f, err := os.Open(src)
-	if err != nil {
-		t.Fatalf("open fixture %s: %v", src, err)
+	data := decompressCryptoFixture(t, name)
+	dst := filepath.Join(t.TempDir(), "d0.img")
+	if err := os.WriteFile(dst, data, 0o600); err != nil {
+		t.Fatalf("write fixture copy: %v", err)
 	}
-	defer f.Close()
-	zr, err := zstd.NewReader(f)
-	if err != nil {
-		t.Fatalf("zstd reader: %v", err)
-	}
-	defer zr.Close()
-	tr := tar.NewReader(zr)
-	dir := t.TempDir()
-	var img string
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("tar next: %v", err)
-		}
-		if hdr.Typeflag != tar.TypeReg {
-			continue
-		}
-		dst := filepath.Join(dir, hdr.Name)
-		w, err := os.Create(dst)
-		if err != nil {
-			t.Fatalf("create %s: %v", dst, err)
-		}
-		if _, err := io.Copy(w, tr); err != nil {
-			t.Fatalf("extract %s: %v", dst, err)
-		}
-		w.Close()
-		img = dst
-	}
-	if img == "" {
-		t.Fatal("fixture contained no regular file")
-	}
-	return img
+	return dst
 }
 
 func openEncryptedFixture(t *testing.T, dataset string, pass []byte) FS {
