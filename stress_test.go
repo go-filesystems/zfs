@@ -1065,7 +1065,7 @@ func TestStress_CryptoRoundTrip(t *testing.T) {
 
 		// ZAP-attribute round-trip via the parser.
 		attrs := map[string][]byte{
-			zapDSLCryptoKeyCryptSuite: u64bytes(uint64(k.Suite)),
+			zapDSLCryptoKeyCryptSuite: u64bytes(zioCryptFromSuite(k.Suite)),
 			zapDSLCryptoKeyGUID:       u64bytes(k.GUID),
 			zapDSLCryptoKeyIters:      u64bytes(k.Iters),
 			zapDSLCryptoKeyIV:         k.IV,

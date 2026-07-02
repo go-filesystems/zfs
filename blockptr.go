@@ -278,7 +278,11 @@ func readBlock(r io.ReaderAt, partOff int64, bp blkptr) ([]byte, error) {
 		return nil, fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
 	}
 
-	if bp.isEncrypted() {
+	// Only genuinely-encrypted blocks (BP_IS_ENCRYPTED) are decrypted.
+	// Authenticated and indirect-MAC-checksum blocks also set the crypt
+	// bit but store their bodies in plaintext, so they fall straight
+	// through to the decompressor below.
+	if bpIsEncrypted(bp) {
 		cr, ok := r.(*cryptingReader)
 		if !ok {
 			return nil, fmt.Errorf("zfs: encrypted block read against an unwrapped reader — open with OpenFromDeviceDatasetWithKey")
