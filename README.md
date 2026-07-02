@@ -18,8 +18,10 @@ create, inspect, and modify ZFS filesystems programmatically.
 | Format | ✅ | Creates new pool images via `Format` |
 | ReadFile / WriteFile | ✅ | Basic file I/O supported (ZPL dataset) |
 | MkDir / Delete / Rename | ✅ | Directory operations supported |
-| Snapshots / Clones | ⚠️ No | Not implemented (test-oriented subset) |
-| Compression / Checksums | ⚠️ No | Not implemented on data blocks |
+| Snapshots | ✅ | Create via `FS.Snapshot`, read via `OpenSnapshot` |
+| Compression | ✅ Read | Transparent decompress on read (lz4 / gzip / zstd / lzjb / zle) |
+| Native encryption | ✅ Read | AES-CCM/GCM datasets via `OpenFromDeviceDatasetWithKey` (passphrase or raw wrapping key) |
+| Clones | ⚠️ No | Not implemented |
 
 
 ## Module
@@ -111,13 +113,16 @@ Only **micro-ZAP** is supported for directory writes. Directory entries use a
 
 ## Limitations
 
-- Single vdev, single pool, single dataset
-- No compression or checksums on data blocks
-- No snapshots, clones, or ACLs
+- Single pool; the writer targets a single dataset (the reader also
+  navigates nested datasets and multi-vdev/RAID-Z pools)
+- The writer does not compress or encrypt data blocks; the reader
+  decompresses (lz4/gzip/zstd/lzjb/zle) and decrypts (native AES-CCM/GCM)
+  transparently
+- No clones or ACLs (snapshots are supported: create + read)
 - Maximum 28 objects (files + directories) per pool image
 - Directory names limited to 49 bytes
 
 ## Test coverage
 
-~85% statement coverage, enforced by a CI floor. The uncovered
+~86% statement coverage, enforced by a CI floor. The uncovered
 remainder is defensive error handling on rare on-disk corruption paths.
