@@ -119,4 +119,5 @@ Only **micro-ZAP** is supported for directory writes. Directory entries use a
 
 ## Test coverage
 
-100% statement coverage.
+~85% statement coverage, enforced by a CI floor. The uncovered
+remainder is defensive error handling on rare on-disk corruption paths.
