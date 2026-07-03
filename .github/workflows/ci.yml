@@ -46,30 +46,30 @@ jobs:
     runs-on: ${{ matrix.runs-on }}
     steps:
       - name: Checkout zfs
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fs/zfs
 
       - name: Checkout interface (sibling replace target)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: go-filesystems/interface
           path: fs/interface
 
       - name: Checkout zfscrypt (sibling replace target)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: go-encryptions/zfscrypt
           path: go-encryptions/zfscrypt
 
       - name: Checkout ccm (sibling replace target)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: go-encryptions/ccm
           path: go-encryptions/ccm
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: stable
           check-latest: true
@@ -153,30 +153,30 @@ jobs:
             qemu: qemu
     steps:
       - name: Checkout zfs
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: fs/zfs
 
       - name: Checkout interface (sibling replace target)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: go-filesystems/interface
           path: fs/interface
 
       - name: Checkout zfscrypt (sibling replace target)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: go-encryptions/zfscrypt
           path: go-encryptions/zfscrypt
 
       - name: Checkout ccm (sibling replace target)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: go-encryptions/ccm
           path: go-encryptions/ccm
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: stable
           check-latest: true
