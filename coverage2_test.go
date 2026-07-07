@@ -997,12 +997,12 @@ func TestParseFatZAP_PtrTblBoundsOOB(t *testing.T) {
 
 func TestWriteDnode_OffsetOOB(t *testing.T) {
 	// offsetInBlock+dnodeMinSize > len(blkData) in writeDnode (fs.go line 552).
-	// blkData comes from readBlock which returns lsize bytes. lsize=fmtObjArraySize=16384.
+	// blkData comes from readBlock which returns lsize bytes. lsize=fmtZPLObjArraySize=16384.
 	// offsetInBlock = (objNum * 512) % 16384. For objNum=0..31, this is always valid.
 	// The only way to make it OOB is for the physical block to be shorter than lsize,
 	// e.g. an embedded BP where lsize > psize. However readBlock decompresses to lsize.
 	// For a normal block, lsize == psize, so OOB is unreachable — dead code.
-	t.Skip("fs.go:552 OOB is dead code: lsize always equals fmtObjArraySize")
+	t.Skip("fs.go:552 OOB is dead code: lsize always equals fmtZPLObjArraySize")
 }
 
 // ── fs.go: updateDirZAP ZAP type not zbtMicro ────────────────────────────────

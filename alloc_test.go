@@ -6,7 +6,7 @@ import (
 )
 
 func TestAllocFreeSpace(t *testing.T) {
-	a := newAllocator(0, 4096, poolBlockSize)
+	a := newAllocator(0, 4096, poolBlockSize, 0)
 	if got := a.freeSpace(); got != 4096 {
 		t.Fatalf("freeSpace() = %d, want 4096", got)
 	}
@@ -20,18 +20,18 @@ func TestAllocFreeSpace(t *testing.T) {
 
 func TestAllocDefaultBlockSize(t *testing.T) {
 	// blockSize <= 0 should fall back to poolBlockSize.
-	a := newAllocator(0, 16384, 0)
+	a := newAllocator(0, 16384, 0, 0)
 	if a.blockSize != poolBlockSize {
 		t.Fatalf("blockSize = %d, want %d (default)", a.blockSize, poolBlockSize)
 	}
-	a2 := newAllocator(0, 16384, -1)
+	a2 := newAllocator(0, 16384, -1, 0)
 	if a2.blockSize != poolBlockSize {
 		t.Fatalf("blockSize = %d for -1 input, want %d", a2.blockSize, poolBlockSize)
 	}
 }
 
 func TestAllocExhausted(t *testing.T) {
-	a := newAllocator(0, poolBlockSize, poolBlockSize)
+	a := newAllocator(0, poolBlockSize, poolBlockSize, 0)
 	if _, err := a.alloc(poolBlockSize); err != nil {
 		t.Fatalf("first alloc: %v", err)
 	}
@@ -42,14 +42,14 @@ func TestAllocExhausted(t *testing.T) {
 
 func TestAllocStartAlignment(t *testing.T) {
 	// Unaligned start should be aligned up.
-	a := newAllocator(1, 8192, poolBlockSize)
+	a := newAllocator(1, 8192, poolBlockSize, 0)
 	if a.nextFree != poolBlockSize {
 		t.Fatalf("nextFree = %d, want %d (aligned from 1)", a.nextFree, poolBlockSize)
 	}
 }
 
 func TestAllocReturnsOffset(t *testing.T) {
-	a := newAllocator(0, 3*poolBlockSize, poolBlockSize)
+	a := newAllocator(0, 3*poolBlockSize, poolBlockSize, 0)
 	off0, err := a.alloc(poolBlockSize)
 	if err != nil || off0 != 0 {
 		t.Fatalf("first alloc = (%d, %v), want (0, nil)", off0, err)
@@ -65,7 +65,7 @@ func TestAllocReturnsOffset(t *testing.T) {
 // This is the property that prevents the bump pointer from leaking
 // pool space under steady-state write/delete workloads.
 func TestAllocFreeListExactSize(t *testing.T) {
-	a := newAllocator(0, 8*poolBlockSize, poolBlockSize)
+	a := newAllocator(0, 8*poolBlockSize, poolBlockSize, 0)
 	off0, err := a.alloc(poolBlockSize)
 	if err != nil || off0 != 0 {
 		t.Fatalf("first alloc = (%d, %v), want (0, nil)", off0, err)
@@ -89,7 +89,7 @@ func TestAllocFreeListExactSize(t *testing.T) {
 // is satisfied, and the remainder rejoins the free list under a new
 // size class.
 func TestAllocFreeListBestFit(t *testing.T) {
-	a := newAllocator(0, 16*poolBlockSize, poolBlockSize)
+	a := newAllocator(0, 16*poolBlockSize, poolBlockSize, 0)
 	// Allocate one 4-block extent then free it.
 	big, err := a.alloc(4 * poolBlockSize)
 	if err != nil {
@@ -113,7 +113,7 @@ func TestAllocFreeListBestFit(t *testing.T) {
 // the bump tail, and proves the SECOND allocation comes from the
 // freed slot rather than failing OOM.
 func TestAllocFreeListReclaimsBeforeBump(t *testing.T) {
-	a := newAllocator(0, 2*poolBlockSize, poolBlockSize)
+	a := newAllocator(0, 2*poolBlockSize, poolBlockSize, 0)
 	off0, err := a.alloc(poolBlockSize)
 	if err != nil {
 		t.Fatalf("alloc 1: %v", err)
@@ -134,7 +134,7 @@ func TestAllocFreeListReclaimsBeforeBump(t *testing.T) {
 // TestAllocFreeIgnoresInvalid checks that calling free on null /
 // negative inputs is a no-op (callers pass BPs straight through).
 func TestAllocFreeIgnoresInvalid(t *testing.T) {
-	a := newAllocator(0, 4*poolBlockSize, poolBlockSize)
+	a := newAllocator(0, 4*poolBlockSize, poolBlockSize, 0)
 	a.free(0, 0)
 	a.free(-1, poolBlockSize)
 	a.free(0, -1)
@@ -148,7 +148,7 @@ func TestAllocFreeIgnoresInvalid(t *testing.T) {
 // race (caught by -race) or an arithmetic invariant violation
 // (free-list accumulates impossible extents).
 func TestAllocConcurrent(t *testing.T) {
-	a := newAllocator(0, 1<<24, poolBlockSize) // 16 MiB
+	a := newAllocator(0, 1<<24, poolBlockSize, 0) // 16 MiB
 	const iters = 200
 	const workers = 8
 	var wg sync.WaitGroup

@@ -25,6 +25,16 @@ type fsFields struct {
 	alloc  *allocator
 	curTxg uint64
 	mu     sync.Mutex
+	// Metaslab geometry (set by initAllocator from the image size): the
+	// space_map writer distributes live extents across msCount metaslabs of
+	// 2^msShift bytes each.
+	msShift int
+	msCount int
+	// mosUpperDirty is set when a MOS object beyond the first dnode block
+	// (block 0) is written in the current transaction — only Snapshot does
+	// this. recommitChain uses it to skip re-reading/re-checksumming the
+	// upper MOS blocks on the common write path.
+	mosUpperDirty bool
 }
 
 // ── Stat ─────────────────────────────────────────────────────────────────────
@@ -809,7 +819,7 @@ func (fs *zfsFS) allocObjectNum() (uint64, error) {
 	// unlinked set, root dir, SA master/registry/layouts). User files start
 	// at the first slot after them; the dmotNone check below also skips any
 	// already-allocated slot, so a low start bound is safe either way.
-	for i := uint64(fmtZPLObjCount + 1); i < fmtObjArrayObjs; i++ {
+	for i := uint64(fmtZPLObjCount + 1); i < fmtZPLObjArrayObjs; i++ {
 		dn, err := fs.zplDS.zplOS.readObject(i)
 		if err != nil {
 			continue
@@ -829,9 +839,18 @@ func (fs *zfsFS) allocObjectNum() (uint64, error) {
 // non-zero (DMU_OT_NONE == 0); DeleteFile/DeleteDir zero the whole dnode,
 // which clears the type and so drops the slot from this count.
 func countZPLObjects(objArray []byte) uint64 {
+	return countDnodeSlots(objArray, 1)
+}
+
+// countDnodeSlots returns the number of allocated dnodes (dn_type != DMU_OT_NONE)
+// in a single object-array block, scanning from slot startSlot. Use startSlot=1
+// for the array's first block (object 0 is never an allocated object —
+// dmu_object_next skips it) and startSlot=0 for subsequent blocks (every slot
+// there maps to a real object number).
+func countDnodeSlots(block []byte, startSlot int) uint64 {
 	var n uint64
-	for off := dnodeMinSize; off+dnodeMinSize <= len(objArray); off += dnodeMinSize {
-		if objArray[off] != dmotNone {
+	for off := startSlot * dnodeMinSize; off+dnodeMinSize <= len(block); off += dnodeMinSize {
+		if block[off] != dmotNone {
 			n++
 		}
 	}
@@ -841,7 +860,7 @@ func countZPLObjects(objArray []byte) uint64 {
 // writeDnode writes a dnode back to the ZPL object array at objNum.
 func (fs *zfsFS) writeDnode(objNum uint64, dn *dnode) error {
 	// Object array is at fmtZPLObjArrayOff; each dnode is 512 bytes.
-	blkSz := uint64(fmtObjArraySize)
+	blkSz := uint64(fmtZPLObjArraySize)
 	byteOff := objNum * uint64(dnodeMinSize)
 	blockID := byteOff / blkSz
 	offsetInBlock := int(byteOff % blkSz)
@@ -1137,79 +1156,102 @@ func (fs *zfsFS) updateSpaceMap() error {
 		return fmt.Errorf("read MOS object array: %w", err)
 	}
 
-	// Parse the metaslab-0 space_map dnode (MOS object fmtMOSSpaceMap0Obj).
-	smOff := fmtMOSSpaceMap0Obj * dnodeMinSize
-	if smOff+dnodeMinSize > len(mosObjArray) {
-		return fmt.Errorf("space_map object %d out of MOS array", fmtMOSSpaceMap0Obj)
-	}
-	smDN, err := parseDnode(mosObjArray[smOff : smOff+dnodeMinSize])
-	if err != nil {
-		return fmt.Errorf("parse space_map dnode: %w", err)
-	}
-	if smDN.typ != dmotSpaceMap {
-		// Older / different layout without our metaslab space map — nothing
-		// to maintain (the leak audit only applies when a space map exists).
+	// The live allocated set, distributed across the msCount metaslabs.
+	// Every block the writer hands out lands in [fmtMOSObjsetOff, asize) and
+	// asize = msCount<<msShift, so every extent falls inside some metaslab,
+	// each of which has a pre-created space_map object — keeping `zdb -bcc`
+	// claim/leak accounting balanced however large the writes grow.
+	if fs.msCount == 0 {
 		return nil
 	}
-	smBP := smDN.blkptrAt(0)
-	if smBP.isNull() {
-		return fmt.Errorf("space_map dnode has null data BP")
-	}
-
-	// Build the new space-map log from the live allocated set.
+	msSize := int64(1) << fs.msShift
 	extents := fs.alloc.allocatedExtents(int64(fmtMOSObjsetOff))
-	metaslab0End := int64(1) << fmtMetaslabShift
-	ranges := make([]smRange, 0, len(extents))
-	var allocBytes int64
-	for _, e := range extents {
-		if e.off+e.size > metaslab0End {
-			// The live set has grown past metaslab 0. Maintaining a
-			// balanced multi-metaslab space_map at runtime (allocating new
-			// space_map objects, growing the metaslab_array, adjusting the
-			// spacemap_histogram feature refcount) is beyond this writer;
-			// leave the space_map untouched rather than emit a wrong one.
-			// The block-pointer checksum chain is still fully recomputed by
-			// recommitChain, so the pool stays checksum-clean — only the
-			// space-accounting leak audit (`zdb -bcc` without -AAA) would
-			// flag such a >16 MiB pool. Smaller pools stay fully balanced.
+
+	// Pass 1: build and validate every metaslab's space_map block + bonus,
+	// so a single over-fragmented metaslab aborts the whole update cleanly
+	// (no partial on-disk state) rather than truncating one map.
+	type smUpdate struct {
+		dn     *dnode
+		bp     blkptr
+		block  []byte
+		logLen int
+		alloc  int64
+	}
+	updates := make([]smUpdate, fs.msCount)
+	for m := 0; m < fs.msCount; m++ {
+		smObj := fmtMOSSpaceMap0Obj + m
+		off := smObj * dnodeMinSize
+		if off+dnodeMinSize > len(mosObjArray) {
+			return fmt.Errorf("space_map object %d out of MOS array", smObj)
+		}
+		dn, err := parseDnode(mosObjArray[off : off+dnodeMinSize])
+		if err != nil {
+			return fmt.Errorf("parse space_map dnode %d: %w", smObj, err)
+		}
+		if dn.typ != dmotSpaceMap {
+			// Layout without our per-metaslab space maps — nothing to maintain.
 			return nil
 		}
-		ranges = append(ranges, smRange{off: e.off, length: e.size, typ: smAlloc})
-		allocBytes += e.size
-	}
-	smLog := encodeSpaceMapLog(ranges)
+		bp := dn.blkptrAt(0)
+		if bp.isNull() {
+			return fmt.Errorf("space_map dnode %d has null data BP", smObj)
+		}
 
-	smBlkSize := int(smBP.psize())
-	if len(smLog) > smBlkSize {
-		// Too many discontiguous live extents to fit the space-map log in
-		// one block. Same rationale as the metaslab-0 overflow above: leave
-		// the space_map as-is rather than truncate it.
-		return nil
-	}
-	smBlock := make([]byte, smBlkSize)
-	copy(smBlock, smLog)
+		// Clip the live extents into this metaslab; space_map offsets are
+		// metaslab-relative (metaslab m starts at vdev offset m<<msShift).
+		msStart := int64(m) * msSize
+		msEnd := msStart + msSize
+		ranges := make([]smRange, 0, len(extents))
+		var allocBytes int64
+		for _, e := range extents {
+			lo, hi := e.off, e.off+e.size
+			if lo < msStart {
+				lo = msStart
+			}
+			if hi > msEnd {
+				hi = msEnd
+			}
+			if hi <= lo {
+				continue
+			}
+			ranges = append(ranges, smRange{off: lo - msStart, length: hi - lo, typ: smAlloc})
+			allocBytes += hi - lo
+		}
 
-	// Write the space-map data block and recompute its BP checksum.
-	if _, err := fs.f.WriteAt(smBlock, fs.partOffset+smBP.dvaOffset(0)); err != nil {
-		return fmt.Errorf("write space_map block: %w", err)
+		log := encodeSpaceMapLog(ranges)
+		blkSize := int(bp.psize())
+		if len(log) > blkSize {
+			// Too fragmented for one block; leave all maps as-is this commit.
+			return nil
+		}
+		block := make([]byte, blkSize)
+		copy(block, log)
+		updates[m] = smUpdate{dn: dn, bp: bp, block: block, logLen: len(log), alloc: allocBytes}
 	}
-	setBPChecksum(&smBP, smBlock)
-	smBP.birth = fs.curTxg
-	smBP.physBirth = fs.curTxg
-	smDN.setBlkptrAt(0, smBP)
 
-	// Update the space_map_phys_t bonus (smp_length, smp_alloc) in place.
-	bonusBase := dnodeBonusOff(int(smDN.nblkptr))
-	if bonusBase+smpAlloc+8 > len(smDN.raw) {
-		return fmt.Errorf("space_map bonus out of dnode")
+	// Pass 2: write every space_map block, recompute its BP checksum, refresh
+	// smp_length/smp_alloc, and patch the dnode back into the MOS array.
+	// recommitChain re-reads the array and recomputes the checksum chain above.
+	for m := 0; m < fs.msCount; m++ {
+		u := updates[m]
+		if _, err := fs.f.WriteAt(u.block, fs.partOffset+u.bp.dvaOffset(0)); err != nil {
+			return fmt.Errorf("write space_map block %d: %w", m, err)
+		}
+		setBPChecksum(&u.bp, u.block)
+		u.bp.birth = fs.curTxg
+		u.bp.physBirth = fs.curTxg
+		u.dn.setBlkptrAt(0, u.bp)
+
+		bonusBase := dnodeBonusOff(int(u.dn.nblkptr))
+		if bonusBase+smpAlloc+8 > len(u.dn.raw) {
+			return fmt.Errorf("space_map %d bonus out of dnode", m)
+		}
+		binary.LittleEndian.PutUint64(u.dn.raw[bonusBase+smpLength:], uint64(u.logLen))
+		binary.LittleEndian.PutUint64(u.dn.raw[bonusBase+smpAlloc:], uint64(u.alloc))
+
+		off := (fmtMOSSpaceMap0Obj + m) * dnodeMinSize
+		copy(mosObjArray[off:off+dnodeMinSize], u.dn.raw[:dnodeMinSize])
 	}
-	binary.LittleEndian.PutUint64(smDN.raw[bonusBase+smpLength:], uint64(len(smLog)))
-	binary.LittleEndian.PutUint64(smDN.raw[bonusBase+smpAlloc:], uint64(allocBytes))
-
-	// Write the updated space_map dnode back into the on-disk MOS object
-	// array. recommitChain re-reads this array and recomputes its checksum
-	// (and the whole chain above) on the next step.
-	copy(mosObjArray[smOff:smOff+dnodeMinSize], smDN.raw[:dnodeMinSize])
 	if _, err := fs.f.WriteAt(mosObjArray, fs.partOffset+mosMetaBP.dvaOffset(0)); err != nil {
 		return fmt.Errorf("write MOS object array: %w", err)
 	}
@@ -1338,12 +1380,50 @@ func (fs *zfsFS) recommitChain() (blkptr, error) {
 		return blkptr{}, fmt.Errorf("write MOS object array: %w", err)
 	}
 
-	// (c) MOS object array → mosMetaBP checksum, stored in the MOS objset block.
+	// (c) MOS object array → meta_dnode BPs in the MOS objset block. The MOS
+	// array spans multiple 16 KiB dnode blocks: block 0 (mosMetaBP, rewritten
+	// above) holds the system objects + space_maps; higher blocks hold
+	// snapshot datasets/ZAPs. Re-checksum and recount each block so the
+	// per-block fills and the objset (root) fill match the live MOS dnodes —
+	// dump_objset() asserts object_count == usedobjs for the MOS too.
+	mosMetaBP.fill = countDnodeSlots(mosObjArray, 1) // block 0, object 0 excluded
 	setBPChecksum(&mosMetaBP, mosObjArray)
 	encodeBlkptr(mosMetaBP, mosObjsetBlk[dnodeHdrSize:dnodeHdrSize+blkptrSize])
+	totalFill := mosMetaBP.fill
+
+	mosMetaDN, err := parseDnode(mosObjsetBlk[:dnodeMinSize])
+	if err != nil {
+		return blkptr{}, fmt.Errorf("parse MOS meta_dnode: %w", err)
+	}
+	for b := 1; b < int(mosMetaDN.nblkptr); b++ {
+		bp := mosMetaDN.blkptrAt(b)
+		if bp.isNull() {
+			continue
+		}
+		if !fs.mosUpperDirty {
+			// No MOS object beyond block 0 was written this txg (the common
+			// case — only Snapshot allocates into the upper blocks), so this
+			// block's bytes and BP checksum are unchanged. Reuse its on-disk
+			// fill instead of paying a 16 KiB read + fletcher4 on every write.
+			totalFill += bp.fill
+			continue
+		}
+		blk, err := readPhys(bp)
+		if err != nil {
+			return blkptr{}, fmt.Errorf("read MOS object array block %d: %w", b, err)
+		}
+		bp.fill = countDnodeSlots(blk, 0)
+		setBPChecksum(&bp, blk)
+		off := dnodeHdrSize + b*blkptrSize
+		encodeBlkptr(bp, mosObjsetBlk[off:off+blkptrSize])
+		totalFill += bp.fill
+	}
+	fs.mosUpperDirty = false
+
 	if err := writePhys(rootBP, mosObjsetBlk); err != nil {
 		return blkptr{}, fmt.Errorf("write MOS objset: %w", err)
 	}
+	rootBP.fill = totalFill
 
 	// (d) MOS objset block → rootbp checksum (returned for the uberblock).
 	setBPChecksum(&rootBP, mosObjsetBlk)
@@ -1352,10 +1432,16 @@ func (fs *zfsFS) recommitChain() (blkptr, error) {
 
 // initAllocator computes the next free offset by scanning ZPL block pointers.
 func (fs *zfsFS) initAllocator(imageSize int64) {
-	maxOff := int64(fmtInitialNextFree)
+	asize, msShift, msCount := vdevGeometry(imageSize)
+	fs.msShift, fs.msCount = msShift, msCount
+
+	// The bump pointer starts past Format()'s fixed region (which ends after
+	// the msCount space_map blocks), then advances past any already-written
+	// ZPL data on reopen.
+	maxOff := fmtFormatRegionEnd(msCount)
 	if fs.zplDS != nil {
 		// Quick scan: look at each ZPL object's data BP
-		for i := uint64(1); i < fmtObjArrayObjs; i++ {
+		for i := uint64(1); i < fmtZPLObjArrayObjs; i++ {
 			dn, err := fs.zplDS.zplOS.readObject(i)
 			if err != nil || dn == nil || dn.typ == dmotNone {
 				continue
@@ -1386,9 +1472,23 @@ func (fs *zfsFS) initAllocator(imageSize int64) {
 	}
 
 	next := alignUp(maxOff, int64(poolBlockSize))
-	limit := imageSize - 2*vdevLabelSize
+	// Cap allocation at asize so every block lands in metaslab-covered space
+	// (each metaslab has a space_map, so `zdb -bcc` can claim it). On
+	// degenerate tiny images (asize 0, not OpenZFS-importable anyway) fall
+	// back to the device-size bound so the driver's own read/write tests
+	// still have room.
+	limit := asize
+	var msSize int64
+	if asize > 0 {
+		msSize = int64(1) << msShift
+	} else {
+		// Degenerate tiny image (not OpenZFS-importable): keep the historic
+		// device-size bound and no metaslab boundary constraint so the
+		// driver's own read/write tests still have room.
+		limit = imageSize - 2*vdevLabelSize
+	}
 	if limit < next {
 		limit = next
 	}
-	fs.alloc = newAllocator(next, limit, poolBlockSize)
+	fs.alloc = newAllocator(next, limit, poolBlockSize, msSize)
 }
