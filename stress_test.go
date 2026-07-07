@@ -567,7 +567,7 @@ func TestStress_LargeFile(t *testing.T) {
 // for ZFS writes lives in the update-in-place paths.
 //
 // The slot count is intentionally bounded by the writer's
-// fmtObjArrayObjs limit (32 = 28 free); honoring -stress.files
+// fmtZPLObjArrayObjs limit (32 = 28 free); honoring -stress.files
 // faithfully without lifting the bound means cycling.
 func TestStress_ManyFiles(t *testing.T) {
 	targetFiles := stressFiles(t)
