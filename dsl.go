@@ -45,15 +45,22 @@ const (
 	dmuPoolFeatureDescriptions = "feature_descriptions"
 
 	// dsl_dir_phys_t field offsets in bonus (uint64 LE, dnode has bonustype=DMU_OT_DSL_DIR)
-	ddCreationTime      = 0  // uint64
-	ddHeadDatasetObj    = 8  // uint64 – points to the DSL dataset
-	ddParentObj         = 16 // uint64
-	ddCloneParentObj    = 24 // uint64
-	ddChildDirZAPObj    = 32 // uint64
-	ddUsedBytes         = 40 // uint64
-	ddCompressedBytes   = 48 // uint64
-	ddUncompressedBytes = 56 // uint64
-	ddPropsZAPObj       = 80 // uint64 (dd_props_zapobj, field 11)
+	ddCreationTime   = 0  // uint64
+	ddHeadDatasetObj = 8  // uint64 – points to the DSL dataset
+	ddParentObj      = 16 // uint64
+	ddCloneParentObj = 24 // uint64
+	ddChildDirZAPObj = 32 // uint64
+	// ddClonesObj is the byte offset of dd_clones within dsl_dir_phys_t: it
+	// follows the 13 named fields (through dd_flags at 96) and the 5-entry
+	// dd_used_breakdown[] (104..136), landing at 144. dd_clones is a
+	// DMU_OT_DSL_CLONES ZAP listing the dsl_dir objects of every clone whose
+	// origin is a snapshot in THIS dir; OpenZFS sets it on the origin's dir at
+	// clone-create time, and zdb's count_dir_mos_objects marks it referenced.
+	ddClonesObj         = 144 // uint64
+	ddUsedBytes         = 40  // uint64
+	ddCompressedBytes   = 48  // uint64
+	ddUncompressedBytes = 56  // uint64
+	ddPropsZAPObj       = 80  // uint64 (dd_props_zapobj, field 11)
 	// dslDirPhysSize is sizeof(dsl_dir_phys_t) in OpenZFS: 19 named
 	// uint64 fields (creation_time, head_dataset_obj, parent_obj,
 	// origin_obj, child_dir_zapobj, used_bytes, compressed_bytes,
@@ -94,6 +101,14 @@ const (
 	dsGUID              = 112 // uint64
 	dsFlags             = 120 // uint64
 	dsBP                = 128 // blkptr_t (128 bytes) = the ZPL object set block pointer
+	// The three tail uint64s live AFTER ds_bp (128-byte blkptr at dsBP=128),
+	// matching dsl_dataset_phys_t. ds_next_clones_obj is the DMU_OT_DSL_CLONES
+	// ZAP that lists every clone whose origin is this snapshot: it is how a
+	// snapshot tracks its dependent clones, and a non-empty one makes
+	// dsl_destroy_snapshot fail with EEXIST. See clone.go.
+	dsNextClonesObj = 256 // uint64 – DMU_OT_DSL_CLONES ZAP (dependent clones)
+	dsPropsObj      = 264 // uint64 – DMU_OT_DSL_PROPS ZAP (snapshot props)
+	dsUserrefsObj   = 272 // uint64 – DMU_OT_USERREFS ZAP (user holds)
 	// dslDatasetPhysSize is sizeof(dsl_dataset_phys_t): 16 named uint64
 	// fields, then ds_bp (128B blkptr) at 128, then ds_next_clones_obj,
 	// ds_props_obj, ds_userrefs_obj and ds_pad[5] = 0x140 (320) bytes.
