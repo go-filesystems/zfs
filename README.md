@@ -18,10 +18,10 @@ create, inspect, and modify ZFS filesystems programmatically.
 | Format | ✅ | Creates new pool images via `Format` |
 | ReadFile / WriteFile | ✅ | Basic file I/O supported (ZPL dataset) |
 | MkDir / Delete / Rename | ✅ | Directory operations supported |
-| Snapshots | ✅ | Create via `FS.Snapshot`, read via `OpenSnapshot` |
+| Snapshots | ✅ | Create via `FS.Snapshot`, read via `OpenSnapshot`, remove via `FS.DestroySnapshot` |
+| Clones | ✅ | Create writable dataset from a snapshot via `FS.Clone`; `FS.Origin` reports the origin; dependent-clone tracking blocks snapshot destroy |
 | Compression | ✅ Read | Transparent decompress on read (lz4 / gzip / zstd / lzjb / zle) |
 | Native encryption | ✅ Read | AES-CCM/GCM datasets via `OpenFromDeviceDatasetWithKey` (passphrase or raw wrapping key) |
-| Clones | ⚠️ No | Not implemented |
 
 
 ## Module
@@ -69,6 +69,33 @@ func (fs *FS) DeleteDir(path string) error
 ```go
 func (fs *FS) Rename(oldPath, newPath string) error
 ```
+
+### Snapshots and clones
+
+```go
+// Snapshot freezes the currently-open dataset; read it back via OpenSnapshot.
+func (fs *FS) Snapshot(snapName string) error
+
+// Clone creates a writable dataset from a snapshot. Reach it via OpenDataset.
+func (fs *FS) Clone(snapName, cloneName string) error
+
+// Origin returns "<pool>@<snapshot>" for a clone, or "" for a non-clone.
+func (fs *FS) Origin() (string, error)
+
+// DestroySnapshot removes a snapshot; it fails if the snapshot has dependent
+// clones (a snapshot with clones cannot be destroyed).
+func (fs *FS) DestroySnapshot(snapName string) error
+```
+
+A clone is created with a faithful on-disk DSL layout: a `dsl_dir` whose
+`dd_origin_obj` points at the origin snapshot, a `dsl_dataset` whose
+`ds_prev_snap_obj` references it, registration under the parent DSL dir's child
+map, and dependent-clone tracking on the origin snapshot's `ds_next_clones_obj`.
+Because this driver is not copy-on-write, a clone eagerly deep-copies the
+snapshot's object-set into private blocks (O(dataset size)) rather than sharing
+them O(1) as OpenZFS does — the on-disk DSL *structures* match OpenZFS; only the
+block-sharing optimisation is replaced by the driver's existing eager-copy
+invariant (the same one snapshots use).
 
 ### Closing
 
@@ -118,7 +145,8 @@ Only **micro-ZAP** is supported for directory writes. Directory entries use a
 - The writer does not compress or encrypt data blocks; the reader
   decompresses (lz4/gzip/zstd/lzjb/zle) and decrypts (native AES-CCM/GCM)
   transparently
-- No clones or ACLs (snapshots are supported: create + read)
+- Snapshots and clones are supported (create/read snapshots, create writable
+  clones), but as eager block copies rather than O(1) copy-on-write; no ACLs
 - Maximum 28 objects (files + directories) per pool image
 - Directory names limited to 49 bytes
 
