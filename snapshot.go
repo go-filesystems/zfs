@@ -190,8 +190,19 @@ func (fs *zfsFS) snapshotHeadDataset(snapName string) error {
 
 	// 5. Build the snapshot DSL dataset dnode. It mirrors the head dataset
 	// but: ds_bp → frozen copy, ds_next_snap_obj → head dataset (the snap's
-	// "next" in the chain is the live head), ds_num_children = 0,
+	// "next" in the chain is the live head), ds_num_children = 1,
 	// ds_snapnames_zapobj = 0 (snapshots have no snapshots of their own).
+	//
+	// ds_num_children = 1 matches OpenZFS (dsl_dataset_snapshot_sync_impl sets
+	// dsphys->ds_num_children = 1): for a snapshot the count is 1 (the head
+	// that references it) plus one per clone. It is ALSO load-bearing for zdb:
+	// dsl_dataset_hold_obj sets ds_is_snapshot = (ds_num_children != 0), and
+	// zdb's count_ds_mos_objects only credits a dataset's DSL-dir objects when
+	// the dataset is NOT a snapshot. A snapshot left at num_children = 0 is
+	// misread as a head, which by luck marked the pool root dir's objects; once
+	// a clone (correctly) bumps the origin snapshot's count, that accident
+	// vanishes and `zdb -d` reports the root dir's objects leaked. Seeding the
+	// snapshot at 1 and leaving the HEAD at 0 makes both read correctly.
 	prevSnapObj := binary.LittleEndian.Uint64(headDSBonus[dsPrevSnapObj:])
 	prevSnapTxg := binary.LittleEndian.Uint64(headDSBonus[dsPrevSnapTxg:])
 
@@ -203,7 +214,7 @@ func (fs *zfsFS) snapshotHeadDataset(snapName string) error {
 	le.PutUint64(snapBonus[dsPrevSnapTxg:], prevSnapTxg)
 	le.PutUint64(snapBonus[dsNextSnapObj:], headDSObj) // next in chain = the live head
 	le.PutUint64(snapBonus[dsSnapnamesZAPObj:], 0)
-	le.PutUint64(snapBonus[dsNumChildren:], 0)
+	le.PutUint64(snapBonus[dsNumChildren:], 1)
 	le.PutUint64(snapBonus[dsCreationTime:], now)
 	le.PutUint64(snapBonus[dsCreationTxg:], fs.curTxg)
 	encodeBlkptr(snapZPLBP, snapBonus[dsBP:dsBP+blkptrSize])
@@ -248,7 +259,13 @@ func (fs *zfsFS) snapshotHeadDataset(snapName string) error {
 	}
 
 	// 7. Update the head DSL dataset: link the snapshot into the chain
-	// (ds_prev_snap_obj) and bump num_children / ds_snapnames_zapobj.
+	// (ds_prev_snap_obj) and point ds_snapnames_zapobj at the snap ZAP. Do NOT
+	// touch the head's ds_num_children: in OpenZFS a HEAD dataset always has
+	// ds_num_children = 0 (it is the snapshot that carries the count), and
+	// dsl_dataset_hold_obj reads ds_num_children != 0 as "this is a snapshot".
+	// Bumping the head's count made zdb misread the head as a snapshot and skip
+	// crediting the pool root DSL dir's MOS objects (see the num_children note
+	// in step 5).
 	//
 	// Do NOT advance ds_prev_snap_txg. zdb's space audit (`zdb -bcc`) charges
 	// blocks with birth <= ds_prev_snap_txg to the previous snapshot instead
@@ -267,8 +284,6 @@ func (fs *zfsFS) snapshotHeadDataset(snapName string) error {
 	// all its live blocks — advancing the txg would charge them to a snapshot
 	// that never references them and `zdb -bcc` would report them leaked.
 	le.PutUint64(headDSBonus[dsPrevSnapObj:], snapDSObj)
-	numChildren := le.Uint64(headDSBonus[dsNumChildren:])
-	le.PutUint64(headDSBonus[dsNumChildren:], numChildren+1)
 	le.PutUint64(headDSBonus[dsSnapnamesZAPObj:], snapZAPObj)
 	// Re-encode the head dataset dnode in place (same object slot/offset).
 	newHeadDN := newDnode(dmotDSLDataset, 1, dmotDSLDataset, uint16(len(headDSBonus)))
@@ -479,13 +494,15 @@ func (fs *zfsFS) copyBlkptrTree(bp blkptr, objectArrayLevel0 bool, leafBlockSize
 	return newBP, nil
 }
 
-// snapshotHighWater returns the highest byte offset (exclusive) occupied by
-// any snapshot dataset's deep-copied block tree, so the allocator can resume
-// above it after a reopen. It walks every DSL dataset object in the MOS whose
-// ds_bp differs from the live head dataset's, recursing through the snapshot's
-// ZPL objset, object array, and each object's data/indirect extents.
+// snapshotHighWater returns the highest byte offset (exclusive) occupied by any
+// runtime-allocated MOS metadata that is NOT reachable from the live head
+// dataset — snapshot & clone deep-copied ZPL trees plus every snapshot/clone
+// auxiliary MOS object (deadlists, child-dir / props / snapnames / clones ZAPs)
+// — so the allocator resumes above all of it after a reopen. It scans every MOS
+// object, walking both its own data/indirect extents and (for DSL datasets) the
+// ZPL objset tree its ds_bp points at.
 //
-// Returns 0 if no snapshots exist or the MOS cannot be scanned. Best-effort:
+// Returns 0 if the MOS holds no such metadata or cannot be scanned. Best-effort:
 // unreadable objects are skipped (they cannot pin live space the writer would
 // hand out, since the writer only ever appends).
 func (fs *zfsFS) snapshotHighWater() int64 {
@@ -501,15 +518,27 @@ func (fs *zfsFS) snapshotHighWater() int64 {
 	}
 	for i := uint64(1); i < fmtMOSObjArrayObjs; i++ {
 		dn, err := mos.readObject(i)
-		if err != nil || dn == nil || dn.typ != dmotDSLDataset {
+		if err != nil || dn == nil || dn.typ == dmotNone {
 			continue
 		}
-		bonus := dn.bonusData()
-		if len(bonus) < dsBP+blkptrSize {
-			continue
+		// Every MOS object's OWN data / indirect blocks — snapshot & clone
+		// deadlists, their child-dir / props / snapnames / clones ZAPs — are
+		// bump-allocated at Snapshot/Clone time and are reachable from NO
+		// dataset's ds_bp. If the allocator resumed below them a later write
+		// would clobber those blocks (invisible to this driver's reader, but a
+		// real zdb walk of the pool then crashes on the corrupted deadlist/ZAP).
+		// Account for them here so the bump pointer always resumes above.
+		for j := 0; j < int(dn.nblkptr); j++ {
+			fs.walkBlockTreeExtents(dn.blkptrAt(j), false, bump)
 		}
-		zplBP := parseBlkptr(bonus[dsBP : dsBP+blkptrSize])
-		fs.walkBlockTreeExtents(zplBP, true, bump)
+		// A DSL dataset additionally pins its deep-copied ZPL object-set tree
+		// via ds_bp (the frozen snapshot copy / the clone's private copy).
+		if dn.typ == dmotDSLDataset {
+			bonus := dn.bonusData()
+			if len(bonus) >= dsBP+blkptrSize {
+				fs.walkBlockTreeExtents(parseBlkptr(bonus[dsBP:dsBP+blkptrSize]), true, bump)
+			}
+		}
 	}
 	return maxEnd
 }

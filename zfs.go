@@ -165,6 +165,18 @@ type FS interface {
 	// dataset. The snapshot is unaffected by later writes to the live
 	// dataset and is readable via OpenSnapshot. See snapshot.go.
 	Snapshot(snapName string) error
+	// Clone creates a writable dataset cloneName from the snapshot snapName of
+	// the currently-open dataset. The clone is reachable via OpenDataset
+	// (or OpenFromDeviceDataset) and is independently writable. See clone.go.
+	Clone(snapName, cloneName string) error
+	// Origin returns "<pool>@<snapshot>" — the snapshot this dataset was
+	// cloned from — or "" if the open dataset is not a clone (mirroring
+	// `zfs get origin`, which reports "-" for a non-clone).
+	Origin() (string, error)
+	// DestroySnapshot removes a snapshot of the currently-open dataset. It
+	// fails (wrapping errHasClones) when the snapshot still has dependent
+	// clones — a snapshot with clones cannot be destroyed.
+	DestroySnapshot(snapName string) error
 }
 
 // OpenSnapshot opens a snapshot of a dataset for reading. datasetPath has the
