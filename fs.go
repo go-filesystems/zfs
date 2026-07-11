@@ -1314,29 +1314,48 @@ func (fs *zfsFS) recommitChain() (blkptr, error) {
 	if err != nil {
 		return blkptr{}, fmt.Errorf("read MOS objset: %w", err)
 	}
-	mosMetaBP := parseBlkptr(mosObjsetBlk[dnodeHdrSize : dnodeHdrSize+blkptrSize])
-
-	// 2. Read the MOS object array and locate the head DSL dataset dnode,
-	//    whose bonus ds_bp points at the ZPL objset block.
-	mosObjArray, err := readPhys(mosMetaBP)
+	// Parse the MOS meta_dnode to learn the object-array geometry. The array
+	// spans mosMetaDN.nblkptr fixed-size dnode blocks, so a DSL dataset object
+	// may live in ANY of them: block 0 holds the Format-time system objects,
+	// while the upper blocks hold runtime-allocated snapshot AND clone datasets
+	// (a writable clone reopened via OpenDataset lands here). Locate the
+	// dataset in its own block rather than assuming block 0.
+	mosMetaDN, err := parseDnode(mosObjsetBlk[:dnodeMinSize])
 	if err != nil {
-		return blkptr{}, fmt.Errorf("read MOS object array: %w", err)
+		return blkptr{}, fmt.Errorf("parse MOS meta_dnode: %w", err)
 	}
+	mosBlkSz := uint64(mosMetaDN.dataBlockSize())
+	if mosBlkSz == 0 {
+		return blkptr{}, fmt.Errorf("MOS meta_dnode has zero block size")
+	}
+
+	// 2. Locate the head/clone DSL dataset dnode in whichever MOS array block
+	//    holds it; its bonus ds_bp points at the ZPL objset block.
 	dsObjNum := fs.zplDS.headDSObjNum
-	dsOff := int(dsObjNum) * dnodeMinSize
-	if dsOff+dnodeMinSize > len(mosObjArray) {
-		return blkptr{}, fmt.Errorf("DSL dataset object %d out of MOS array", dsObjNum)
+	dsByteOff := dsObjNum * uint64(dnodeMinSize)
+	dsBlockID := dsByteOff / mosBlkSz
+	dsOffInBlk := int(dsByteOff % mosBlkSz)
+	if int(dsBlockID) >= int(mosMetaDN.nblkptr) {
+		return blkptr{}, fmt.Errorf("DSL dataset object %d beyond MOS array (%d blocks)", dsObjNum, mosMetaDN.nblkptr)
 	}
-	dsDN, err := parseDnode(mosObjArray[dsOff : dsOff+dnodeMinSize])
+	dsBlockBP := mosMetaDN.blkptrAt(int(dsBlockID))
+	mosDSBlock, err := readPhys(dsBlockBP)
+	if err != nil {
+		return blkptr{}, fmt.Errorf("read MOS array block %d: %w", dsBlockID, err)
+	}
+	if dsOffInBlk+dnodeMinSize > len(mosDSBlock) {
+		return blkptr{}, fmt.Errorf("DSL dataset object %d out of MOS array block", dsObjNum)
+	}
+	dsDN, err := parseDnode(mosDSBlock[dsOffInBlk : dsOffInBlk+dnodeMinSize])
 	if err != nil {
 		return blkptr{}, fmt.Errorf("parse DSL dataset dnode: %w", err)
 	}
 	bonusBase := dnodeHdrSize + int(dsDN.nblkptr)*blkptrSize
 	zplBPOff := bonusBase + dsBP // ds_bp sits at offset dsBP within the bonus
-	if zplBPOff+blkptrSize > len(mosObjArray[dsOff:dsOff+dnodeMinSize]) {
+	if zplBPOff+blkptrSize > dnodeMinSize {
 		return blkptr{}, fmt.Errorf("ds_bp out of DSL dataset dnode")
 	}
-	zplBP := parseBlkptr(mosObjArray[dsOff+zplBPOff : dsOff+zplBPOff+blkptrSize])
+	zplBP := parseBlkptr(mosDSBlock[dsOffInBlk+zplBPOff : dsOffInBlk+zplBPOff+blkptrSize])
 
 	// 3. Read the ZPL objset block; its meta_dnode bp[0] points at the ZPL
 	//    object array (the block writeDnode rewrote in place).
@@ -1370,49 +1389,54 @@ func (fs *zfsFS) recommitChain() (blkptr, error) {
 		return blkptr{}, fmt.Errorf("write ZPL objset: %w", err)
 	}
 
-	// (b) ZPL objset block → zplBP checksum, stored in the DSL dataset's ds_bp.
-	// The objset BP's fill is what zdb reports as `usedobjs`, so carry the
-	// freshly-recounted object total up from the meta_dnode's data BP.
+	// (b) ZPL objset block → zplBP checksum, stored in the DSL dataset's ds_bp
+	// inside its MOS array block. The objset BP's fill is what zdb reports as
+	// `usedobjs`, so carry the freshly-recounted object total up from the
+	// meta_dnode's data BP. Write that MOS array block back to disk; its BP
+	// checksum/fill are recomputed in the loop below (its block is flagged via
+	// the b == dsBlockID case, independent of mosUpperDirty).
 	setBPChecksum(&zplBP, zplObjsetBlk)
 	zplBP.fill = objCount
-	encodeBlkptr(zplBP, mosObjArray[dsOff+zplBPOff:dsOff+zplBPOff+blkptrSize])
-	if err := writePhys(mosMetaBP, mosObjArray); err != nil {
-		return blkptr{}, fmt.Errorf("write MOS object array: %w", err)
+	encodeBlkptr(zplBP, mosDSBlock[dsOffInBlk+zplBPOff:dsOffInBlk+zplBPOff+blkptrSize])
+	if err := writePhys(dsBlockBP, mosDSBlock); err != nil {
+		return blkptr{}, fmt.Errorf("write MOS array block %d: %w", dsBlockID, err)
 	}
 
 	// (c) MOS object array → meta_dnode BPs in the MOS objset block. The MOS
-	// array spans multiple 16 KiB dnode blocks: block 0 (mosMetaBP, rewritten
-	// above) holds the system objects + space_maps; higher blocks hold
-	// snapshot datasets/ZAPs. Re-checksum and recount each block so the
-	// per-block fills and the objset (root) fill match the live MOS dnodes —
-	// dump_objset() asserts object_count == usedobjs for the MOS too.
-	mosMetaBP.fill = countDnodeSlots(mosObjArray, 1) // block 0, object 0 excluded
-	setBPChecksum(&mosMetaBP, mosObjArray)
-	encodeBlkptr(mosMetaBP, mosObjsetBlk[dnodeHdrSize:dnodeHdrSize+blkptrSize])
-	totalFill := mosMetaBP.fill
-
-	mosMetaDN, err := parseDnode(mosObjsetBlk[:dnodeMinSize])
-	if err != nil {
-		return blkptr{}, fmt.Errorf("parse MOS meta_dnode: %w", err)
-	}
-	for b := 1; b < int(mosMetaDN.nblkptr); b++ {
+	// array spans multiple fixed-size dnode blocks: block 0 holds the system
+	// objects + space_maps (rewritten by updateSpaceMap every commit), and the
+	// upper blocks hold snapshot/clone datasets & ZAPs. Re-checksum and recount
+	// each block that changed so the per-block fills and the objset (root) fill
+	// match the live MOS dnodes — dump_objset() asserts object_count ==
+	// usedobjs for the MOS too. A block is recomputed when it holds the
+	// just-written dataset (b == dsBlockID, bytes already in mosDSBlock), when
+	// it is block 0 (space_map churn), or when Snapshot/Clone flagged an upper
+	// block dirty this txg; otherwise its on-disk fill/checksum are reused.
+	var totalFill uint64
+	for b := 0; b < int(mosMetaDN.nblkptr); b++ {
 		bp := mosMetaDN.blkptrAt(b)
 		if bp.isNull() {
 			continue
 		}
-		if !fs.mosUpperDirty {
-			// No MOS object beyond block 0 was written this txg (the common
-			// case — only Snapshot allocates into the upper blocks), so this
-			// block's bytes and BP checksum are unchanged. Reuse its on-disk
-			// fill instead of paying a 16 KiB read + fletcher4 on every write.
+		var blk []byte
+		switch {
+		case uint64(b) == dsBlockID:
+			blk = mosDSBlock // in-memory copy already carries the fresh ds_bp
+		case b == 0 || fs.mosUpperDirty:
+			blk, err = readPhys(bp)
+			if err != nil {
+				return blkptr{}, fmt.Errorf("read MOS object array block %d: %w", b, err)
+			}
+		default:
+			// Clean upper block: reuse its on-disk fill + checksum.
 			totalFill += bp.fill
 			continue
 		}
-		blk, err := readPhys(bp)
-		if err != nil {
-			return blkptr{}, fmt.Errorf("read MOS object array block %d: %w", b, err)
+		startSlot := 0
+		if b == 0 {
+			startSlot = 1 // object 0 is the meta_dnode, never an allocated object
 		}
-		bp.fill = countDnodeSlots(blk, 0)
+		bp.fill = countDnodeSlots(blk, startSlot)
 		setBPChecksum(&bp, blk)
 		off := dnodeHdrSize + b*blkptrSize
 		encodeBlkptr(bp, mosObjsetBlk[off:off+blkptrSize])
