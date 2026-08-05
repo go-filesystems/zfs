@@ -22,6 +22,11 @@ create, inspect, and modify ZFS filesystems programmatically.
 | Clones | ✅ | Create writable dataset from a snapshot via `FS.Clone`; `FS.Origin` reports the origin; dependent-clone tracking blocks snapshot destroy |
 | Compression | ✅ Read | Transparent decompress on read (lz4 / gzip / zstd / lzjb / zle) |
 | Native encryption | ✅ Read | AES-CCM/GCM datasets via `OpenFromDeviceDatasetWithKey` (passphrase or raw wrapping key) |
+| Grow / Resize | ✅ | `FS.Grow` / `FS.GrowTo`; `FS.Resize` dispatches to Grow or Shrink based on the requested size |
+| Shrink | ✅ | `FS.Shrink` / `FS.ShrinkWithMode` — `ShrinkMode_Rebuild` / `ShrinkMode_InPlace` / `ShrinkMode_Auto` (picks InPlace when the pool is snapshot-free, else Rebuild) |
+| Symlinks / hardlinks | ✅ | `filesystem.Symlinker` / `filesystem.HardLinker` (type-assert `FS`) |
+| chmod / chown / chtimes | ✅ | `filesystem.MetadataSetter` (type-assert `FS`) |
+| Multi-vdev pools (mirror / raidz) | ✅ Read | `OpenFromDevices` — one backend per leaf in on-disk `vdev_tree.children` order; a missing raidz data leg is not yet reconstructed from parity |
 
 
 ## Module
@@ -32,60 +37,98 @@ github.com/go-filesystems/zfs
 
 ## API
 
+`FS` is an interface (not a struct) — every entry point below returns `FS`,
+and every method is called through that interface value (`fs.Info()`, not
+`(*FS).Info`).
+
 ### Opening / creating
 
 ```go
 // Open opens an existing ZFS image. partIndex=-1 uses the whole image.
-func Open(imagePath string, partIndex int) (*FS, error)
+func Open(imagePath string, partIndex int) (FS, error)
 
 // Format creates a new ZFS image of sizeBytes at path and opens it.
-func Format(path string, sizeBytes int64, cfg FormatConfig) (*FS, error)
+func Format(path string, sizeBytes int64, cfg FormatConfig) (FS, error)
+
+// OpenDataset opens a specific dataset (by DSL path) inside an existing image.
+func OpenDataset(imagePath string, partIndex int, datasetPath string) (FS, error)
+
+// OpenFromDevice / OpenFromDeviceDataset open a pool backed by an arbitrary
+// BlockBackend instead of an *os.File-backed image (LUKS/qcow2/in-memory).
+func OpenFromDevice(dev BlockBackend, partIndex int) (FS, error)
+func OpenFromDeviceDataset(dev BlockBackend, partIndex int, datasetPath string) (FS, error)
+
+// OpenFromDeviceDatasetWithKey opens a native-encrypted dataset. The key
+// argument is either a 32-byte raw wrapping key or a passphrase (any other
+// length); a passphrase is derived on the fly using the salt/iter count
+// stored in the dataset's DSL_CRYPTO_KEY object.
+func OpenFromDeviceDatasetWithKey(dev BlockBackend, partIndex int, datasetPath string, key []byte) (FS, error)
+
+// OpenFromDevices opens a multi-vdev (mirror / raidz) pool: one backend per
+// leaf, in the same order as the on-disk vdev_tree.children array. A missing
+// raidz data leg is not yet reconstructed from parity.
+func OpenFromDevices(devs []BlockBackend, partIndex int, datasetPath string) (FS, error)
+
+// OpenSnapshot opens a dataset's frozen snapshot read-only.
+func OpenSnapshot(imagePath string, partIndex int, datasetPath, snapName string) (FS, error)
 ```
 
-### Metadata
+### FS interface
 
 ```go
-func (fs *FS) Info() Info   // pool name, GUID, version, TXG, timestamp
+type FS interface {
+    filesystem.Filesystem // Close, ReadFile, ListDir, Stat, WriteFile, ReadLink,
+                           // MkDir, DeleteFile, DeleteDir, Rename
+
+    Info() Info               // uberblock fields: version, TXG, GUID sum, timestamp, label/slot/offset, endian
+    PartitionOffset() int64
+
+    // GrowTo / Grow are the grow-only entry points; they reject shrink
+    // targets with a wrapped filesystem.ErrShrinkUnsupported.
+    GrowTo(newSizeBytes int64) error
+    Grow(newSizeBytes int64) error
+    // Resize is bidirectional: newSize > current routes to Grow, newSize <
+    // current routes to Shrink (in ShrinkMode_Auto).
+    Resize(newSize int64) error
+    // Shrink / ShrinkWithMode expose the shrink path; ShrinkMode selects the
+    // on-disk relocation strategy (Rebuild / InPlace / Auto).
+    Shrink(newSize int64) error
+    ShrinkWithMode(newSize int64, mode ShrinkMode) error
+
+    Snapshot(snapName string) error
+    Clone(snapName, cloneName string) error
+    Origin() (string, error)
+    DestroySnapshot(snapName string) error
+}
 ```
 
-### File operations
+### Optional capabilities (type-assert)
+
+Symlinks, hardlinks, and POSIX metadata mutators are not part of the `FS`
+interface itself — the underlying driver satisfies the corresponding optional
+interfaces from `github.com/go-filesystems/interface`, so callers type-assert:
 
 ```go
-func (fs *FS) ReadFile(path string) ([]byte, error)
-func (fs *FS) WriteFile(path string, data []byte, perm os.FileMode) error
-func (fs *FS) DeleteFile(path string) error
-```
-
-### Directory operations
-
-```go
-func (fs *FS) ListDir(path string) ([]filesystem.DirEntry, error)
-func (fs *FS) MkDir(path string, perm os.FileMode) error
-func (fs *FS) DeleteDir(path string) error
-```
-
-### Rename
-
-```go
-func (fs *FS) Rename(oldPath, newPath string) error
+if s, ok := fs.(filesystem.Symlinker); ok {
+    _ = s.Symlink("/target", "/link")
+}
+if h, ok := fs.(filesystem.HardLinker); ok {
+    _ = h.Link("/existing", "/newname")
+}
+if m, ok := fs.(filesystem.MetadataSetter); ok {
+    _ = m.Chmod("/file", 0o644)
+    _ = m.Chown("/file", 1000, 1000)
+    _ = m.Chtimes("/file", atime, mtime)
+}
 ```
 
 ### Snapshots and clones
 
-```go
-// Snapshot freezes the currently-open dataset; read it back via OpenSnapshot.
-func (fs *FS) Snapshot(snapName string) error
-
-// Clone creates a writable dataset from a snapshot. Reach it via OpenDataset.
-func (fs *FS) Clone(snapName, cloneName string) error
-
-// Origin returns "<pool>@<snapshot>" for a clone, or "" for a non-clone.
-func (fs *FS) Origin() (string, error)
-
-// DestroySnapshot removes a snapshot; it fails if the snapshot has dependent
-// clones (a snapshot with clones cannot be destroyed).
-func (fs *FS) DestroySnapshot(snapName string) error
-```
+`Snapshot` freezes the currently-open dataset (read it back via
+`OpenSnapshot`); `Clone` creates a writable dataset from a snapshot (reach it
+via `OpenDataset`); `Origin` returns `"<pool>@<snapshot>"` for a clone or `""`
+otherwise; `DestroySnapshot` removes a snapshot, failing if it still has
+dependent clones.
 
 A clone is created with a faithful on-disk DSL layout: a `dsl_dir` whose
 `dd_origin_obj` points at the origin snapshot, a `dsl_dataset` whose
@@ -97,11 +140,7 @@ them O(1) as OpenZFS does — the on-disk DSL *structures* match OpenZFS; only t
 block-sharing optimisation is replaced by the driver's existing eager-copy
 invariant (the same one snapshots use).
 
-### Closing
-
-```go
-func (fs *FS) Close() error
-```
+`Close()` is part of the embedded `filesystem.Filesystem` interface above.
 
 ## Implements
 
