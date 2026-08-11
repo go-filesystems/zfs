@@ -87,10 +87,19 @@ jobs:
       # The heavy stress / resize / grow paths are gated on
       # `!testing.Short()`, so the full (non-short) run exercises them. Give
       # it a generous timeout since the largest cases write multi-MB pools.
+      #
+      # The full race+coverage sweep takes ~18 min on the amd64 runner but
+      # runs a good deal slower on the arm64 runner, where the RAID-profile
+      # stress sweep (TestStress_RAIDProfileSweep) tipped the job past the old
+      # 30m `go test` timeout — `panic: test timed out after 30m0s` — despite
+      # the work itself completing correctly. That was a runner-speed wall,
+      # not a bug, so raise the per-`go test` timeout well clear of it (the
+      # GitHub-hosted job ceiling is 6h). Coverage and the stress gate are
+      # unchanged: the same tests still run, they simply get room to finish.
       - name: Test (race + coverage)
         working-directory: fs/zfs
         run: |
-          go test -mod=mod -race -timeout 30m \
+          go test -mod=mod -race -timeout 60m \
             -coverprofile=cover.out -covermode=atomic ./...
 
       - name: Enforce coverage threshold
