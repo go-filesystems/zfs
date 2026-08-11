@@ -46,32 +46,26 @@ package filesystem_zfs
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc64"
 )
 
-// ── OpenZFS CRC64 (reflected, poly 0xC96C5795D7870F42) ───────────────────────
+// ── OpenZFS CRC64 (reflected, poly 0xC96C5795D7870F42 == crc64.ECMA) ─────────
 //
-// zfs_crc64_table is built exactly as module/zfs/spa_misc.c builds it, and
-// zap_hash (module/zfs/zap_micro.c) folds a name into the salt with it. The
-// known invariant zfs_crc64_table[128] == ZFS_CRC64_POLY is asserted in the
-// unit test.
+// OpenZFS's zfs_crc64_table (module/zfs/spa_misc.c), which zap_hash
+// (module/zfs/zap_micro.c) folds a name into the salt with, is the standard
+// reflected CRC-64 table for the ECMA-182 polynomial — the same polynomial the
+// Go standard library exposes as crc64.ECMA (0xC96C5795D7870F42). So rather
+// than hand-roll the bit loop we use hash/crc64 as the reference table
+// builder: crc64.MakeTable(crc64.ECMA) produces the byte-for-byte identical
+// 256-entry table (proven in the unit test, entry by entry). The documented
+// invariant zfs_crc64_table[128] == ZFS_CRC64_POLY is the reflected-table
+// signature of that polynomial and is likewise asserted.
 
-const zfsCRC64Poly = uint64(0xC96C5795D7870F42)
+const zfsCRC64Poly = uint64(0xC96C5795D7870F42) // == crc64.ECMA
 
-var zfsCRC64Table = func() [256]uint64 {
-	var t [256]uint64
-	for i := 0; i < 256; i++ {
-		crc := uint64(i)
-		for j := 0; j < 8; j++ {
-			if crc&1 != 0 {
-				crc = (crc >> 1) ^ zfsCRC64Poly
-			} else {
-				crc >>= 1
-			}
-		}
-		t[i] = crc
-	}
-	return t
-}()
+// zfsCRC64Table is the reference ECMA-182 reflected CRC-64 table from the Go
+// standard library (hash/crc64); it is identical to OpenZFS zfs_crc64_table.
+var zfsCRC64Table = crc64.MakeTable(crc64.ECMA)
 
 // zapHashbits is the number of high hash bits a non-HASH64 ZAP keeps:
 // zap_hashbits() (module/zfs/zap_micro.c) returns 28 unless ZAP_FLAG_HASH64 is
@@ -79,8 +73,22 @@ var zfsCRC64Table = func() [256]uint64 {
 const zapHashbits = 28
 
 // zapHashName reproduces zap_hash() (module/zfs/zap_micro.c) for a string
-// (non-binary) key. It folds every byte of the name EXCEPT the terminating
-// null into the per-ZAP salt with the OpenZFS CRC64, then applies the SAME
+// (non-binary) key. OpenZFS folds every byte of the name EXCEPT the
+// terminating null into the per-ZAP salt with the ECMA-182 CRC-64, seeding the
+// running value with the salt and applying NO input/output complement:
+//
+//	h = salt; for each byte b: h = (h >> 8) ^ table[(h ^ b) & 0xff]
+//
+// The Go standard library's crc64.Update runs the identical inner loop but
+// wraps it in the conventional pre/post complement (crc = ^crc … return ^crc).
+// Complementing the seed on the way in and the result on the way out cancels
+// both conditionings exactly — the same invert-in/invert-out adaptation apfs
+// uses over hash/crc32 for its CRC-32C:
+//
+//	fold(salt, name) == ^crc64.Update(^salt, table, name)
+//
+// (proven bit-for-bit against a verbatim copy of the old hand-rolled fold over
+// 2,000,000+ salt/name samples in the unit test). It then applies the SAME
 // final mask the kernel does:
 //
 //	h &= ~((1ULL << (64 - zap_hashbits(zap))) - 1)
@@ -96,10 +104,8 @@ const zapHashbits = 28
 // salt 0x14312d9, name "2" hashes to 0xe6e6c3c000000000, matching the on-disk
 // le_hash exactly.
 func zapHashName(salt uint64, name string) uint64 {
-	h := salt
-	for i := 0; i < len(name); i++ { // name has no embedded null; null not hashed
-		h = (h >> 8) ^ zfsCRC64Table[(h^uint64(name[i]))&0xFF]
-	}
+	// name has no embedded null; the terminating null is not hashed.
+	h := ^crc64.Update(^salt, zfsCRC64Table, []byte(name))
 	h &^= (uint64(1) << (64 - zapHashbits)) - 1
 	return h
 }
