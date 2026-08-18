@@ -156,6 +156,12 @@ func (dn *dnode) setBlkptrAt(i int, bp blkptr) {
 // bonusData returns the bonus buffer bytes (up to dn.bonuslen).
 func (dn *dnode) bonusData() []byte {
 	base := dnodeHdrSize + int(dn.nblkptr)*blkptrSize
+	// parseDnode rejects an nblkptr that does not fit, but a dnode built directly
+	// in this package (clone.go does) never passes through it, and base > len(raw)
+	// would make the slice below panic on low > high rather than return empty.
+	if base >= len(dn.raw) {
+		return nil
+	}
 	end := base + int(dn.bonuslen)
 	if end > len(dn.raw) {
 		end = len(dn.raw)
@@ -187,6 +193,17 @@ func parseDnode(b []byte) (*dnode, error) {
 	size := (1 + int(dn.extraSlots)) * dnodeMinSize
 	if len(b) < size {
 		size = len(b)
+	}
+	// dn_nblkptr is one byte off the disk, so a malformed dnode can claim up to
+	// 255 block pointers while the dnode itself only has room for
+	// (size - dnodeHdrSize) / blkptrSize of them -- 3 in a 512-byte dnode, 7 in a
+	// 1024-byte one. Nothing downstream re-checks it: findDataBP gates blockID on
+	// dn.nblkptr and then blkptrAt slices raw[64+i*128 : ...] straight past the
+	// end, and bonusData clamps its END but computes its BASE from nblkptr too.
+	// Both are panics in the caller's process rather than errors it can handle, so
+	// the claim is rejected here, once, at the parse boundary.
+	if maxBlkptrs := (size - dnodeHdrSize) / blkptrSize; int(dn.nblkptr) > maxBlkptrs {
+		return nil, fmt.Errorf("zfs: dnode claims %d block pointers, only %d fit in %d bytes", dn.nblkptr, maxBlkptrs, size)
 	}
 	dn.raw = make([]byte, size)
 	copy(dn.raw, b[:size])
