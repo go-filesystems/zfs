@@ -2,10 +2,14 @@ github.com/go-encryptions/ccm v0.0.0-20260620055113-74db323be0b2 h1:Gky3CPkbtx6T
 github.com/go-encryptions/ccm v0.0.0-20260620055113-74db323be0b2/go.mod h1:0XHNptBliXAeC9Ikl/maTnmj6+VWeJ5vZElyTprdYWI=
 github.com/go-encryptions/ccm v0.0.0-20260806072937-9e4d464681aa h1:9j0Kriv7YtTrInG17SdDcoCJVl/8cOqhlMlwRBEbDuc=
 github.com/go-encryptions/ccm v0.0.0-20260806072937-9e4d464681aa/go.mod h1:mdMMBlXE6sF9mCc1ryuifermVqwjHIOJPW0ZYVbYMMo=
+github.com/go-encryptions/ccm v0.0.0-20260830123323-fb71f1f65191 h1:5ub97Vgp8tnc6k5hFUM3qAZ3o8QbC8HIPaQn32dABIM=
+github.com/go-encryptions/ccm v0.0.0-20260830123323-fb71f1f65191/go.mod h1:mdMMBlXE6sF9mCc1ryuifermVqwjHIOJPW0ZYVbYMMo=
 github.com/go-encryptions/zfscrypt v0.0.0-20260623125925-033c4ad509ed h1:WaqYbb5Ia613X8QRW8J7rPqTN5M0P57tAoRKf1xpRts=
 github.com/go-encryptions/zfscrypt v0.0.0-20260623125925-033c4ad509ed/go.mod h1:PzuGFDE4GvnezFgPEbaBdKFaPFsDdxIF8DpaqgdsvUQ=
 github.com/go-encryptions/zfscrypt v0.0.0-20260830130459-aa897957219f h1:HYt3GLVBGLyY5ZZ6ro4dXxFK4xcO056flaPMf4yimC4=
 github.com/go-encryptions/zfscrypt v0.0.0-20260830130459-aa897957219f/go.mod h1:MkX0lLL2T3FB/zMUcaMylaumxF0RTGjY4kBWc6c29VY=
+github.com/go-encryptions/zfscrypt v0.0.0-20260831144114-4922684a77bc h1:/xEP1FnrnxJcZsX30lETTZwj+l6LgTdlm7g50vL1cUw=
+github.com/go-encryptions/zfscrypt v0.0.0-20260831144114-4922684a77bc/go.mod h1:LoR0OdKpPxkrHXXoITzviAKknjX7ssGT8VvTa/SUTVM=
 github.com/go-filesystems/interface v0.0.0-20260622072638-0b01d4fb163f h1:5HnRecjgsND+ESeX7EgGNvYL5ofL+bzJTqcvcSGo1BI=
 github.com/go-filesystems/interface v0.0.0-20260622072638-0b01d4fb163f/go.mod h1:9WZHAmuKzDWHFtncQuJ3rJYWnAcgX3VsupSqYITgftE=
 github.com/go-filesystems/interface v0.2.0 h1:HmQRCkeS+K+q3WkI2WfGYfLV0zsKmCdAKTKWQNZjmAs=
@@ -28,3 +32,5 @@ github.com/klauspost/compress v1.18.6 h1:2jupLlAwFm95+YDR+NwD2MEfFO9d4z4Prjl1XXD
 github.com/klauspost/compress v1.18.6/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
 github.com/klauspost/compress v1.19.2 h1:hMRETovs/pu/dVWN7zIT1PGG8t509MwT6bO7XSi26R8=
 github.com/klauspost/compress v1.19.2/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
+github.com/klauspost/compress v1.20.0 h1:a3C1ke2ohxFymNlb2HWAHjDeKCI90scRskErZkR0ezA=
+github.com/klauspost/compress v1.20.0/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
