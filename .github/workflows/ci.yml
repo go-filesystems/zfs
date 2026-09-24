@@ -231,6 +231,35 @@ jobs:
           if [ ${#bins[@]} -eq 0 ]; then
             echo "no test binaries to run"; exit 0
           fi
+          # ⛔ Pull ONCE, before the loop, and retry.
+          #
+          # `docker run` pulls on demand, so the image was fetched inside the
+          # loop -- once per test binary. A transient registry timeout on the
+          # FIRST binary therefore fails the whole lane while the very next
+          # pull succeeds and its tests pass. That took go-filesystems/xfs's
+          # main red on 2026-09-24 with every test passing:
+          #
+          #   docker: Get "https://ghcr.io/v2/loong64/debian/manifests/...":
+          #   dial tcp 140.82.112.34:443: i/o timeout
+          #
+          # The log ended in PASS followed by exit 1, which reads like a lost
+          # exit status and is not one. Re-running with nothing changed turned
+          # it green.
+          #
+          # Three attempts, because one attempt is a flake detector rather
+          # than a fetch, and a lane that goes red at random is a lane people
+          # learn to re-run without reading.
+          for attempt in 1 2 3; do
+            if docker pull --platform linux/${{ matrix.arch }} ${{ matrix.image }}; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::could not pull ${{ matrix.image }} after 3 attempts"
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+
           rc=0
           for bin in "${bins[@]}"; do
             echo "::group::$(basename "$bin")"
