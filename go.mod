@@ -1,6 +1,6 @@
 module github.com/go-filesystems/zfs
 
-go 1.26.4
+go 1.27.1
 
 require (
 	github.com/go-encryptions/zfscrypt v0.0.0-20260927173133-ff7dd33bb415
