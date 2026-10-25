@@ -1,7 +1,7 @@
-github.com/go-encryptions/ccm v0.0.0-20261010193930-9c9f092ab7c8 h1:XeEnwahq1AS32msjjihQfg56H2O72+Gx19g50nkhE6M=
-github.com/go-encryptions/ccm v0.0.0-20261010193930-9c9f092ab7c8/go.mod h1:N6dSqzbwzd+65hl2B8C/8S0avlWhGCbfY1DdAXSm0vo=
-github.com/go-encryptions/zfscrypt v0.0.0-20261012185758-f87a14465dff h1:wCpxlggnjaBstZTW7W1/AC73L/0EYagfxfir/fRZdM8=
-github.com/go-encryptions/zfscrypt v0.0.0-20261012185758-f87a14465dff/go.mod h1:8o9dUl7JLH3bWcmE2p1ag4bU1PlbsimDFVcfdx8Kw7I=
+github.com/go-encryptions/ccm v0.0.0-20261024084551-8f94ab359209 h1:1eiOHnE1BlruSiPizcT5Y1pGI6SCDYTYftRUxyIQGzg=
+github.com/go-encryptions/ccm v0.0.0-20261024084551-8f94ab359209/go.mod h1:N6dSqzbwzd+65hl2B8C/8S0avlWhGCbfY1DdAXSm0vo=
+github.com/go-encryptions/zfscrypt v0.0.0-20261025134207-eb78902b14ac h1:nSmkOfePlLXSOGvDXrxVCzyn8lbwG3b+Yi0n+t7uDR4=
+github.com/go-encryptions/zfscrypt v0.0.0-20261025134207-eb78902b14ac/go.mod h1:eE0t4i3RiWt52V6NgCnZqO4G0uMxk7Ip9jaBEoSpFlg=
 github.com/go-filesystems/interface v0.5.0 h1:AsbSXYG5cp497Ki0Ez88s8wwrVEmeRmFLd40T4d3UwA=
 github.com/go-filesystems/interface v0.5.0/go.mod h1:u9v8mvapNV8djzObwCECdyd2g6JBU6HNTR4EAqxOn6U=
 github.com/go-volumes/gpt v0.3.0 h1:ZA33VVlmlkA47fFY+BkFylsufqq1TBoASIuBmri+xsw=
