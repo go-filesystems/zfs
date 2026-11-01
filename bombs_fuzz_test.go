@@ -30,7 +30,11 @@ func FuzzDecompressBlock(f *testing.F) {
 				_, _ = zstdDecompress(src, dst)
 			}
 		})
-		if got > fuzzAllocBudget(len(src)) {
+		budget := fuzzAllocBudget(len(src))
+		if codec%5 == 4 { // zstd: 32768:1 is what the format can produce
+			budget = 1<<20 + zstdMaxExpansion*uint64(len(src))
+		}
+		if got > budget {
 			t.Fatalf("codec %d: allocated %d bytes for a %d-byte block declaring %d", codec%5, got, len(src), dst)
 		}
 	})
@@ -47,7 +51,8 @@ func FuzzReadEmbedded(f *testing.F) {
 		bp := parseBlkptr(raw[:blkptrSize])
 		bp.prop |= bpEmbeddedBit
 		got := allocDelta(func() { _, _ = readEmbedded(bp) })
-		if got > fuzzAllocBudget(bpePayloadSize) {
+		// Up to 112 payload bytes of a zstd frame can stand for 112 x 32768.
+		if got > 1<<20+zstdMaxExpansion*bpePayloadSize {
 			t.Fatalf("allocated %d bytes for prop %#x", got, bp.prop)
 		}
 	})

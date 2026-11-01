@@ -190,13 +190,15 @@ each refused road). Bounds come from the OpenZFS sources (`zio.c`
 | block pointer LSIZE / PSIZE | at most `SPA_MAXBLOCKSIZE` (16 MiB), as `zfs_blkptr_verify`; the fields themselves reach 32 MiB |
 | embedded block pointer | LSIZE at most 16 MiB; an uncompressed one cannot be longer than its 112-byte payload |
 | decompression (lz4, lzjb, zle) | the destination must be reachable from the input at the codec's maximum expansion (255:1, 8:1, 256:1); an lz4 match is cut to the destination instead of being generated and thrown away |
-| gzip, zstd | the destination grows with what the stream produces; zstd window and memory capped at 16 MiB, no allocation from the frame's declared content size |
+| gzip | the destination grows with what the stream produces |
+| zstd | the frame header is parsed and its declared content size must equal the block's logical size, and the size must be reachable at the format's 32768:1 maximum (RFC 8878: 128 KiB per RLE block of 4 bytes), all before the destination is allocated; window and memory capped at 16 MiB |
 | `ReadFile` / `ReadLink` | `dn_maxblkid` is read from the image and a hole costs nothing on disk, so the object is limited to `DefaultMaxReadSize` (1 GiB; `fs.(interface{ SetMaxReadSize(int64) })` changes it) and refused with `ErrTooLarge` before any buffer is sized; the result can never outgrow the limit whatever the block pointers claim |
 | indirect blocks | read once per walk, not once per data block (the last block at each level is kept) |
 | fat-ZAP leaf | the entries of a leaf are charged against the leaf's chunk count (an entry needing more than the leaf has is invalid, `zap_entry_create`) |
 | nvlist label | nesting at most 100 (`nvpair_max_recursion`); nvlist arrays no longer than the bytes they sit in; nested lists share the label's bytes instead of copying them per level |
 | RAID-Z `ashift` | 9 to 16 (`ASHIFT_MIN`, `ASHIFT_MAX`) |
-| block larger than 16 KiB | its last byte is read before the buffer is allocated, so a pointer past the end of the device costs one byte, not PSIZE (up to 16 MiB) per pointer |
+| block larger than 128 KiB | read in doubling, aligned chunks, so a pointer past the end of the device costs 128 KiB, not PSIZE (up to 16 MiB) per pointer |
+| indirect block geometry | `dn_nlevels` and `dn_indblkshift` come from the image: the coverage of a root pointer is kept as a shift, since 2^(shift x levels) overflows 64 bits |
 
 Fuzz targets: `FuzzDecompressBlock`, `FuzzReadEmbedded`, `FuzzNVList`,
 `FuzzZAPLeaf`, `FuzzDnodeWalk`, `FuzzVdevLabel` (allocation stays proportional

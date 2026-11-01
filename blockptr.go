@@ -30,6 +30,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/go-volumes/safeio"
 )
@@ -49,9 +50,9 @@ const (
 	// invalid).
 	bpePayloadSize = 112
 
-	// probeAheadThreshold: blocks larger than this have their last byte read
-	// before the buffer is allocated (see readBlock).
-	probeAheadThreshold = 16 << 10
+	// firstReadChunk is the most readBlock allocates before the device has
+	// answered (see readAtGrowing).
+	firstReadChunk = 128 << 10
 
 	// blk_prop bits
 	bpLsizeBits     = 0xFFFF // bits 15:0 (lsize - 1 in 512B sectors)
@@ -287,6 +288,37 @@ func verifyBlkptrSizes(bp blkptr) error {
 	return nil
 }
 
+// readAtGrowing reads n bytes at off. n comes from a block pointer and reaches
+// 16 MiB, so a buffer that large is not allocated before the device has shown
+// that the bytes exist: a block up to firstReadChunk (the default 128 KiB
+// record size) is read in one call as always; a larger one in chunks that
+// double, so a pointer past the end of the device costs 128 KiB, not 16 MiB.
+// Every chunk starts at a multiple of firstReadChunk from the block's offset
+// and is a multiple of it (but the last), which keeps the reads aligned for
+// the RAID-Z reader.
+func readAtGrowing(r io.ReaderAt, off, n int64) ([]byte, error) {
+	if n <= firstReadChunk {
+		raw := make([]byte, n)
+		if _, err := r.ReadAt(raw, off); err != nil {
+			return nil, err
+		}
+		return raw, nil
+	}
+	raw := make([]byte, firstReadChunk)
+	if _, err := r.ReadAt(raw, off); err != nil {
+		return nil, err
+	}
+	for int64(len(raw)) < n {
+		step := min(int64(len(raw)), n-int64(len(raw)))
+		cur := int64(len(raw))
+		raw = slices.Grow(raw, int(step))[:cur+step]
+		if _, err := r.ReadAt(raw[cur:], off+cur); err != nil {
+			return nil, err
+		}
+	}
+	return raw, nil
+}
+
 // readBlock reads the logical content of a block pointer from r.
 // r is the underlying device file, partOff is the partition byte offset.
 // Returns the decompressed lsize bytes.
@@ -315,18 +347,8 @@ func readBlock(r io.ReaderAt, partOff int64, bp blkptr) ([]byte, error) {
 	psize := bp.psize()
 	lsize := bp.lsize()
 
-	// PSIZE comes from the pointer and reaches 16 MiB; do not allocate it
-	// before the device has shown those bytes exist. A one-byte read of the
-	// block's last byte costs one byte, and costs nothing measurable next to
-	// reading the block itself (it is skipped for blocks of 16 KiB or less).
-	if psize > probeAheadThreshold {
-		var last [1]byte
-		if _, err := r.ReadAt(last[:], offset+psize-1); err != nil {
-			return nil, fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
-		}
-	}
-	raw := make([]byte, psize)
-	if _, err := r.ReadAt(raw, offset); err != nil {
+	raw, err := readAtGrowing(r, offset, psize)
+	if err != nil {
 		return nil, fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
 	}
 

@@ -297,6 +297,23 @@ func findDataBP(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64) (blkptr
 	return findDataBPCached(r, partOff, dn, blockID, nil)
 }
 
+// shiftRight is v >> n with n >= 64 giving 0 (Go already does that for shifts
+// of unsigned values; spelled out so the overflow case is visible).
+func shiftRight(v uint64, n uint) uint64 {
+	if n >= 64 {
+		return 0
+	}
+	return v >> n
+}
+
+// lowBits is v % 2^n with n >= 64 giving v.
+func lowBits(v uint64, n uint) uint64 {
+	if n >= 64 {
+		return v
+	}
+	return v & (1<<n - 1)
+}
+
 func findDataBPCached(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64, c *indirectCache) (blkptr, error) {
 	if dn.nlevels == 1 {
 		// Direct: block pointer is in the dnode itself
@@ -323,23 +340,22 @@ func findDataBPCached(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64, c
 
 	// Multi-level: start from level dn.nlevels-1 down to level 1
 	// Each indirect block contains (indirBlockSize / 128) block pointers.
-	indirBlockSz := int(1) << dn.indblkshift // bytes per indirect block body
-	bpsPerBlock := uint64(indirBlockSz / blkptrSize)
-
-	// Indirect blocks at level L cover bpsPerBlock^L data blocks each.
-	// Find which root blkptr to use.
+	// An indirect block holds 2^(indblkshift-7) pointers (blkptrSize = 128).
+	// Indirect blocks at level L cover 2^(shift*L) data blocks each. The
+	// geometry is an image field: with indblkshift 24 and 5 levels that is
+	// 2^85, which overflowed the product the walk used to keep and made the
+	// division below a divide by zero. Kept as a shift, a coverage of 2^64 or
+	// more simply covers every block ID.
+	shift := uint(dn.indblkshift) - 7
 	level := int(dn.nlevels) - 1
-	covered := bpsPerBlock
-	for i := 1; i < level; i++ {
-		covered *= bpsPerBlock
-	}
+	cs := shift * uint(level)
 
-	rpIdx := blockID / covered
+	rpIdx := shiftRight(blockID, cs)
 	if rpIdx >= uint64(dn.nblkptr) {
 		return blkptr{}, fmt.Errorf("zfs: blockID %d exceeds dnode capacity", blockID)
 	}
 	bp := dn.blkptrAt(int(rpIdx))
-	remaining := blockID % covered
+	remaining := lowBits(blockID, cs)
 
 	for level > 0 {
 		if bp.isNull() {
@@ -350,9 +366,9 @@ func findDataBPCached(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64, c
 			return blkptr{}, fmt.Errorf("zfs: read indirect block level %d: %w", level, err)
 		}
 		level--
-		covered /= bpsPerBlock
-		idx := remaining / covered
-		remaining = remaining % covered
+		cs -= shift
+		idx := shiftRight(remaining, cs)
+		remaining = lowBits(remaining, cs)
 		// H2(b): idx is derived from the attacker-controlled blockID and
 		// geometry; a short/garbage indirect block (or an idx beyond the
 		// blkptrs it actually holds) must error, not slice out of bounds.

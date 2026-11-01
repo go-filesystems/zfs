@@ -606,8 +606,31 @@ func TestBomb_BlockPastTheDevice(t *testing.T) {
 	if err == nil {
 		t.Fatal("a block past the end of the device was read")
 	}
-	if got > bombAllocLimit {
+	// 128 KiB (firstReadChunk) per pointer, not 16 MiB.
+	if got > 50*(firstReadChunk+16<<10) {
 		t.Fatalf("50 failed reads of a 16 MiB block allocated %d bytes", got)
+	}
+	// Chunked reads reassemble the block exactly, every read aligned to the
+	// first chunk as the RAID-Z reader needs, for sizes around the doubling steps.
+	pat := make([]byte, 4<<20)
+	for i := range pat {
+		pat[i] = byte(i * 31 >> 3)
+	}
+	for _, size := range []int64{firstReadChunk, firstReadChunk + 512, 2 * firstReadChunk, 3*firstReadChunk + 4096, 1<<20 + 512, 3 << 20} {
+		var offs []int64
+		rd := readerAtFunc(func(p []byte, off int64) (int, error) {
+			offs = append(offs, off)
+			return copy(p, pat[off:]), nil
+		})
+		got, err := readAtGrowing(rd, 4096, size)
+		if err != nil || !bytes.Equal(got, pat[4096:4096+size]) {
+			t.Fatalf("size %d: err=%v, content differs", size, err)
+		}
+		for _, o := range offs {
+			if (o-4096)%firstReadChunk != 0 {
+				t.Fatalf("size %d: read at %d is not a multiple of the first chunk from the start", size, o-4096)
+			}
+		}
 	}
 	// Inside the device a large block still reads whole.
 	big := &bombCountingReader{b: make([]byte, 2<<20)}
@@ -617,5 +640,105 @@ func TestBomb_BlockPastTheDevice(t *testing.T) {
 	// And the very last byte of the device is still reachable.
 	if b, err := readBlock(big, 0, plainBP(2<<20-64<<10, 64<<10)); err != nil || len(b) != 64<<10 {
 		t.Fatalf("block ending at the device end: len=%d err=%v", len(b), err)
+	}
+}
+
+// The witness kept in testdata/fuzz/FuzzDecompressBlock (zstd, 4121-byte
+// destination): written out because emulated CI lanes run a compiled test
+// binary away from testdata/. A 14-byte block must not cost more than the
+// destination it declares.
+func TestBomb_FuzzWitnessZstd(t *testing.T) {
+	src := []byte("\x00\x00\x00\x050000\xa4000\x00")
+	got := allocDelta(func() { _, _ = zstdDecompress(src, 4121) })
+	if got > fuzzAllocBudget(len(src)) {
+		t.Fatalf("allocated %d bytes", got)
+	}
+}
+
+// The witness kept in testdata/fuzz/FuzzDnodeWalk, found in the first seconds
+// of fuzzing: nlevels 6 with indblkshift 20 covers 2^(13*5) = 2^65 blocks per
+// root pointer; the product wrapped to 0 and the walk divided by it
+// ("integer divide by zero"). Written out because emulated CI lanes run a
+// compiled test binary away from testdata/.
+func TestBomb_FuzzWitnessIndirectCoverageOverflow(t *testing.T) {
+	dn := newDnode(dmotPlainFileContents, 3, 0, 0)
+	dn.nlevels, dn.indblkshift, dn.datablkszsec, dn.maxblkid = 6, 20, 1, 63
+	dev := bytes.Repeat([]byte("0"), 128)
+	for i := 0; i < 3; i++ {
+		dn.setBlkptrAt(i, parseBlkptr(dev))
+	}
+	r := &bombCountingReader{b: dev}
+	for _, id := range []uint64{0, 63, 1 << 40, ^uint64(0)} {
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					t.Fatalf("block %d: panic %v", id, p)
+				}
+			}()
+			_, _ = findDataBP(r, 0, dn, id)
+		}()
+	}
+	// The shift arithmetic agrees with the division it replaced wherever that
+	// did not overflow: 1024 pointers per 128 KiB indirect block, 3 levels.
+	r2, dn2 := indirectBomb(1 << 14)
+	dn2.maxblkid = 1<<14 - 1
+	bp, err := findDataBP(r2, 0, dn2, 5000)
+	if err != nil || bp != plainBP(2*(128<<10), 512) {
+		t.Fatalf("block 5000: bp=%+v err=%v", bp, err)
+	}
+	if _, err := findDataBP(r2, 0, dn2, 1<<20); err == nil {
+		t.Fatal("block 2^20 of a 1-root-pointer, 3-level, 1024-fan-out dnode accepted")
+	}
+}
+
+// The witness kept in testdata/fuzz/FuzzReadEmbedded: an embedded pointer
+// declaring ~3 MB of zstd output from a payload of '0' bytes allocated the
+// whole destination (DecodeAll is limited to the capacity it is given) before
+// finding that the payload is not a frame. The header is now parsed, its
+// declared size compared and the expansion bounded first.
+func TestBomb_FuzzWitnessEmbeddedZstd(t *testing.T) {
+	var raw [blkptrSize]byte
+	for i := range raw {
+		raw[i] = '0'
+	}
+	bp := parseBlkptr(raw[:])
+	bp.prop = 0x3030309030303030
+	var err error
+	got := allocDelta(func() { _, err = readEmbedded(bp) })
+	if err == nil || got > bombAllocLimit {
+		t.Fatalf("err=%v allocated %d bytes", err, got)
+	}
+}
+
+// The zstd gate is exact: a 20-byte frame may stand for 20 x 32768 bytes (plus
+// the slack), one byte more is refused before the destination is allocated;
+// and a frame whose header declares another size than the block's is refused.
+func TestBomb_ZstdExpansionAndDeclaredSize(t *testing.T) {
+	// A frame with a 4-byte content size field declaring `fcs` bytes and an
+	// empty last raw block (header 0x01 0x00 0x00).
+	frame := func(fcs uint32) []byte {
+		b := []byte{0xA0} // FHD: Frame_Content_Size_flag=2 (4 bytes), Single_Segment=1
+		b = binary.LittleEndian.AppendUint32(b, fcs)
+		b = append(b, 0x01, 0x00, 0x00) // last, raw, size 0
+		return b
+	}
+	wrap := func(fr []byte) []byte {
+		// on-disk: 4 magic bytes are stripped by ZFS
+		body := fr
+		src := binary.BigEndian.AppendUint32(nil, uint32(len(body)))
+		src = append(src, 0, 0, 0, 0) // rest of the 8-byte header (level etc.)
+		return append(src, body...)
+	}
+	src := wrap(frame(100))
+	var err error
+	got := allocDelta(func() { _, err = zstdDecompress(src, 4096) })
+	if err == nil || got > bombAllocLimit {
+		t.Fatalf("declared 100, want 4096: err=%v allocated %d", err, got)
+	}
+	cLen := len(frame(100))
+	big := cLen*zstdMaxExpansion + expansionSlack + 1
+	got = allocDelta(func() { _, err = zstdDecompress(wrap(frame(uint32(big))), big) })
+	if !errors.Is(err, safeio.ErrTooLarge) || got > bombAllocLimit {
+		t.Fatalf("one over the expansion bound: err=%v allocated %d", err, got)
 	}
 }

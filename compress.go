@@ -30,6 +30,11 @@ const (
 	lz4MaxExpansion  = 255
 	lzjbMaxExpansion = 8
 	zleMaxExpansion  = 256
+
+	// zstdMaxExpansion: a block is at most 128 KiB (Block_Maximum_Size) and an
+	// RLE_Block is a 3-byte header plus one byte standing for up to that many
+	// (RFC 8878 sections 3.1.1.2.1 to 3.1.1.2.4): 131072 / 4 = 32768.
+	zstdMaxExpansion = 32768
 )
 
 // expansionSlack is the zero-padding the decoders have always tolerated for a
@@ -358,6 +363,22 @@ func zstdDecompress(src []byte, dstSize int) ([]byte, error) {
 	frame := make([]byte, 0, 4+cLen)
 	frame = append(frame, zstdMagic...)
 	frame = append(frame, src[frameStart:frameStart+cLen]...)
+
+	// The destination is allocated at its full size (DecodeAll is limited to
+	// the capacity it is given), so refuse before allocating what this frame
+	// cannot produce: a frame header that does not parse, a declared content
+	// size other than the block's logical size (the result must be exactly
+	// dstSize), or a size beyond the format's maximum expansion.
+	var h zstd.Header
+	if err := h.Decode(frame); err != nil {
+		return nil, fmt.Errorf("zfs: zstd: %w", err)
+	}
+	if h.HasFCS && h.FrameContentSize != uint64(dstSize) {
+		return nil, fmt.Errorf("zfs: zstd: frame declares %d bytes, want %d", h.FrameContentSize, dstSize)
+	}
+	if err := checkExpansion("zstd", cLen, dstSize, zstdMaxExpansion); err != nil {
+		return nil, err
+	}
 
 	dst, err := zstdDecoder.DecodeAll(frame, make([]byte, 0, dstSize))
 	if err != nil {
