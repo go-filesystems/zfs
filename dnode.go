@@ -237,10 +237,52 @@ func newDnode(typ uint8, nblkptr uint8, bonusType uint8, bonusLen uint16) *dnode
 // key and the dataset is encrypted) readBlock transparently
 // decrypts encrypted blocks before returning them.
 func readDataBlock(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64) ([]byte, error) {
+	return readDataBlockCached(r, partOff, dn, blockID, nil)
+}
+
+// indirectCache remembers the last indirect block read at each level of one
+// walk over an object. Walking the blocks in order visits the same indirect
+// block for each of its (up to 2^(indblkshift-7)) children; without the cache
+// every data block re-read, re-allocated and re-parsed its whole chain from
+// the root -- 2 GiB of device reads for 8192 blocks of 512 bytes, from a
+// 264 KiB image whose pointers all named the same two blocks. The kernel
+// keeps indirect blocks in the ARC.
+//
+// Only bodies up to indirectCacheMax are kept, so the cache holds at most
+// maxNlevels of them.
+type indirectCache struct {
+	ent [maxNlevels + 1]struct {
+		ok   bool
+		bp   blkptr
+		data []byte
+	}
+}
+
+const indirectCacheMax = 1 << 20
+
+// read is readBlock through the cache for indirect level `level`.
+func (c *indirectCache) read(r io.ReaderAt, partOff int64, bp blkptr, level int) ([]byte, error) {
+	if c == nil || level < 0 || level >= len(c.ent) {
+		return readBlock(r, partOff, bp)
+	}
+	if e := &c.ent[level]; e.ok && e.bp == bp {
+		return e.data, nil
+	}
+	data, err := readBlock(r, partOff, bp)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) <= indirectCacheMax {
+		c.ent[level].ok, c.ent[level].bp, c.ent[level].data = true, bp, data
+	}
+	return data, nil
+}
+
+func readDataBlockCached(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64, c *indirectCache) ([]byte, error) {
 	if dn.nlevels == 0 || dn.nblkptr == 0 {
 		return make([]byte, dn.dataBlockSize()), nil
 	}
-	bp, err := findDataBP(r, partOff, dn, blockID)
+	bp, err := findDataBPCached(r, partOff, dn, blockID, c)
 	if err != nil {
 		return nil, err
 	}
@@ -252,6 +294,10 @@ func readDataBlock(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64) ([]b
 
 // findDataBP traverses indirect block levels to find the block pointer for blockID.
 func findDataBP(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64) (blkptr, error) {
+	return findDataBPCached(r, partOff, dn, blockID, nil)
+}
+
+func findDataBPCached(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64, c *indirectCache) (blkptr, error) {
 	if dn.nlevels == 1 {
 		// Direct: block pointer is in the dnode itself
 		if blockID >= uint64(dn.nblkptr) {
@@ -299,7 +345,7 @@ func findDataBP(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64) (blkptr
 		if bp.isNull() {
 			return blkptr{}, nil
 		}
-		indirData, err := readBlock(r, partOff, bp)
+		indirData, err := c.read(r, partOff, bp, level)
 		if err != nil {
 			return blkptr{}, fmt.Errorf("zfs: read indirect block level %d: %w", level, err)
 		}
@@ -321,12 +367,35 @@ func findDataBP(r io.ReaderAt, partOff int64, dn *dnode, blockID uint64) (blkptr
 
 // readDnodeData reads all data bytes of a dnode (up to maxblkid+1 blocks).
 func readDnodeData(r io.ReaderAt, partOff int64, dn *dnode) ([]byte, error) {
+	return readDnodeDataMax(r, partOff, dn, 0)
+}
+
+// DefaultMaxReadSize is the largest object ReadFile will materialise in memory
+// unless SetMaxReadSize says otherwise: 1 GiB.
+//
+// dn_maxblkid is read from the image and a hole costs no bytes on disk, so
+// nothing in the image bounds how much a sparse object expands to; only the
+// caller knows how much memory it is willing to spend.
+const DefaultMaxReadSize int64 = 1 << 30
+
+// readDnodeDataMax is readDnodeData with an explicit ceiling in bytes
+// (max <= 0 means DefaultMaxReadSize; it never exceeds maxDnodeDataBytes).
+func readDnodeDataMax(r io.ReaderAt, partOff int64, dn *dnode, max int64) ([]byte, error) {
 	if dn.maxblkid == 0 && dn.blkptrAt(0).isNull() {
 		return nil, nil
 	}
 	blkSz := dn.dataBlockSize()
 	if blkSz == 0 {
 		return nil, nil
+	}
+	if blkSz > spaMaxBlockSize {
+		return nil, fmt.Errorf("zfs: dnode data block size %d exceeds %d: %w", blkSz, spaMaxBlockSize, safeio.ErrTooLarge)
+	}
+	if max <= 0 {
+		max = DefaultMaxReadSize
+	}
+	if max > maxDnodeDataBytes {
+		max = maxDnodeDataBytes
 	}
 	// C1: dn_maxblkid is attacker-controlled (up to ~2^64). The naive
 	// `make([]byte, 0, int(n)*blkSz)` overflows int and either panics with
@@ -341,22 +410,32 @@ func readDnodeData(r io.ReaderAt, partOff int64, dn *dnode) ([]byte, error) {
 	}
 	// total = n*blkSz computed without overflow; reject if it doesn't fit
 	// in the maxDnodeDataBytes ceiling.
-	maxBlocks := uint64(maxDnodeDataBytes) / uint64(blkSz)
+	maxBlocks := uint64(max) / uint64(blkSz)
 	if n > maxBlocks {
-		return nil, fmt.Errorf("zfs: dnode data %d blocks × %d exceeds ceiling %d",
-			n, blkSz, maxDnodeDataBytes)
+		return nil, fmt.Errorf("zfs: dnode data %d blocks × %d exceeds ceiling %d: %w",
+			n, blkSz, max, safeio.ErrTooLarge)
 	}
+	// n <= max/blkSz, so total <= max and the product cannot overflow. (This
+	// used to call safeio.MakeBytes(total, ceiling) to "validate" total and
+	// discard the result -- but MakeBytes returns the allocated buffer, so the
+	// check itself cost `total` bytes.)
 	total := int64(n) * int64(blkSz)
-	// Validate total against the ceiling (also rejects total<0); on success
-	// total is safe to use as the slice capacity.
-	if _, err := safeio.MakeBytes(total, maxDnodeDataBytes); err != nil {
-		return nil, err
-	}
-	data := make([]byte, 0, int(total))
+	// The buffer grows with the blocks actually read. Reserving `total` up
+	// front made a dnode claiming 1 GiB cost 1 GiB before its first block was
+	// read (and failed): at most a few blocks are reserved.
+	data := make([]byte, 0, int(min(total, 4*int64(blkSz))))
+	var cache indirectCache
 	for i := uint64(0); i < n; i++ {
-		blk, err := readDataBlock(r, partOff, dn, i)
+		blk, err := readDataBlockCached(r, partOff, dn, i, &cache)
 		if err != nil {
 			return nil, err
+		}
+		// A block pointer's lsize is its own (up to 16 MiB) and need not match
+		// the dnode's block size, so n blocks could append n x 16 MiB to a
+		// result sized for n x blkSz. Keep the result inside the ceiling
+		// whatever the pointers say; the walk stops as soon as it is crossed.
+		if int64(len(data))+int64(len(blk)) > max {
+			return nil, fmt.Errorf("zfs: dnode data block %d takes the object past the ceiling %d: %w", i, max, safeio.ErrTooLarge)
 		}
 		data = append(data, blk...)
 	}

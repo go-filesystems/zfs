@@ -23,6 +23,8 @@ package filesystem_zfs
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/go-volumes/safeio"
 )
 
 // parsedNVPair is the decoded form of an on-disk nvpair.
@@ -83,6 +85,13 @@ func (p *parsedNVPair) nvlistValue() (parsedNVList, error) {
 func (p *parsedNVPair) nvlistArrayValue() ([]parsedNVList, error) {
 	if p.typ != nvDataTypeNVListArray {
 		return nil, fmt.Errorf("nvpair %q: not an nvlist array (typ=%d)", p.name, p.typ)
+	}
+	// nelem is an int32 of the image. Each element starts with its own 8-byte
+	// (version, nvflags) header, so the data cannot hold more than len/8 of
+	// them; reserving nelem slots up front was 51 GB for nelem = 2^31-1, and
+	// a negative nelem panicked in make.
+	if p.nelem < 0 || int64(p.nelem) > int64(len(p.data))/8 {
+		return nil, fmt.Errorf("nvpair %q: nvlist array of %d elements cannot fit in %d bytes: %w", p.name, p.nelem, len(p.data), safeio.ErrOutOfBounds)
 	}
 	out := make([]parsedNVList, 0, p.nelem)
 	rest := p.data
@@ -150,14 +159,17 @@ func decodeInnerNVListWithBytes(b []byte) (parsedNVList, int, error) {
 		}
 		encSize := int(int32(binary.BigEndian.Uint32(b[off : off+4])))
 		// decoded_size at off+4 — ignored.
-		nameLen := int(binary.BigEndian.Uint32(b[off+8 : off+12]))
+		// name_len is a uint32 of the image: compared as a uint64 it cannot
+		// go negative through int on 32-bit targets and slip past the bound.
+		nameLen64 := uint64(binary.BigEndian.Uint32(b[off+8 : off+12]))
 		if encSize <= 0 || off+encSize > len(b) {
 			return nil, 0, fmt.Errorf("nvlist: bad encoded_size %d at off %d", encSize, off)
 		}
 		nameStart := off + 12
-		if nameStart+nameLen > len(b) {
-			return nil, 0, fmt.Errorf("nvlist: name truncated at off %d (len=%d)", off, nameLen)
+		if uint64(nameStart)+nameLen64 > uint64(len(b)) {
+			return nil, 0, fmt.Errorf("nvlist: name truncated at off %d (len=%d)", off, nameLen64)
 		}
+		nameLen := int(nameLen64)
 		name := string(b[nameStart : nameStart+nameLen])
 		// Trim trailing NULs — older encoders pad with NULs to the
 		// XDR length boundary.
@@ -178,7 +190,12 @@ func decodeInnerNVListWithBytes(b []byte) (parsedNVList, int, error) {
 			name:  name,
 			typ:   typ,
 			nelem: nelem,
-			data:  append([]byte(nil), b[dataStart:dataEnd]...),
+			// A view, not a copy: a nested nvlist's data holds all its own
+			// pairs, so copying at every level copied the label once per
+			// level of nesting (64 KiB of nesting allocated 28 MB). Nothing
+			// writes to a pair's data; the capacity is cut so an append
+			// could not reach the bytes after it.
+			data: b[dataStart:dataEnd:dataEnd],
 		})
 		off += encSize
 	}

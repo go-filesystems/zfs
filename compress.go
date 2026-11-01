@@ -11,8 +11,40 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/go-volumes/safeio"
 	"github.com/klauspost/compress/zstd"
 )
+
+// Maximum expansion of each codec, in output bytes per input byte. lsize comes
+// from the block pointer, so the destination buffer must not be sized from it
+// unless the input can actually produce that much: an embedded pointer carries
+// at most 112 payload bytes, and declaring 16 MiB of logical size for them was
+// a 16 MiB allocation per read.
+//
+//   - LZ4: "this format has a maximum achievable compression ratio of about
+//     ~250" (doc/lz4_Block_format.md); every 255-valued length byte adds 255.
+//   - LZJB: a copy item is 2 bytes and yields at most 10 (copyLen =
+//     (hi>>5)+3), a literal 1 for 1; 8 is generous.
+//   - ZLE: a control byte yields at most 256-zleParam = 192 zero bytes.
+const (
+	lz4MaxExpansion  = 255
+	lzjbMaxExpansion = 8
+	zleMaxExpansion  = 256
+)
+
+// expansionSlack is the zero-padding the decoders have always tolerated for a
+// short or empty stream (a destination larger than the stream produces comes
+// back zero-filled); the gate leaves that much room and no more.
+const expansionSlack = 4096
+
+// checkExpansion refuses a destination size that srcLen input bytes cannot
+// produce with a codec expanding at most ratio:1 (plus expansionSlack).
+func checkExpansion(codec string, srcLen, dstSize, ratio int) error {
+	if dstSize < 0 || int64(dstSize) > int64(ratio)*int64(srcLen)+expansionSlack {
+		return fmt.Errorf("zfs: %s: %d input bytes cannot expand to %d (max %d:1): %w", codec, srcLen, dstSize, ratio, safeio.ErrTooLarge)
+	}
+	return nil
+}
 
 // lz4Decompress decompresses ZFS LZ4-compressed data.
 // ZFS LZ4 format: 4 bytes big-endian compressed size, then raw LZ4 block data.
@@ -32,6 +64,9 @@ func lz4Decompress(src []byte, dstSize int) ([]byte, error) {
 // lz4DecodeBlock decompresses a raw LZ4 block (no frame header).
 // dst capacity is dstSize bytes.
 func lz4DecodeBlock(src []byte, dstSize int) ([]byte, error) {
+	if err := checkExpansion("lz4", len(src), dstSize, lz4MaxExpansion); err != nil {
+		return nil, err
+	}
 	dst := make([]byte, 0, dstSize)
 	si := 0
 	for {
@@ -94,6 +129,13 @@ func lz4DecodeBlock(src []byte, dstSize int) ([]byte, error) {
 		if matchStart < 0 {
 			return nil, fmt.Errorf("zfs: lz4: invalid match offset %d at pos %d", offset, len(dst))
 		}
+		// matchLen is extended by 255-valued bytes with no limit in the
+		// format; never produce more than the destination holds (the
+		// result is cut to dstSize below, so the tail would be thrown away
+		// after being generated -- 1.5 GB from a 1 MiB block).
+		if room := dstSize - len(dst); matchLen > room {
+			matchLen = room
+		}
 		for i := 0; i < matchLen; i++ {
 			dst = append(dst, dst[matchStart+i])
 		}
@@ -113,6 +155,9 @@ func lz4DecodeBlock(src []byte, dstSize int) ([]byte, error) {
 // lzjbDecompress decompresses LZJB-compressed data (legacy ZFS default).
 // LZJB is a simple sliding-window compression with 9-bit symbols.
 func lzjbDecompress(src []byte, dstSize int) ([]byte, error) {
+	if err := checkExpansion("lzjb", len(src), dstSize, lzjbMaxExpansion); err != nil {
+		return nil, err
+	}
 	dst := make([]byte, dstSize)
 	const (
 		nbitsHz       = 9
@@ -181,6 +226,9 @@ const zleParam = 64
 // that decoded real OpenZFS ZLE blocks to garbage.
 func zleDecompress(src []byte, dstSize int) ([]byte, error) {
 	const n = zleParam
+	if err := checkExpansion("zle", len(src), dstSize, zleMaxExpansion); err != nil {
+		return nil, err
+	}
 	dst := make([]byte, dstSize)
 	si, di := 0, 0
 	for si < len(src) && di < dstSize {
@@ -229,15 +277,19 @@ func gzipDecompress(src []byte, dstSize int) ([]byte, error) {
 	}
 	defer zr.Close()
 
-	dst := make([]byte, dstSize)
-	n, err := io.ReadFull(zr, dst)
+	// The destination grows with what the stream actually produces (capped at
+	// dstSize+1 to notice an overlong stream); it is not sized from lsize up
+	// front, which a block pointer is free to set to 16 MiB for a few bytes.
+	var out bytes.Buffer
+	out.Grow(min(dstSize, 64*len(src)+4096))
+	_, err = io.Copy(&out, io.LimitReader(zr, int64(dstSize)+1))
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		return nil, fmt.Errorf("zfs: gzip: %w", err)
 	}
-	if n != dstSize {
-		return nil, fmt.Errorf("zfs: gzip: decompressed %d bytes, want %d", n, dstSize)
+	if out.Len() != dstSize {
+		return nil, fmt.Errorf("zfs: gzip: decompressed %d bytes, want %d", out.Len(), dstSize)
 	}
-	return dst, nil
+	return out.Bytes(), nil
 }
 
 // zstdHeaderSize is the size of the ZFS zstd header (zfs_zstdhdr_t) that
@@ -257,7 +309,18 @@ var zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
 // zstdDecoder is a shared, stateless zstd decoder. klauspost's decoder is safe
 // for concurrent use across goroutines via DecodeAll.
 var zstdDecoder = func() *zstd.Decoder {
-	d, err := zstd.NewReader(nil)
+	// A block is at most SPA_MAXBLOCKSIZE (16 MiB) of logical data, so neither
+	// its output nor its window can legitimately exceed that; the library
+	// defaults (64 GiB decoded, 512 MiB window) are limits for trusted input.
+	//
+	// The destination is exactly the block's logical size, so DecodeAll is
+	// limited to the capacity it is given: a frame header declaring a content
+	// size (up to 16 MiB here) made DecodeAll grow the destination to it
+	// before decoding, 3 MB for a 13-byte block.
+	d, err := zstd.NewReader(nil,
+		zstd.WithDecoderMaxMemory(spaMaxBlockSize),
+		zstd.WithDecoderMaxWindow(spaMaxBlockSize),
+		zstd.WithDecodeAllCapLimit(true))
 	if err != nil {
 		panic(fmt.Sprintf("zfs: zstd: init decoder: %v", err))
 	}

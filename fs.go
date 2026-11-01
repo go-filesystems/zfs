@@ -13,9 +13,11 @@ import (
 	"hash/fnv"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	filesystem "github.com/go-filesystems/interface"
+	"github.com/go-volumes/safeio"
 )
 
 // fsFields groups the additional fields added to FS for full filesystem access.
@@ -35,6 +37,38 @@ type fsFields struct {
 	// this. recommitChain uses it to skip re-reading/re-checksumming the
 	// upper MOS blocks on the common write path.
 	mosUpperDirty bool
+	// maxRead is the ceiling on a materialised object (0 = DefaultMaxReadSize);
+	// accessed atomically.
+	maxRead int64
+}
+
+// SetMaxReadSize sets the largest object ReadFile / ReadLink will materialise,
+// in bytes. n <= 0 restores DefaultMaxReadSize. An object whose block count
+// would exceed it is refused with an error wrapping ErrTooLarge before any
+// buffer is allocated.
+func (fs *zfsFS) SetMaxReadSize(n int64) {
+	if n < 0 {
+		n = 0
+	}
+	atomic.StoreInt64(&fs.maxRead, n)
+}
+
+// MaxReadSize reports the limit SetMaxReadSize configured (or the default).
+func (fs *zfsFS) MaxReadSize() int64 {
+	if m := atomic.LoadInt64(&fs.maxRead); m > 0 {
+		return m
+	}
+	return DefaultMaxReadSize
+}
+
+// ErrTooLarge is returned, wrapped, when an on-disk size or count would make
+// the driver allocate more than the image can legitimately hold. It is
+// safeio.ErrTooLarge, so errors.Is works against either name.
+var ErrTooLarge = safeio.ErrTooLarge
+
+// readData reads all data bytes of dn under this filesystem's read limit.
+func (fs *zfsFS) readData(dn *dnode) ([]byte, error) {
+	return readDnodeDataMax(fs.f, fs.partOffset, dn, atomic.LoadInt64(&fs.maxRead))
 }
 
 // ── Stat ─────────────────────────────────────────────────────────────────────
@@ -137,7 +171,7 @@ func (fs *zfsFS) ReadFile(path string) ([]byte, error) {
 		// Empty file
 		return nil, nil
 	}
-	data, err := readDnodeData(fs.f, fs.partOffset, dn)
+	data, err := fs.readData(dn)
 	if err != nil {
 		return nil, fmt.Errorf("zfs: ReadFile %q: %w", path, err)
 	}
@@ -175,7 +209,7 @@ func (fs *zfsFS) ReadLink(path string) (string, error) {
 	if dn.blkptrAt(0).isNull() {
 		return "", nil
 	}
-	data, err := readDnodeData(fs.f, fs.partOffset, dn)
+	data, err := fs.readData(dn)
 	if err != nil {
 		return "", fmt.Errorf("zfs: ReadLink %q: %w", path, err)
 	}
