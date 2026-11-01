@@ -34,7 +34,6 @@ const (
 	zapLeafHashShift   = 16
 	zapLeafHashTabSize = 1 << zapLeafHashShift // entries in leaf hash table
 	zapLeafChunkSize   = 24                    // sizeof(struct zap_leaf_chunk)
-
 	// maxZapPtrtblShift caps zt_shift (log2 of the number of pointer-table
 	// entries). OpenZFS zap_ptrtbl never exceeds a few million entries; 24
 	// (=16M pointers) is already far past any real ZAP and keeps 1<<shift
@@ -498,6 +497,7 @@ func iterateFatZAPLeafEntries(blk []byte, fn func(name string, chunksStart, chun
 	// Walk chunks looking for entry chunks (type 252 = ZAP_CHUNK_ENTRY).
 	// ZAP_CHUNK_ENTRY = 252, ZAP_CHUNK_ARRAY = 251, ZAP_CHUNK_FREE = 253
 	const chunkTypeEntry = 252
+	budget := chunkCount
 	for i := 0; i < chunkCount; i++ {
 		off := chunksStart + i*zapLeafChunkSize
 		if blk[off] != chunkTypeEntry {
@@ -533,17 +533,35 @@ func iterateFatZAPLeafEntries(blk []byte, fn func(name string, chunksStart, chun
 			nameLen = maxArrayBytes
 		}
 
-		// Read name from chained array chunks
-		name := readZAPLeafString(blk, chunksStart, chunkCount, nameChunk, nameLen)
-		if name == "" {
-			continue
-		}
-
 		// Clamp valNumInts so numInts*intLen cannot exceed the leaf's array
 		// capacity (H3); valIntLen is a single byte (<=255) so the product
 		// is then safely bounded.
 		if valIntLen > 0 && valNumInts > maxArrayBytes/valIntLen {
 			valNumInts = maxArrayBytes / valIntLen
+		}
+
+		// The per-entry clamps above let every entry claim the leaf's whole
+		// array capacity, and all of them may name the same chain: 1000
+		// entries in a 128 KiB leaf were 647 MB of name and value buffers.
+		// zap_entry_create refuses an entry needing more chunks than the
+		// leaf has (1 + ARRAY_NCHUNKS(name) + ARRAY_NCHUNKS(value) >
+		// ZAP_LEAF_NUMCHUNKS, module/zfs/zap_leaf.c) and an entry's chunks
+		// are its own, so the entries of a leaf cannot need more chunks
+		// than it has in total: charge each entry against that budget and
+		// stop at the first that overdraws it.
+		cost := 1 + (nameLen+zapLeafArrayBytes-1)/zapLeafArrayBytes
+		if valIntLen > 0 {
+			cost += (valNumInts*valIntLen + zapLeafArrayBytes - 1) / zapLeafArrayBytes
+		}
+		if cost > budget {
+			break
+		}
+		budget -= cost
+
+		// Read name from chained array chunks
+		name := readZAPLeafString(blk, chunksStart, chunkCount, nameChunk, nameLen)
+		if name == "" {
+			continue
 		}
 		fn(name, chunksStart, chunkCount, valChunk, valNumInts, valIntLen)
 	}

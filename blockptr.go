@@ -30,10 +30,29 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
+
+	"github.com/go-volumes/safeio"
 )
 
 const (
 	blkptrSize = 128 // sizeof(blkptr_t)
+
+	// spaMaxBlockSize is SPA_MAXBLOCKSIZE = 1 << SPA_MAXBLOCKSHIFT(24), 16 MiB
+	// (include/sys/fs/zfs.h). zfs_blkptr_verify (module/zfs/zio.c) refuses a
+	// block pointer whose LSIZE or PSIZE exceeds it. The block-pointer fields
+	// themselves reach 32 MiB (16 bits of 512-byte sectors), and every block
+	// read allocates what they say.
+	spaMaxBlockSize = 1 << 24
+
+	// bpePayloadSize is BPE_PAYLOAD_SIZE: the 14 words of an embedded block
+	// pointer that carry data (module/zfs/zio.c: PSIZE > BPE_PAYLOAD_SIZE is
+	// invalid).
+	bpePayloadSize = 112
+
+	// firstReadChunk is the most readBlock allocates before the device has
+	// answered (see readAtGrowing).
+	firstReadChunk = 128 << 10
 
 	// blk_prop bits
 	bpLsizeBits     = 0xFFFF // bits 15:0 (lsize - 1 in 512B sectors)
@@ -248,6 +267,58 @@ func setBPChecksum(bp *blkptr, phys []byte) {
 	bp.cksum = blockChecksum(ctype, phys)
 }
 
+// verifyBlkptrSizes refuses a block pointer whose logical or physical size the
+// format cannot have, before any buffer is sized from it: LSIZE and PSIZE must
+// not exceed SPA_MAXBLOCKSIZE (zfs_blkptr_verify, module/zfs/zio.c). For an
+// embedded pointer the physical size is the payload and is checked by
+// readEmbedded.
+func verifyBlkptrSizes(bp blkptr) error {
+	if bp.isEmbedded() {
+		if l := (bp.prop & 0x1FFFFFF) + 1; l > spaMaxBlockSize {
+			return fmt.Errorf("zfs: embedded blkptr lsize %d exceeds %d: %w", l, spaMaxBlockSize, safeio.ErrTooLarge)
+		}
+		return nil
+	}
+	if l := bp.lsize(); l > spaMaxBlockSize {
+		return fmt.Errorf("zfs: blkptr lsize %d exceeds %d: %w", l, spaMaxBlockSize, safeio.ErrTooLarge)
+	}
+	if p := bp.psize(); p > spaMaxBlockSize {
+		return fmt.Errorf("zfs: blkptr psize %d exceeds %d: %w", p, spaMaxBlockSize, safeio.ErrTooLarge)
+	}
+	return nil
+}
+
+// readAtGrowing reads n bytes at off. n comes from a block pointer and reaches
+// 16 MiB, so a buffer that large is not allocated before the device has shown
+// that the bytes exist: a block up to firstReadChunk (the default 128 KiB
+// record size) is read in one call as always; a larger one in chunks that
+// double, so a pointer past the end of the device costs 128 KiB, not 16 MiB.
+// Every chunk starts at a multiple of firstReadChunk from the block's offset
+// and is a multiple of it (but the last), which keeps the reads aligned for
+// the RAID-Z reader.
+func readAtGrowing(r io.ReaderAt, off, n int64) ([]byte, error) {
+	if n <= firstReadChunk {
+		raw := make([]byte, n)
+		if _, err := r.ReadAt(raw, off); err != nil {
+			return nil, err
+		}
+		return raw, nil
+	}
+	raw := make([]byte, firstReadChunk)
+	if _, err := r.ReadAt(raw, off); err != nil {
+		return nil, err
+	}
+	for int64(len(raw)) < n {
+		step := min(int64(len(raw)), n-int64(len(raw)))
+		cur := int64(len(raw))
+		raw = slices.Grow(raw, int(step))[:cur+step]
+		if _, err := r.ReadAt(raw[cur:], off+cur); err != nil {
+			return nil, err
+		}
+	}
+	return raw, nil
+}
+
 // readBlock reads the logical content of a block pointer from r.
 // r is the underlying device file, partOff is the partition byte offset.
 // Returns the decompressed lsize bytes.
@@ -258,6 +329,9 @@ func setBPChecksum(bp *blkptr, phys []byte) {
 // OpenFromDeviceDatasetWithKey, which stores a cryptingReader as
 // the FS's backing reader.
 func readBlock(r io.ReaderAt, partOff int64, bp blkptr) ([]byte, error) {
+	if err := verifyBlkptrSizes(bp); err != nil {
+		return nil, err
+	}
 	if bp.isNull() {
 		// Return a zero block of lsize bytes.
 		return make([]byte, bp.lsize()), nil
@@ -273,8 +347,8 @@ func readBlock(r io.ReaderAt, partOff int64, bp blkptr) ([]byte, error) {
 	psize := bp.psize()
 	lsize := bp.lsize()
 
-	raw := make([]byte, psize)
-	if _, err := r.ReadAt(raw, offset); err != nil {
+	raw, err := readAtGrowing(r, offset, psize)
+	if err != nil {
 		return nil, fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
 	}
 
@@ -356,7 +430,10 @@ func readEmbedded(bp blkptr) ([]byte, error) {
 	psize := int(((bp.prop >> 25) & bpePsizeMask) + 1)
 	comp := uint8((bp.prop >> 32) & 0x7F)
 
-	const payloadCap = 112
+	if lsize > spaMaxBlockSize {
+		return nil, fmt.Errorf("zfs: embedded blkptr lsize %d exceeds %d: %w", lsize, spaMaxBlockSize, safeio.ErrTooLarge)
+	}
+	const payloadCap = bpePayloadSize
 	var raw [payloadCap]byte
 	le := binary.LittleEndian
 	// dva[0..2] = raw[0..48]
@@ -384,7 +461,11 @@ func readEmbedded(bp blkptr) ([]byte, error) {
 
 	switch comp {
 	case zcompressOff, zcompressEmpty, zcompressInherit:
-		// Uncompressed; psize == lsize is expected.
+		// Uncompressed; psize == lsize is expected. More than the payload
+		// holds would be 16 MiB of invented zeros from 112 bytes.
+		if lsize > psize {
+			return nil, fmt.Errorf("zfs: uncompressed embedded blkptr lsize %d exceeds its %d-byte payload: %w", lsize, psize, safeio.ErrOutOfBounds)
+		}
 		out := make([]byte, lsize)
 		copy(out, compressed)
 		return out, nil

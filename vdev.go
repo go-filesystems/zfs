@@ -18,6 +18,8 @@ package filesystem_zfs
 import (
 	"fmt"
 	"io"
+
+	"github.com/go-volumes/safeio"
 )
 
 // vdevType is the string in the vdev_tree.type nvpair.
@@ -67,6 +69,18 @@ func (v *vdev) leafGUIDs() []uint64 {
 
 // parseVdevTree decodes a vdev_tree NVList into a vdev tree.
 func parseVdevTree(nv parsedNVList) (*vdev, error) {
+	return parseVdevTreeDepth(nv, 0)
+}
+
+// maxNVNesting is nvpair_max_recursion (module/nvpair/nvpair.c, userland): the
+// deepest nesting of nvlists libnvpair will unpack. The label region is
+// 112 KiB, so without it a label could nest a level every ~80 bytes.
+const maxNVNesting = 100
+
+func parseVdevTreeDepth(nv parsedNVList, depth int) (*vdev, error) {
+	if depth >= maxNVNesting {
+		return nil, fmt.Errorf("zfs: vdev_tree nested deeper than %d: %w", maxNVNesting, safeio.ErrTooLarge)
+	}
 	v := &vdev{}
 	if p := nv.findByName("type"); p != nil {
 		if s, err := p.stringValue(); err == nil {
@@ -92,7 +106,7 @@ func parseVdevTree(nv parsedNVList) (*vdev, error) {
 			}
 			v.children = make([]*vdev, 0, len(kids))
 			for i, k := range kids {
-				c, err := parseVdevTree(k)
+				c, err := parseVdevTreeDepth(k, depth+1)
 				if err != nil {
 					return nil, fmt.Errorf("vdev child %d: %w", i, err)
 				}

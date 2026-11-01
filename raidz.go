@@ -32,6 +32,8 @@ package filesystem_zfs
 import (
 	"fmt"
 	"io"
+
+	"github.com/go-volumes/safeio"
 )
 
 // raidzCol describes one accessed column of a RAID-Z IO.
@@ -49,6 +51,14 @@ type raidzMap struct {
 	parity  []raidzCol // length == nparity
 	data    []raidzCol // length == acols - nparity
 }
+
+// ashiftMin and ashiftMax are ASHIFT_MIN and ASHIFT_MAX (include/sys/spa.h):
+// the sector shifts OpenZFS accepts for a vdev. ashift is read from the vdev
+// nvlist of the image, and 1<<ashift is 0 for ashift >= 64.
+const (
+	ashiftMin = 9
+	ashiftMax = 16
+)
 
 // validRaidzGeom reports whether a RAID-Z geometry is sane. dcols (number
 // of children) must be at least 2 and nparity must be a real parity count
@@ -126,6 +136,9 @@ func raidzMapAlloc(b, s uint64, dcols, nparity int, ashift uint) *raidzMap {
 // data — the concatenation of each data column read in column
 // order.
 func raidzRead(children []io.ReaderAt, dataArea int64, offset, size int64, nparity int, ashift uint) ([]byte, error) {
+	if ashift < ashiftMin || ashift > ashiftMax {
+		return nil, fmt.Errorf("zfs: raidz read: ashift %d outside [%d,%d]: %w", ashift, ashiftMin, ashiftMax, safeio.ErrOutOfBounds)
+	}
 	sectorSize := int64(1) << ashift
 	if offset%sectorSize != 0 || size%sectorSize != 0 {
 		return nil, fmt.Errorf("zfs: raidz read: offset/size %d/%d not aligned to sector %d", offset, size, sectorSize)
