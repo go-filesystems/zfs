@@ -17,6 +17,7 @@ create, inspect, and modify ZFS filesystems programmatically.
 | Open / Close | ✅ | Opens single-pool images |
 | Format | ✅ | Creates new pool images via `Format` |
 | ReadFile / WriteFile | ✅ | Basic file I/O supported (ZPL dataset) |
+| OpenFile (`filesystem.Opener`) | ✅ | Positional reads: each `ReadAt` reads only the data blocks of its window (the indirect blocks are cached per handle); holes read as zeros. A 1 MiB read at 66 MiB of a 72 MiB file allocates 1.1 MB through it and 538 MB through `ReadFile` |
 | MkDir / Delete / Rename | ✅ | Directory operations supported |
 | Snapshots | ✅ | Create via `FS.Snapshot`, read via `OpenSnapshot`, remove via `FS.DestroySnapshot` |
 | Clones | ✅ | Create writable dataset from a snapshot via `FS.Clone`; `FS.Origin` reports the origin; dependent-clone tracking blocks snapshot destroy |
