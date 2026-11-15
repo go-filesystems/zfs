@@ -4,6 +4,8 @@ github.com/go-encryptions/zfscrypt v0.0.0-20261110170137-b5b9a4ee0567 h1:ICnZaXw
 github.com/go-encryptions/zfscrypt v0.0.0-20261110170137-b5b9a4ee0567/go.mod h1:Ddo9Pu/LLHSUsEpADOOv1UuI04XIW4pqV1tiuYZiiQM=
 github.com/go-filesystems/interface v0.6.0 h1:+7nA5FHgs/B03rZ9p81bkm0+6ew9fEntTFK8L5Uu6pk=
 github.com/go-filesystems/interface v0.6.0/go.mod h1:u9v8mvapNV8djzObwCECdyd2g6JBU6HNTR4EAqxOn6U=
+github.com/go-filesystems/kerneljudge v0.3.0 h1:PBsqm0gmsLcy+zFLBLwxAcQ5/EdmNt4rZveWryUaTs0=
+github.com/go-filesystems/kerneljudge v0.3.0/go.mod h1:SK6ri2WMRBATCd+RUhsOn+gLCy+F41a1VGebjQECZgs=
 github.com/go-volumes/gpt v0.3.0 h1:ZA33VVlmlkA47fFY+BkFylsufqq1TBoASIuBmri+xsw=
 github.com/go-volumes/gpt v0.3.0/go.mod h1:Dha6JL5/mGyDai8tWvZOPYn6pqe75NOtMRYGm3N4Qv8=
 github.com/go-volumes/safeio v0.0.0-20261101001828-0e1734761f39 h1:fwjxetvgv6Q6w60Pn94WolICFLFP/dfPXcjKrGKPI18=

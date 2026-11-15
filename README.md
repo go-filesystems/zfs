@@ -206,6 +206,24 @@ Fuzz targets: `FuzzDecompressBlock`, `FuzzReadEmbedded`, `FuzzNVList`,
 to the input), plus the existing `FuzzParseFatZAPLeaf`, `FuzzParseFatZAP`,
 `FuzzReadDnodeData`, `FuzzPartitionOffset` and `FuzzOpen`.
 
+## Judged by
+
+The Linux kernel's OpenZFS module (`zpool import -o readonly=on`, `zpool create`)
+and `zdb -c`, run as root in a Tart VM by
+[kerneljudge](https://github.com/go-filesystems/kerneljudge) (`kerneljudge run
+--driver <clone>`; the test is `kerneljudge_test.go`, behind `FS_KERNEL_JUDGE=1`;
+zfs-kmod 2.4.1, zfs 2.2.2 userland, Linux 7.0). Our `Format` image and the pool
+`zpool create` writes are each held to a fixed corpus (nested directories, UTF-8
+names, a 32 MiB file, a sparse file, symlinks, times) by `zdb -c`, a kernel
+import and mount, and this reader. Without symlinks both directions pass byte for
+byte. Fixed by this release: [#52](https://github.com/go-filesystems/zfs/issues/52)
+(the label said the pool was ACTIVE: `zpool import` needed `-f`) and
+[#55](https://github.com/go-filesystems/zfs/issues/55) (`ReadFile` of a sparse file
+failed). Open, logged as `KNOWN DEFECT` by the test:
+[#53](https://github.com/go-filesystems/zfs/issues/53) (the kernel cannot read a
+symlink `Symlink` writes) and [#54](https://github.com/go-filesystems/zfs/issues/54)
+(`ReadLink` returns an empty target for a kernel-written symlink).
+
 ## Limitations
 
 - Single pool; the writer targets a single dataset (the reader also

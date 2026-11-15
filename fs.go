@@ -167,10 +167,7 @@ func (fs *zfsFS) ReadFile(path string) ([]byte, error) {
 	if dn.typ != dmotPlainFileContents {
 		return nil, fmt.Errorf("zfs: ReadFile %q: not a regular file (type %d)", path, dn.typ)
 	}
-	if dn.blkptrAt(0).isNull() {
-		// Empty file
-		return nil, nil
-	}
+	// readData zero-fills a hole at any block, the first included.
 	data, err := fs.readData(dn)
 	if err != nil {
 		return nil, fmt.Errorf("zfs: ReadFile %q: %w", path, err)
@@ -180,8 +177,30 @@ func (fs *zfsFS) ReadFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("zfs: ReadFile %q: readAttrs: %w", path, err)
 	}
-	if int(attrs.size) > len(data) {
-		return nil, fmt.Errorf("zfs: ReadFile %q: SA size %d > data block %d", path, attrs.size, len(data))
+	if attrs.size > uint64(len(data)) {
+		// The file is longer than the blocks it owns: what lies beyond is a
+		// hole (a file grown by truncate(2), or sparse by writing far past its
+		// end) and reads as zeros, as it does in the kernel (#55). The size is
+		// attacker-controlled: it is held to the same read limit as the data.
+		limit := atomic.LoadInt64(&fs.maxRead)
+		if limit <= 0 {
+			limit = DefaultMaxReadSize
+		}
+		if limit > maxDnodeDataBytes {
+			limit = maxDnodeDataBytes
+		}
+		if maxInt := int64(^uint(0) >> 1); limit > maxInt { // 32-bit: make takes an int
+			limit = maxInt
+		}
+		if attrs.size > uint64(limit) {
+			return nil, fmt.Errorf("zfs: ReadFile %q: size %d exceeds the read limit %d: %w", path, attrs.size, limit, ErrTooLarge)
+		}
+		out := make([]byte, attrs.size)
+		copy(out, data)
+		return out, nil
+	}
+	if dn.blkptrAt(0).isNull() && attrs.size == 0 {
+		return nil, nil // empty file
 	}
 	return data[:attrs.size], nil
 }

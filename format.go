@@ -1073,7 +1073,10 @@ func buildLabelNVList(poolName string, poolGUID, vdevGUID uint64, totalBytes, ts
 	config := nvList{
 		nvUint64("version", fmtPoolVersion),
 		nvString("name", poolName),
-		nvUint64("state", 0), // POOL_STATE_ACTIVE
+		// POOL_STATE_EXPORTED (1): the driver is not holding the pool, and an
+		// ACTIVE label makes zpool import refuse it without -f ("previously in
+		// use from another system", #52).
+		nvUint64("state", 1),
 		nvUint64("txg", fmtPoolTXG),
 		nvUint64("pool_guid", poolGUID),
 		nvUint64("errata", 0),
