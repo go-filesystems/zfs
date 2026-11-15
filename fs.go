@@ -167,12 +167,10 @@ func (fs *zfsFS) ReadFile(path string) ([]byte, error) {
 	if dn.typ != dmotPlainFileContents {
 		return nil, fmt.Errorf("zfs: ReadFile %q: not a regular file (type %d)", path, dn.typ)
 	}
-	var data []byte
-	if !dn.blkptrAt(0).isNull() {
-		data, err = fs.readData(dn)
-		if err != nil {
-			return nil, fmt.Errorf("zfs: ReadFile %q: %w", path, err)
-		}
+	// readData zero-fills a hole at any block, the first included.
+	data, err := fs.readData(dn)
+	if err != nil {
+		return nil, fmt.Errorf("zfs: ReadFile %q: %w", path, err)
 	}
 	// Trim to actual size from SA attrs
 	attrs, err := fs.zplDS.readAttrs(objNum)
@@ -190,6 +188,9 @@ func (fs *zfsFS) ReadFile(path string) ([]byte, error) {
 		}
 		if limit > maxDnodeDataBytes {
 			limit = maxDnodeDataBytes
+		}
+		if maxInt := int64(^uint(0) >> 1); limit > maxInt { // 32-bit: make takes an int
+			limit = maxInt
 		}
 		if attrs.size > uint64(limit) {
 			return nil, fmt.Errorf("zfs: ReadFile %q: size %d exceeds the read limit %d: %w", path, attrs.size, limit, ErrTooLarge)
