@@ -37,6 +37,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+
+	simdfletcher4 "github.com/go-simd/adler32/fletcher4"
 )
 
 // ZIO checksum types (zio_checksum_t / zio_checksum enum in
@@ -56,23 +58,14 @@ const (
 
 // fletcher4 computes the ZFS fletcher4 checksum over buf and returns the
 // four 64-bit accumulators (a, b, c, d), exactly as
-// fletcher_4_scalar_native() does in module/zfs/zfs_fletcher.c.
+// fletcher_4_scalar_native() does in module/zcommon/zfs_fletcher.c. The kernel
+// is the shared one, github.com/go-simd/adler32/fletcher4 (AVX-512, AVX2, NEON,
+// scalar elsewhere), bit-identical to that function.
 //
-// The input is processed as a stream of 32-bit little-endian words. buf's
-// length must be a multiple of 4 (block sizes are always 512-aligned, so
-// this always holds for on-disk blocks).
-func fletcher4(buf []byte) [4]uint64 {
-	var a, b, c, d uint64
-	n := len(buf) / 4
-	for i := 0; i < n; i++ {
-		w := uint64(binary.LittleEndian.Uint32(buf[i*4:]))
-		a += w
-		b += a
-		c += b
-		d += c
-	}
-	return [4]uint64{a, b, c, d}
-}
+// The input is a stream of 32-bit little-endian words. buf's length must be a
+// multiple of 4 (block sizes are always 512-aligned, so this always holds for
+// on-disk blocks).
+func fletcher4(buf []byte) [4]uint64 { return simdfletcher4.Sum(buf) }
 
 // sha256Checksum computes the ZFS SHA-256 block checksum over buf. ZFS
 // stores the digest as four big-endian uint64 words (abd_checksum_sha256
