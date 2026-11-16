@@ -16,7 +16,6 @@ package filesystem_zfs
 //   root dir object = ZAP of directory entries
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -222,9 +221,11 @@ func openNamedDataset(r io.ReaderAt, partOff int64, rootBP blkptr, childPath str
 		}
 		salt := new([32]byte)
 		if v, ok := raw[checksumSaltName]; !ok {
-			if _, err := rand.Read(salt[:]); err != nil {
-				return nil, fmt.Errorf("zfs: random checksum salt: %w", err)
-			}
+			// spa_load (read path, spa.c:4684-4687) invents a random salt for
+			// the session here, against which no existing salted block can
+			// verify. We say so instead: such a block is refused with a clear
+			// error (pools using only fletcher/SHA blocks open as before).
+			salt = noChecksumSalt
 		} else if len(v) > len(salt) {
 			return nil, fmt.Errorf("zfs: pool checksum salt is %d bytes, at most %d allowed", len(v), len(salt))
 		} else {

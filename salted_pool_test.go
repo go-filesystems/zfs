@@ -128,6 +128,63 @@ func firstBlock(t *testing.T, fs *zfsFS, path string) (blkptr, int64) {
 	return bp, fs.partOffset + bp.dvaOffset(0)
 }
 
+// firstDataBlock returns the block pointer of the file's first LEVEL-0 block
+// (through the indirect block when the file has one) and its image offset.
+func firstDataBlock(t *testing.T, fs *zfsFS, path string) (blkptr, int64) {
+	t.Helper()
+	bp, _ := firstBlock(t, fs, path)
+	for bp.level() > 0 {
+		blk, err := readBlock(fs.f, fs.partOffset, bp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bp = parseBlkptr(blk[:blkptrSize])
+	}
+	return bp, fs.partOffset + bp.dvaOffset(0)
+}
+
+// A byte flipped in a DATA block (level 0, one copy) is refused with
+// ErrChecksum for each salted type, plain and encrypted, and the block really
+// carries that type.
+func TestSaltedPoolsRefuseDataCorruption(t *testing.T) {
+	for _, fx := range saltedFixtures {
+		for _, dataset := range []string{"", fx.dataset} {
+			name := fx.name + "/plain"
+			if dataset != "" {
+				name = fx.name + "/encrypted"
+			}
+			t.Run(name, func(t *testing.T) {
+				img := extractSaltedFixture(t, fx.name)
+				pass := []byte("hunter2!")
+				clean := openSalted(t, img, dataset, pass)
+				bp, off := firstDataBlock(t, clean, "/blob.bin")
+				if bp.level() != 0 || bp.checksumType() != fx.ctype {
+					t.Fatalf("level %d type %d, want a level-0 block of type %d", bp.level(), bp.checksumType(), fx.ctype)
+				}
+				flipByteAt(t, img, off+100)
+				bad := openSalted(t, img, dataset, pass)
+				if _, err := bad.ReadFile("/blob.bin"); !errors.Is(err, ErrChecksum) {
+					t.Fatalf("ReadFile of a damaged data block: %v, want ErrChecksum", err)
+				}
+			})
+		}
+	}
+}
+
+// A pool with no salt entry has its salted blocks refused with a clear error.
+func TestVerifyBlockChecksum_NoSaltEntryRefusesSalted(t *testing.T) {
+	bp := makeBlkptrCksum(0, 512, 512, zcompressOff, dmotPlainFileContents, 0, 1, zioChecksumBlake3)
+	err := verifyBlockChecksum(bp, make([]byte, 512), noChecksumSalt)
+	if !errors.Is(err, ErrChecksum) {
+		t.Fatalf("err = %v, want ErrChecksum", err)
+	}
+	fl := makeBlkptrCksum(0, 512, 512, zcompressOff, dmotPlainFileContents, 0, 1, zioChecksumFletch4)
+	fl.cksum = fletcher4(make([]byte, 512))
+	if err := verifyBlockChecksum(fl, make([]byte, 512), noChecksumSalt); err != nil {
+		t.Fatalf("a fletcher4 block must not need a salt: %v", err)
+	}
+}
+
 func checkFiles(t *testing.T, fs *zfsFS, want map[string]string) {
 	t.Helper()
 	for p, sum := range want {
