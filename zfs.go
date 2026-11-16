@@ -82,8 +82,9 @@ type zfsFS struct {
 	partOffset  int64 // DATA AREA start in `f` (= raw partition start + VDEV_LABEL_START_SIZE)
 	labelOffset int64 // raw partition start in `f` — for label / uberblock / grow operations
 	info        Info
-	crypt       *cryptCtx // non-nil only when opened via OpenFromDeviceDatasetWithKey
-	fsFields              // extra fields defined in fs.go
+	vb          *verifyBackend // the backend f reads through; carries the verify-on-read switch
+	crypt       *cryptCtx      // non-nil only when opened via OpenFromDeviceDatasetWithKey
+	fsFields                   // extra fields defined in fs.go
 }
 
 // blockBackend is the interface backing zfsFS. The read path uses
@@ -282,19 +283,22 @@ func OpenFromDevices(devs []BlockBackend, partIndex int, datasetPath string) (FS
 		pool.Close()
 		return nil, err
 	}
-	fs := &zfsFS{f: pool, partOffset: off + vdevLabelStartSize, info: info, labelOffset: off}
+	vb := &verifyBackend{blockBackend: pool}
+	vb.on.Store(true) // the open itself reads checked blocks
+	defer vb.on.Store(false)
+	fs := &zfsFS{f: vb, vb: vb, partOffset: off + vdevLabelStartSize, info: info, labelOffset: off}
 	fs.curTxg = info.TransactionGroup
 
 	rootBPBuf := make([]byte, blkptrSize)
 	if _, e2 := pool.ReadAt(rootBPBuf, info.Offset+40); e2 == nil {
 		rootBP := parseBlkptr(rootBPBuf)
 		if !rootBP.isNull() {
-			if ds, e3 := openNamedDataset(pool, fs.partOffset, rootBP, datasetPath); e3 == nil {
+			if ds, e3 := openNamedDataset(vb, fs.partOffset, rootBP, datasetPath); e3 == nil {
 				fs.zplDS = ds
 				if sz, e4 := pool.Size(); e4 == nil {
 					fs.initAllocator(sz)
 				}
-			} else if datasetPath != "" {
+			} else if datasetPath != "" || errors.Is(e3, ErrChecksum) {
 				pool.Close()
 				return nil, fmt.Errorf("zfs: open dataset %q: %w", datasetPath, e3)
 			}
@@ -322,19 +326,22 @@ func openFromDevice(dev BlockBackend, partIndex int, datasetPath string) (FS, er
 	// use this as the base; label/uberblock reads use info.Offset which
 	// was computed pre-shift by openReadInfo and is still raw-partition-
 	// relative.
-	fs := &zfsFS{f: dev, partOffset: off + vdevLabelStartSize, info: info, labelOffset: off}
+	vb := &verifyBackend{blockBackend: dev}
+	vb.on.Store(true) // the open itself reads checked blocks
+	defer vb.on.Store(false)
+	fs := &zfsFS{f: vb, vb: vb, partOffset: off + vdevLabelStartSize, info: info, labelOffset: off}
 	fs.curTxg = info.TransactionGroup
 
 	rootBPBuf := make([]byte, blkptrSize)
 	if _, e2 := dev.ReadAt(rootBPBuf, info.Offset+40); e2 == nil {
 		rootBP := parseBlkptr(rootBPBuf)
 		if !rootBP.isNull() {
-			if ds, e3 := openNamedDataset(dev, fs.partOffset, rootBP, datasetPath); e3 == nil {
+			if ds, e3 := openNamedDataset(vb, fs.partOffset, rootBP, datasetPath); e3 == nil {
 				fs.zplDS = ds
 				if sz, e4 := dev.Size(); e4 == nil {
 					fs.initAllocator(sz)
 				}
-			} else if datasetPath != "" {
+			} else if datasetPath != "" || errors.Is(e3, ErrChecksum) {
 				dev.Close()
 				return nil, fmt.Errorf("zfs: open dataset %q: %w", datasetPath, e3)
 			}

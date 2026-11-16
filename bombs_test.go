@@ -61,10 +61,11 @@ func TestBomb_LZ4MatchLength(t *testing.T) {
 	var err error
 	got := allocDelta(func() { out, err = lz4DecodeBlock(src, 4096) })
 	t.Logf("allocated %d bytes, err=%v", got, err)
-	// The block is decoded up to the destination, as before; it just no longer
-	// generates the 267 MB it would then have thrown away.
-	if err != nil || len(out) != 4096 {
-		t.Fatalf("len=%d err=%v", len(out), err)
+	// A block that produces more than the destination holds is refused, as
+	// OpenZFS refuses it (LZ4_uncompress_unknownOutputSize), without generating
+	// the 267 MB the match asks for.
+	if err == nil || len(out) != 0 {
+		t.Fatalf("len=%d err=%v, want a refusal", len(out), err)
 	}
 	if got > bombAllocLimit {
 		t.Fatalf("allocated %d bytes for a %d-byte block", got, len(src))

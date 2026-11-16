@@ -343,13 +343,33 @@ func readBlock(r io.ReaderAt, partOff int64, bp blkptr) ([]byte, error) {
 		return nil, fmt.Errorf("zfs: gang blocks not supported")
 	}
 
-	offset := partOff + bp.dvaOffset(0)
 	psize := bp.psize()
 	lsize := bp.lsize()
 
-	raw, err := readAtGrowing(r, offset, psize)
-	if err != nil {
-		return nil, fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
+	// The kernel verifies every block it reads against the checksum in the
+	// pointing blkptr and, on a mismatch, reads another copy (the block's other
+	// DVAs: ditto blocks, copies=N) before giving up with EIO; so do we, before
+	// the bytes are decrypted, decompressed or returned. Without verification
+	// only the first copy is ever read, as before.
+	var raw []byte
+	for i := 0; ; i++ {
+		offset := partOff + bp.dvaOffset(i)
+		var err error
+		raw, err = readAtGrowing(r, offset, psize)
+		if err != nil {
+			return nil, fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
+		}
+		if !readerVerifies(r) {
+			break
+		}
+		verr := verifyBlockChecksum(bp, raw)
+		if verr == nil {
+			break
+		}
+		// Another copy to try: populated, not a gang header.
+		if i+1 >= 3 || bp.dva[i+1][0]&0xFFFFFF == 0 || bp.dvaGang(i+1) {
+			return nil, verr
+		}
 	}
 
 	// Only genuinely-encrypted blocks (BP_IS_ENCRYPTED) are decrypted.

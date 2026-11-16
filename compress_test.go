@@ -84,15 +84,11 @@ func TestLZ4DecodeBlock_ExtendedMatchLength(t *testing.T) {
 }
 
 func TestLZ4DecodeBlock_TruncatedMatchOffset(t *testing.T) {
-	// Only 1 byte after literals → falls into `len(src)-si < 2` branch
+	// Only 1 byte after the literals: a match offset needs 2. The block is
+	// truncated, which OpenZFS refuses (input overrun) and so do we.
 	raw := []byte{0x10, 'x', 0x01} // litLen=1, then 1 byte remaining → no offset
-	// This path breaks out of loop, returns padded result
-	got, err := lz4DecodeBlock(raw, 5)
-	if err != nil {
-		t.Fatalf("short match offset: %v", err)
-	}
-	if got[0] != 'x' {
-		t.Fatalf("got[0] = %q, want 'x'", got[0])
+	if _, err := lz4DecodeBlock(raw, 5); err == nil {
+		t.Fatal("a block cut inside a match offset was accepted")
 	}
 }
 

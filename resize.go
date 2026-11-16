@@ -1159,11 +1159,14 @@ func (fs *zfsFS) relabelAndTruncate(newSize int64) error {
 	// be lingering at the old positions until truncate.
 	fs.curTxg++
 
-	rootBPBuf := make([]byte, blkptrSize)
-	if _, err := fs.f.ReadAt(rootBPBuf, fs.info.Offset+40); err != nil {
-		return fmt.Errorf("read rootbp: %w", err)
+	// Blocks were relocated and rewritten in place: the root block pointer in the
+	// current uberblock carries the checksum of the MOS objset as it was BEFORE.
+	// Recompute the chain, as every other writer does through commitUberblock,
+	// so the new uberblock's rootbp matches the blocks on disk.
+	rootBP, err := fs.recommitChain()
+	if err != nil {
+		return fmt.Errorf("recompute checksum chain: %w", err)
 	}
-	rootBP := parseBlkptr(rootBPBuf)
 	rootBP.birth = fs.curTxg
 	rootBP.physBirth = fs.curTxg
 

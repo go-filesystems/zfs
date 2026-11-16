@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/go-compressions/lz4"
 	"github.com/go-volumes/safeio"
 	"github.com/klauspost/compress/zstd"
 )
@@ -66,95 +67,21 @@ func lz4Decompress(src []byte, dstSize int) ([]byte, error) {
 	return lz4DecodeBlock(src[4:4+compSize], dstSize)
 }
 
-// lz4DecodeBlock decompresses a raw LZ4 block (no frame header).
-// dst capacity is dstSize bytes.
+// lz4DecodeBlock decompresses a raw LZ4 block (no frame header) into exactly
+// dstSize bytes with the shared decoder, github.com/go-compressions/lz4
+// (DecodeBlock: assembly fast loop on amd64 and arm64, checked against liblz4).
+// A block that produces more than dstSize bytes is refused, as OpenZFS's
+// LZ4_uncompress_unknownOutputSize does; one that produces fewer leaves the rest
+// of the buffer zero, as this driver always has.
 func lz4DecodeBlock(src []byte, dstSize int) ([]byte, error) {
 	if err := checkExpansion("lz4", len(src), dstSize, lz4MaxExpansion); err != nil {
 		return nil, err
 	}
-	dst := make([]byte, 0, dstSize)
-	si := 0
-	for {
-		if si >= len(src) {
-			break
-		}
-		token := src[si]
-		si++
-
-		// Literal length
-		litLen := int(token >> 4)
-		if litLen == 15 {
-			for si < len(src) {
-				extra := src[si]
-				si++
-				litLen += int(extra)
-				if extra != 255 {
-					break
-				}
-			}
-		}
-
-		// Copy literals
-		if si+litLen > len(src) {
-			return nil, fmt.Errorf("zfs: lz4: literal overflow")
-		}
-		dst = append(dst, src[si:si+litLen]...)
-		si += litLen
-
-		// Last sequence has no match
-		if si >= len(src) {
-			break
-		}
-		if len(src)-si < 2 {
-			break
-		}
-
-		// Match offset (LE uint16)
-		offset := int(binary.LittleEndian.Uint16(src[si:]))
-		si += 2
-		if offset == 0 {
-			return nil, fmt.Errorf("zfs: lz4: zero match offset")
-		}
-
-		// Match length
-		matchLen := int(token&0xF) + 4
-		if token&0xF == 15 {
-			for si < len(src) {
-				extra := src[si]
-				si++
-				matchLen += int(extra)
-				if extra != 255 {
-					break
-				}
-			}
-		}
-
-		// Copy match from already-decoded output
-		matchStart := len(dst) - offset
-		if matchStart < 0 {
-			return nil, fmt.Errorf("zfs: lz4: invalid match offset %d at pos %d", offset, len(dst))
-		}
-		// matchLen is extended by 255-valued bytes with no limit in the
-		// format; never produce more than the destination holds (the
-		// result is cut to dstSize below, so the tail would be thrown away
-		// after being generated -- 1.5 GB from a 1 MiB block).
-		if room := dstSize - len(dst); matchLen > room {
-			matchLen = room
-		}
-		for i := 0; i < matchLen; i++ {
-			dst = append(dst, dst[matchStart+i])
-		}
-
-		if len(dst) >= dstSize {
-			break
-		}
+	dst := make([]byte, dstSize)
+	if _, err := lz4.DecodeBlock(dst, src); err != nil {
+		return nil, fmt.Errorf("zfs: lz4: %w", err)
 	}
-	if len(dst) < dstSize {
-		// Pad with zeros if needed (shouldn't happen with correct data)
-		extra := make([]byte, dstSize-len(dst))
-		dst = append(dst, extra...)
-	}
-	return dst[:dstSize], nil
+	return dst, nil
 }
 
 // lzjbDecompress decompresses LZJB-compressed data (legacy ZFS default).

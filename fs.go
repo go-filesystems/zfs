@@ -87,10 +87,11 @@ func (fs *zfsFS) Stat(path string) (filesystem.Stat, error) {
 
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.verifyReads()()
 
 	objNum, err := fs.zplDS.lookupPath(fs.f, fs.partOffset, path)
 	if err != nil {
-		return nil, &os.PathError{Op: "stat", Path: path, Err: errNotFound}
+		return nil, lookupErr("stat", path, err)
 	}
 	attrs, err := fs.zplDS.readAttrs(objNum)
 	if err != nil {
@@ -109,10 +110,11 @@ func (fs *zfsFS) ListDir(path string) ([]filesystem.DirEntry, error) {
 	path = cleanPath(path)
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.verifyReads()()
 
 	objNum, err := fs.zplDS.lookupPath(fs.f, fs.partOffset, path)
 	if err != nil {
-		return nil, &os.PathError{Op: "listdir", Path: path, Err: errNotFound}
+		return nil, lookupErr("listdir", path, err)
 	}
 	dirDN, err := fs.zplDS.zplOS.readObject(objNum)
 	if err != nil {
@@ -155,10 +157,11 @@ func (fs *zfsFS) ReadFile(path string) ([]byte, error) {
 	path = cleanPath(path)
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.verifyReads()()
 
 	objNum, err := fs.zplDS.lookupPath(fs.f, fs.partOffset, path)
 	if err != nil {
-		return nil, &os.PathError{Op: "open", Path: path, Err: errNotFound}
+		return nil, lookupErr("open", path, err)
 	}
 	dn, err := fs.zplDS.zplOS.readObject(objNum)
 	if err != nil {
@@ -215,10 +218,11 @@ func (fs *zfsFS) ReadLink(path string) (string, error) {
 	path = cleanPath(path)
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.verifyReads()()
 
 	objNum, err := fs.zplDS.lookupPath(fs.f, fs.partOffset, path)
 	if err != nil {
-		return "", &os.PathError{Op: "readlink", Path: path, Err: errNotFound}
+		return "", lookupErr("readlink", path, err)
 	}
 	dn, err := fs.zplDS.zplOS.readObject(objNum)
 	if err != nil {
@@ -1501,6 +1505,19 @@ func (fs *zfsFS) recommitChain() (blkptr, error) {
 		return blkptr{}, fmt.Errorf("write MOS objset: %w", err)
 	}
 	rootBP.fill = totalFill
+
+	// The open ZPL objset caches its meta_dnode and so the checksum of the
+	// object-array block, which this recommit just changed on disk. Refresh the
+	// cache, or the next checked read of the array compares the block with the
+	// checksum it had before the write and reports corruption.
+	if fs.zplDS != nil && fs.zplDS.zplOS != nil {
+		cached := fs.zplDS.zplOS
+		if md, perr := parseDnode(zplObjsetBlk[objsetMetaDnodeOff : objsetMetaDnodeOff+dnodeMinSize]); perr == nil {
+			cached.metaDnode = md
+			cached.raw = zplObjsetBlk
+			cached.bp = zplBP
+		}
+	}
 
 	// (d) MOS objset block → rootbp checksum (returned for the uberblock).
 	setBPChecksum(&rootBP, mosObjsetBlk)
