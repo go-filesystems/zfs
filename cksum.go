@@ -33,6 +33,7 @@ package filesystem_zfs
 
 import (
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -50,6 +51,7 @@ const (
 	zioChecksumFletch2 = 6
 	zioChecksumFletch4 = 7
 	zioChecksumSHA256  = 8
+	zioChecksumSHA512  = 11 // SHA-512/256 (sha2_zfs.c: SHA2Init(SHA512_256))
 )
 
 // fletcher4 computes the ZFS fletcher4 checksum over buf and returns the
@@ -121,9 +123,11 @@ var ErrChecksum = errors.New("zfs: block checksum mismatch")
 // verifyBlockChecksum checks the physical bytes `phys` of the block `bp` points
 // to against bp.cksum, as zio_checksum_verify does on every read.
 //
-// Verified: fletcher4, fletcher2 and SHA-256 on little-endian block pointers.
-// Not verified, because no implementation exists here yet: SHA-512/256, Skein,
-// Edon-R, BLAKE3 (and a big-endian pool): those blocks are returned as before.
+// Verified: fletcher4, fletcher2, SHA-256 and SHA-512/256 on little-endian block
+// pointers. Not verified: Skein, Edon-R and BLAKE3, which OpenZFS keys with the
+// pool's checksum salt (the MOS object directory entry
+// "org.illumos:checksum_salt", spa.c:4679-4683, dmu.h:388) that this driver does
+// not read yet, and a big-endian pool: those blocks are returned as before.
 // OFF and embedded block pointers carry no checksum.
 func verifyBlockChecksum(bp blkptr, phys []byte) error {
 	if bp.isEmbedded() || bp.prop&bpLEBit == 0 {
@@ -137,6 +141,8 @@ func verifyBlockChecksum(bp blkptr, phys []byte) error {
 		got = fletcher2(phys)
 	case zioChecksumSHA256:
 		got = sha256Checksum(phys)
+	case zioChecksumSHA512:
+		got = sha512Checksum(phys)
 	default:
 		return nil
 	}
@@ -154,4 +160,18 @@ func verifyBlockChecksum(bp blkptr, phys []byte) error {
 			ErrChecksum, bp.checksumType(), bp.dvaOffset(0), got, want)
 	}
 	return nil
+}
+
+// sha512Checksum is the ZFS "sha512" checksum: SHA-512/256 (OpenZFS
+// sha2_zfs.c abd_checksum_sha512_native, SHA2Init(SHA512_256)). Unlike SHA-256,
+// SHA2Final writes the digest straight into the four words, so on a
+// little-endian pool each word is the little-endian reading of eight digest
+// bytes, not the big-endian one sha256Checksum returns.
+func sha512Checksum(buf []byte) [4]uint64 {
+	sum := sha512.Sum512_256(buf)
+	var c [4]uint64
+	for i := range c {
+		c[i] = binary.LittleEndian.Uint64(sum[i*8 : i*8+8])
+	}
+	return c
 }

@@ -23,6 +23,8 @@ func checkedBlock(t *testing.T, ctype uint8, content []byte, mutate func(*blkptr
 	switch ctype {
 	case zioChecksumFletch2:
 		bp.cksum = fletcher2(buf)
+	case zioChecksumSHA512:
+		bp.cksum = sha512Checksum(buf)
 	default:
 		setBPChecksum(&bp, buf)
 	}
@@ -39,7 +41,7 @@ func TestVerifyBlockChecksum_RefusesMismatch(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		ctype uint8
-	}{{"fletcher4", zioChecksumFletch4}, {"fletcher2", zioChecksumFletch2}, {"sha256", zioChecksumSHA256}} {
+	}{{"fletcher4", zioChecksumFletch4}, {"fletcher2", zioChecksumFletch2}, {"sha256", zioChecksumSHA256}, {"sha512", zioChecksumSHA512}} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := checkedBlock(t, tc.ctype, []byte("hello, zfs"), nil); err != nil {
 				t.Fatalf("a matching block was refused: %v", err)
