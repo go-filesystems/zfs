@@ -1,7 +1,7 @@
 github.com/go-compressions/appleoracle v0.3.0 h1:hNdRkdAFDOtbypzcuray4wtER3pWghRFkl/Ygck3r6s=
 github.com/go-compressions/appleoracle v0.3.0/go.mod h1:oKtBkLzNNzAMRv1EpgO0v22V662XXSf0FkhE46j3OtY=
-github.com/go-compressions/lz4 v0.4.2-0.20261116135952-8524a366bda0 h1:OEwn9skIhmEVXTnUX4T3IGsEEgNJab9PmBbAkoynSAM=
-github.com/go-compressions/lz4 v0.4.2-0.20261116135952-8524a366bda0/go.mod h1:/SiFQqIBd2i+rm4zVmLUI1PEDYR9mG/iyVtMb6EZHhc=
+github.com/go-compressions/lz4 v0.4.2-0.20261116140923-16c0e5c9b8e8 h1:KYJwFQZUapJNwk+4TosbVC1wA28nLWuevNORr3uLYAc=
+github.com/go-compressions/lz4 v0.4.2-0.20261116140923-16c0e5c9b8e8/go.mod h1:/SiFQqIBd2i+rm4zVmLUI1PEDYR9mG/iyVtMb6EZHhc=
 github.com/go-encryptions/ccm v0.1.0 h1:kVq0WlU0U+CZIy/pa64MXgBWuJrv/0jot0H8HJAJx2o=
 github.com/go-encryptions/ccm v0.1.0/go.mod h1:N6dSqzbwzd+65hl2B8C/8S0avlWhGCbfY1DdAXSm0vo=
 github.com/go-encryptions/zfscrypt v0.0.0-20261110170137-b5b9a4ee0567 h1:ICnZaXwrFo7A9eA1MMtrnK3SdzP2dxdJVCEAIrIRl3Q=

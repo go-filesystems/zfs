@@ -3,7 +3,7 @@ module github.com/go-filesystems/zfs
 go 1.27.1
 
 require (
-	github.com/go-compressions/lz4 v0.4.2-0.20261116135952-8524a366bda0
+	github.com/go-compressions/lz4 v0.4.2-0.20261116140923-16c0e5c9b8e8
 	github.com/go-encryptions/zfscrypt v0.0.0-20261110170137-b5b9a4ee0567
 	github.com/go-filesystems/interface v0.6.0
 	github.com/go-filesystems/kerneljudge v0.3.0
