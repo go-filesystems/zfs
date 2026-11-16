@@ -1,3 +1,7 @@
+github.com/go-compressions/appleoracle v0.3.0 h1:hNdRkdAFDOtbypzcuray4wtER3pWghRFkl/Ygck3r6s=
+github.com/go-compressions/appleoracle v0.3.0/go.mod h1:oKtBkLzNNzAMRv1EpgO0v22V662XXSf0FkhE46j3OtY=
+github.com/go-compressions/lz4 v0.4.2-0.20261116135952-8524a366bda0 h1:OEwn9skIhmEVXTnUX4T3IGsEEgNJab9PmBbAkoynSAM=
+github.com/go-compressions/lz4 v0.4.2-0.20261116135952-8524a366bda0/go.mod h1:/SiFQqIBd2i+rm4zVmLUI1PEDYR9mG/iyVtMb6EZHhc=
 github.com/go-encryptions/ccm v0.1.0 h1:kVq0WlU0U+CZIy/pa64MXgBWuJrv/0jot0H8HJAJx2o=
 github.com/go-encryptions/ccm v0.1.0/go.mod h1:N6dSqzbwzd+65hl2B8C/8S0avlWhGCbfY1DdAXSm0vo=
 github.com/go-encryptions/zfscrypt v0.0.0-20261110170137-b5b9a4ee0567 h1:ICnZaXwrFo7A9eA1MMtrnK3SdzP2dxdJVCEAIrIRl3Q=
@@ -8,11 +12,15 @@ github.com/go-filesystems/kerneljudge v0.3.0 h1:PBsqm0gmsLcy+zFLBLwxAcQ5/EdmNt4r
 github.com/go-filesystems/kerneljudge v0.3.0/go.mod h1:SK6ri2WMRBATCd+RUhsOn+gLCy+F41a1VGebjQECZgs=
 github.com/go-simd/adler32 v0.1.1-0.20261116134556-a00c3fa731d7 h1:ZCmaOnw3RRYX6Ig6QG/13SboCRStHYDWypDeb9EpugM=
 github.com/go-simd/adler32 v0.1.1-0.20261116134556-a00c3fa731d7/go.mod h1:h27t3xEONs9mT8C4LJbGaR2srIk3i5gxNwnEXuEqpHI=
+github.com/go-simd/matchlen v0.5.0 h1:PNEUL78U0nbp5uUUNYo9O6qEPUrPP8xQLYISh+jIUeo=
+github.com/go-simd/matchlen v0.5.0/go.mod h1:VU2nigACIuhFKuK2ZyWUIlQLLPzkzAxSz6L+VH7aIL8=
 github.com/go-volumes/gpt v0.3.0 h1:ZA33VVlmlkA47fFY+BkFylsufqq1TBoASIuBmri+xsw=
 github.com/go-volumes/gpt v0.3.0/go.mod h1:Dha6JL5/mGyDai8tWvZOPYn6pqe75NOtMRYGm3N4Qv8=
 github.com/go-volumes/safeio v0.0.0-20261101001828-0e1734761f39 h1:fwjxetvgv6Q6w60Pn94WolICFLFP/dfPXcjKrGKPI18=
 github.com/go-volumes/safeio v0.0.0-20261101001828-0e1734761f39/go.mod h1:Xitv1BsPmFxrxxlkHNBZ4PIA+5lbf3F6N/+7ecsHFnY=
 github.com/klauspost/compress v1.20.4 h1:dD0v/bvxtjCBqQu6sx1TNWkalEY5lNTIe+HY9w8TeNI=
 github.com/klauspost/compress v1.20.4/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
+github.com/pierrec/lz4/v4 v4.1.33 h1:GjG1TJ1V4IzKP8L96muuuDNpTwd7D+l2ccXrjAbe014=
+github.com/pierrec/lz4/v4 v4.1.33/go.mod h1:7SE9MC2STkNtL4PIwGhjmyVwvILaGI9/COYQNBhKM/c=
 golang.org/x/sys v0.50.0 h1:dkKZEFTEKaLr1sjhs0WiKqoi8Jj5nHbS3Njmx1UoMJs=
 golang.org/x/sys v0.50.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
