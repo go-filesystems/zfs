@@ -229,6 +229,9 @@ symlink `Symlink` writes) and [#54](https://github.com/go-filesystems/zfs/issues
 
 - Single pool; the writer targets a single dataset (the reader also
   navigates nested datasets and multi-vdev/RAID-Z pools)
+- The writer emits fletcher4 checksums only and persists no pool checksum
+  salt: BLAKE3, Skein and Edon-R are read (and verified), never written (a
+  write into a kernel-made salted pool fails before any salted block is made)
 - The writer does not compress or encrypt data blocks; the reader
   decompresses (lz4/gzip/zstd/lzjb/zle) and decrypts (native AES-CCM/GCM)
   transparently
