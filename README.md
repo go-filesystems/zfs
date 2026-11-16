@@ -21,7 +21,8 @@ create, inspect, and modify ZFS filesystems programmatically.
 | MkDir / Delete / Rename | ✅ | Directory operations supported |
 | Snapshots | ✅ | Create via `FS.Snapshot`, read via `OpenSnapshot`, remove via `FS.DestroySnapshot` |
 | Clones | ✅ | Create writable dataset from a snapshot via `FS.Clone`; `FS.Origin` reports the origin; dependent-clone tracking blocks snapshot destroy |
-| Compression | ✅ Read | Transparent decompress on read (lz4 / gzip / zstd / lzjb / zle) |
+| Compression | ✅ Read | Transparent decompress on read (lz4 / gzip / zstd / lzjb / zle); lz4 through the shared `go-compressions/lz4` decoder (2036 MiB/s on a 256 MiB lz4 file in an arm64 VM, the kernel 1768) |
+| Block checksums | ✅ Verified on read | fletcher4, fletcher2, SHA-256 and SHA-512/256 are checked against the block pointer on every read (before decryption and decompression); a damaged block is `ErrChecksum`, never data. BLAKE3, Skein and Edon-R need the pool checksum salt and are read unverified (#59). fletcher4 is `go-simd/adler32/fletcher4` (AVX-512, AVX2, NEON): 23 GB/s on an M4 Max, 45 GB/s on a Ryzen 7950X |
 | Native encryption | ✅ Read | AES-CCM/GCM datasets via `OpenFromDeviceDatasetWithKey` (passphrase or raw wrapping key) |
 | Grow / Resize | ✅ | `FS.Grow` / `FS.GrowTo`; `FS.Resize` dispatches to Grow or Shrink based on the requested size |
 | Shrink | ✅ | `FS.Shrink` / `FS.ShrinkWithMode` — `ShrinkMode_Rebuild` / `ShrinkMode_InPlace` / `ShrinkMode_Auto` (picks InPlace when the pool is snapshot-free, else Rebuild) |
@@ -190,7 +191,7 @@ each refused road). Bounds come from the OpenZFS sources (`zio.c`
 |---|---|
 | block pointer LSIZE / PSIZE | at most `SPA_MAXBLOCKSIZE` (16 MiB), as `zfs_blkptr_verify`; the fields themselves reach 32 MiB |
 | embedded block pointer | LSIZE at most 16 MiB; an uncompressed one cannot be longer than its 112-byte payload |
-| decompression (lz4, lzjb, zle) | the destination must be reachable from the input at the codec's maximum expansion (255:1, 8:1, 256:1); an lz4 match is cut to the destination instead of being generated and thrown away |
+| decompression (lz4, lzjb, zle) | the destination must be reachable from the input at the codec's maximum expansion (255:1, 8:1, 256:1); an lz4 block that would produce more than the logical size is refused (as OpenZFS does) instead of being generated and thrown away |
 | gzip | the destination grows with what the stream produces |
 | zstd | the frame header is parsed and its declared content size must equal the block's logical size, and the size must be reachable at the format's 32768:1 maximum (RFC 8878: 128 KiB per RLE block of 4 bytes), all before the destination is allocated; window and memory capped at 16 MiB |
 | `ReadFile` / `ReadLink` | `dn_maxblkid` is read from the image and a hole costs nothing on disk, so the object is limited to `DefaultMaxReadSize` (1 GiB; `fs.(interface{ SetMaxReadSize(int64) })` changes it) and refused with `ErrTooLarge` before any buffer is sized; the result can never outgrow the limit whatever the block pointers claim |
