@@ -66,6 +66,10 @@ const (
 // 32-byte checksum salt (DMU_POOL_CHECKSUM_SALT, dmu.h:388; read by spa.c:4679-4683).
 const checksumSaltName = "org.illumos:checksum_salt"
 
+// noChecksumSalt is the marker (compared by address) for a pool whose directory
+// has no salt entry: its salted blocks are refused, not skipped.
+var noChecksumSalt = new([32]byte)
+
 // saltedChecksum computes the keyed checksums of OpenZFS: Skein-512-256
 // (abd_checksum_skein_tmpl_init, skein_zfs.c:84), Edon-R with the double-hashed
 // salt block (edonr_zfs.c:78-104) and BLAKE3 in keyed mode (blake3_zfs.c:104).
@@ -168,6 +172,10 @@ func verifyBlockChecksum(bp blkptr, phys []byte, salt *[32]byte) error {
 	var got [4]uint64
 	switch bp.checksumType() {
 	case zioChecksumSkein, zioChecksumEdonR, zioChecksumBlake3:
+		if salt == noChecksumSalt {
+			return fmt.Errorf("%w: type %d block at 0x%X, but the pool directory has no %s entry",
+				ErrChecksum, bp.checksumType(), bp.dvaOffset(0), checksumSaltName)
+		}
 		if salt == nil {
 			// The reader carries no salt (not a pool reader, or the dataset
 			// is still being opened): nothing to key with, unverified.
