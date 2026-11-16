@@ -203,3 +203,49 @@ func TestCorruptBlockIsRefusedOnRead(t *testing.T) {
 		t.Fatalf("Stat through a damaged ZAP block: err = %v, want ErrChecksum", err)
 	}
 }
+
+// zio_checksum.c:514-525: an encrypted non-objset block drops the MAC words, and
+// folds (w0^w2, w1^w3) only for types WITHOUT ZCHECKSUM_FLAG_DEDUP; SHA-256 and
+// SHA-512/256 have it, so their first two words are compared as they are.
+func TestVerifyBlockChecksum_CryptDedupTypesDoNotFold(t *testing.T) {
+	buf := make([]byte, 512)
+	copy(buf, "ciphertext")
+	for _, tc := range []struct {
+		ctype uint8
+		sum   func([]byte) [4]uint64
+	}{{zioChecksumSHA256, sha256Checksum}, {zioChecksumSHA512, sha512Checksum}} {
+		got := tc.sum(buf)
+		bp := makeBlkptrCksum(0, 512, 512, zcompressOff, dmotPlainFileContents, 0, 1, tc.ctype)
+		bp.prop |= blkPropCryptBit
+		bp.cksum = [4]uint64{got[0], got[1], 0xdead, 0xbeef} // unfolded, MAC words ignored
+		if err := verifyBlockChecksum(bp, buf); err != nil {
+			t.Fatalf("type %d: an unfolded truncated checksum was refused: %v", tc.ctype, err)
+		}
+		bp.cksum = [4]uint64{got[0] ^ got[2], got[1] ^ got[3], 0, 0} // the fletcher fold is wrong here
+		if err := verifyBlockChecksum(bp, buf); !errors.Is(err, ErrChecksum) {
+			t.Fatalf("type %d: a folded checksum was accepted: %v", tc.ctype, err)
+		}
+	}
+}
+
+// A damaged first copy of a block that has a second DVA is read from the copy,
+// as the kernel does; with both damaged it is ErrChecksum.
+func TestReadBlockFallsBackToAnotherDVA(t *testing.T) {
+	good := bytes.Repeat([]byte("good block "), 50)[:512]
+	bad := append([]byte(nil), good...)
+	bad[7] ^= 1
+	img := make([]byte, 2048)
+	copy(img[0:], bad)    // DVA 0 at 0: damaged
+	copy(img[512:], good) // DVA 1 at 512
+	bp := makeBlkptrCksum(0, 512, 512, zcompressOff, dmotPlainFileContents, 0, 1, zioChecksumFletch4)
+	bp.dva[1] = makeDVA(512, 512)
+	setBPChecksum(&bp, good)
+	got, err := readBlock(checkedReader{bytes.NewReader(img)}, 0, bp)
+	if err != nil || !bytes.Equal(got, good) {
+		t.Fatalf("the intact copy was not used: %v", err)
+	}
+	copy(img[512:], bad)
+	if _, err := readBlock(checkedReader{bytes.NewReader(img)}, 0, bp); !errors.Is(err, ErrChecksum) {
+		t.Fatalf("both copies damaged: err = %v, want ErrChecksum", err)
+	}
+}

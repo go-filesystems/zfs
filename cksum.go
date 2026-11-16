@@ -144,8 +144,12 @@ func verifyBlockChecksum(bp blkptr, phys []byte) error {
 		// zio_checksum_error_impl (zio_checksum.c:514-525, OpenZFS 2.3.0): the
 		// stored checksum is the 128-bit truncation (w0^w2, w1^w3), the last two
 		// words hold the MAC and are not compared. Objset blocks keep all four.
-		got[0] ^= got[2]
-		got[1] ^= got[3]
+		// Types with ZCHECKSUM_FLAG_DEDUP (SHA-256, SHA-512/256) skip the fold
+		// (zio_checksum.c:516) and only drop the MAC words.
+		if bp.checksumType() == zioChecksumFletch4 || bp.checksumType() == zioChecksumFletch2 {
+			got[0] ^= got[2]
+			got[1] ^= got[3]
+		}
 		got[2], got[3], want[2], want[3] = 0, 0, 0, 0
 	}
 	if got != want {
