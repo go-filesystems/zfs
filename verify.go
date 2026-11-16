@@ -18,7 +18,8 @@ import (
 // whether readBlock checks block checksums.
 type verifyBackend struct {
 	blockBackend
-	on atomic.Bool
+	on   atomic.Bool
+	salt atomic.Pointer[[32]byte] // the pool checksum salt, once read
 }
 
 // verifier is what readBlock asks of its reader.
@@ -28,6 +29,32 @@ func (v *verifyBackend) verifying() bool { return v.on.Load() }
 
 // verifying forwards through the decrypting wrapper.
 func (c *cryptingReader) verifying() bool { return readerVerifies(c.blockBackend) }
+
+// salter carries the pool's checksum salt: the MOS pool directory entry
+// "org.illumos:checksum_salt" keys the Skein, Edon-R and BLAKE3 checksums.
+type salter interface {
+	checksumSalt() *[32]byte
+	setChecksumSalt(*[32]byte)
+}
+
+func (v *verifyBackend) checksumSalt() *[32]byte     { return v.salt.Load() }
+func (v *verifyBackend) setChecksumSalt(s *[32]byte) { v.salt.Store(s) }
+
+// The decrypting wrapper forwards both.
+func (c *cryptingReader) checksumSalt() *[32]byte { return readerSalt(c.blockBackend) }
+func (c *cryptingReader) setChecksumSalt(s *[32]byte) {
+	if sl, ok := c.blockBackend.(salter); ok {
+		sl.setChecksumSalt(s)
+	}
+}
+
+// readerSalt returns the pool checksum salt known to r, nil if none.
+func readerSalt(r io.ReaderAt) *[32]byte {
+	if s, ok := r.(salter); ok {
+		return s.checksumSalt()
+	}
+	return nil
+}
 
 // readerVerifies reports whether reads through r must verify block checksums.
 func readerVerifies(r io.ReaderAt) bool {

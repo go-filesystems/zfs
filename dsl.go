@@ -210,6 +210,19 @@ func openNamedDataset(r io.ReaderAt, partOff int64, rootBP blkptr, childPath str
 	if err != nil {
 		return nil, fmt.Errorf("zfs: pool dir ZAP: %w", err)
 	}
+	// The checksum salt keys Skein, Edon-R and BLAKE3 (spa.c:4679-4683). A
+	// pool without the entry simply has those blocks unverified.
+	if sl, ok := r.(salter); ok {
+		raw, err := zapListAllRaw(r, partOff, poolDirDN)
+		if err != nil {
+			return nil, fmt.Errorf("zfs: pool dir ZAP: %w", err)
+		}
+		if v, ok := raw[checksumSaltName]; ok && len(v) == 32 {
+			salt := new([32]byte)
+			copy(salt[:], v)
+			sl.setChecksumSalt(salt)
+		}
+	}
 	currentDirObjNum, ok := poolDirEntries[dmuPoolRootDataset]
 	if !ok {
 		return nil, fmt.Errorf("zfs: pool dir missing 'root_dataset' key")

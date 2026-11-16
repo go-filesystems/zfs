@@ -1,7 +1,13 @@
 github.com/go-compressions/appleoracle v0.3.0 h1:hNdRkdAFDOtbypzcuray4wtER3pWghRFkl/Ygck3r6s=
 github.com/go-compressions/appleoracle v0.3.0/go.mod h1:oKtBkLzNNzAMRv1EpgO0v22V662XXSf0FkhE46j3OtY=
+github.com/go-compressions/blake3 v0.6.0 h1:BWqYJxvKX1o930y9Fchnkvpj0g90h+NZJH64VnXbITc=
+github.com/go-compressions/blake3 v0.6.0/go.mod h1:ocPCAaI5V+rbOALzK/T1lvN3gvwnhad+vXZBjTz+QhM=
+github.com/go-compressions/edonr v0.1.0 h1:jlvAFjk7xLHR4TViI23TVnQmfdIZ6H6HIEoURbB8lIE=
+github.com/go-compressions/edonr v0.1.0/go.mod h1:g5Q9qKSSOkK8stj2rR/bNdZKILw7w1YqW2kjfMcrL/I=
 github.com/go-compressions/lz4 v0.5.1 h1:MjdpSf28iWe6I+gv6T/KNOiqYb+VzQfajqPZ4eTQnLA=
 github.com/go-compressions/lz4 v0.5.1/go.mod h1:/SiFQqIBd2i+rm4zVmLUI1PEDYR9mG/iyVtMb6EZHhc=
+github.com/go-compressions/skein v0.1.0 h1:XKb1YI0ZK4ph/AxZmlZE+SL/lLoFKgYZFZcUq9u+96c=
+github.com/go-compressions/skein v0.1.0/go.mod h1:D5vsfprmF6P2xIodVajdZVRRlQErI2Y9wSCLMtB/wCo=
 github.com/go-encryptions/ccm v0.1.0 h1:kVq0WlU0U+CZIy/pa64MXgBWuJrv/0jot0H8HJAJx2o=
 github.com/go-encryptions/ccm v0.1.0/go.mod h1:N6dSqzbwzd+65hl2B8C/8S0avlWhGCbfY1DdAXSm0vo=
 github.com/go-encryptions/zfscrypt v0.0.0-20261110170137-b5b9a4ee0567 h1:ICnZaXwrFo7A9eA1MMtrnK3SdzP2dxdJVCEAIrIRl3Q=

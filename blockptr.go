@@ -362,7 +362,7 @@ func readBlock(r io.ReaderAt, partOff int64, bp blkptr) ([]byte, error) {
 		if !readerVerifies(r) {
 			break
 		}
-		verr := verifyBlockChecksum(bp, raw)
+		verr := verifyBlockChecksum(bp, raw, readerSalt(r))
 		if verr == nil {
 			break
 		}
