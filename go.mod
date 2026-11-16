@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/go-compressions/blake3 v0.6.0
-	github.com/go-compressions/edonr v0.2.0
+	github.com/go-compressions/edonr v0.3.0
 	github.com/go-compressions/lz4 v0.5.1
 	github.com/go-compressions/skein v0.1.0
 	github.com/go-encryptions/zfscrypt v0.0.0-20261110170137-b5b9a4ee0567
