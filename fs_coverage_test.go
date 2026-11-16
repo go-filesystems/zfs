@@ -505,6 +505,16 @@ func TestListDir_SymlinkTypeEntry(t *testing.T) {
 	if _, err := fs.f.WriteAt(zapData, fs.partOffset+bp.dvaOffset(0)); err != nil {
 		t.Fatalf("WriteAt: %v", err)
 	}
+	// A block edited behind the writer's back needs its checksum chain
+	// recomputed, or the checked read refuses it.
+	setBPChecksum(&bp, zapData)
+	rootDN.setBlkptrAt(0, bp)
+	if err := fs.writeDnode(rootObjNum, rootDN); err != nil {
+		t.Fatalf("writeDnode: %v", err)
+	}
+	if err := fs.commitUberblock(); err != nil {
+		t.Fatalf("commitUberblock: %v", err)
+	}
 	entries, err := fs.ListDir("/")
 	if err != nil {
 		t.Fatalf("ListDir: %v", err)

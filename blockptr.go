@@ -352,6 +352,15 @@ func readBlock(r io.ReaderAt, partOff int64, bp blkptr) ([]byte, error) {
 		return nil, fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
 	}
 
+	// The kernel verifies every block it reads against the checksum in the
+	// pointing blkptr and refuses a mismatch (EIO); so do we, before the bytes
+	// are decrypted, decompressed or returned.
+	if readerVerifies(r) {
+		if err := verifyBlockChecksum(bp, raw); err != nil {
+			return nil, err
+		}
+	}
+
 	// Only genuinely-encrypted blocks (BP_IS_ENCRYPTED) are decrypted.
 	// Authenticated and indirect-MAC-checksum blocks also set the crypt
 	// bit but store their bodies in plaintext, so they fall straight

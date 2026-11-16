@@ -9,7 +9,6 @@ package filesystem_zfs
 import (
 	"fmt"
 	"io"
-	"os"
 
 	filesystem "github.com/go-filesystems/interface"
 	"github.com/go-volumes/safeio"
@@ -26,9 +25,10 @@ func (fs *zfsFS) OpenFile(path string) (filesystem.File, error) {
 	path = cleanPath(path)
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	defer fs.verifyReads()()
 	objNum, err := fs.zplDS.lookupPath(fs.f, fs.partOffset, path)
 	if err != nil {
-		return nil, &os.PathError{Op: "open", Path: path, Err: errNotFound}
+		return nil, lookupErr("open", path, err)
 	}
 	dn, err := fs.zplDS.zplOS.readObject(objNum)
 	if err != nil {
@@ -94,6 +94,7 @@ func (f *zfsFile) ReadAt(p []byte, off int64) (int, error) {
 func (f *zfsFile) fill(dst []byte, off uint64) error {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
+	defer f.fs.verifyReads()()
 	bs := uint64(f.blkSz)
 	hi := off + uint64(len(dst))
 	for blk := off / bs; blk*bs < hi; blk++ {

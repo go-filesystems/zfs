@@ -35,6 +35,7 @@ package filesystem_zfs
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
@@ -88,7 +89,10 @@ func OpenFromDeviceDatasetWithKey(dev BlockBackend, partIndex int, datasetPath s
 		dev.Close()
 		return nil, err
 	}
-	fs := &zfsFS{f: dev, partOffset: off + vdevLabelStartSize, info: info, labelOffset: off}
+	vb := &verifyBackend{blockBackend: dev}
+	vb.on.Store(true) // the open itself reads checked blocks
+	defer vb.on.Store(false)
+	fs := &zfsFS{f: vb, vb: vb, partOffset: off + vdevLabelStartSize, info: info, labelOffset: off}
 	fs.curTxg = info.TransactionGroup
 
 	// Read the pool's root block pointer (uberblock.ub_rootbp) once; both
@@ -110,14 +114,14 @@ func OpenFromDeviceDatasetWithKey(dev BlockBackend, partIndex int, datasetPath s
 	}
 	// Replace fs.f with the crypting wrapper so every subsequent
 	// readBlock sees the crypt context.
-	fs.f = &cryptingReader{blockBackend: dev, crypt: fs.crypt}
+	fs.f = &cryptingReader{blockBackend: vb, crypt: fs.crypt}
 
 	if ds, e3 := openNamedDataset(fs.f, fs.partOffset, rootBP, datasetPath); e3 == nil {
 		fs.zplDS = ds
 		if sz, e4 := fs.f.Size(); e4 == nil {
 			fs.initAllocator(sz)
 		}
-	} else if datasetPath != "" {
+	} else if datasetPath != "" || errors.Is(e3, ErrChecksum) {
 		fs.f.Close()
 		return nil, fmt.Errorf("zfs: open dataset %q: %w", datasetPath, e3)
 	}
