@@ -16,6 +16,7 @@ package filesystem_zfs
 //   root dir object = ZAP of directory entries
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -209,6 +210,27 @@ func openNamedDataset(r io.ReaderAt, partOff int64, rootBP blkptr, childPath str
 	poolDirEntries, err := zapListAll(r, partOff, poolDirDN)
 	if err != nil {
 		return nil, fmt.Errorf("zfs: pool dir ZAP: %w", err)
+	}
+	// The checksum salt keys Skein, Edon-R and BLAKE3 (spa.c:4679-4691): a
+	// longer entry fails the pool load (EOVERFLOW), a shorter one fills the
+	// start of a zeroed salt, and an absent one means a random salt, against
+	// which no salted block of the pool can verify (it reads as ErrChecksum).
+	if sl, ok := r.(salter); ok {
+		raw, err := zapListAllRaw(r, partOff, poolDirDN)
+		if err != nil {
+			return nil, fmt.Errorf("zfs: pool dir ZAP: %w", err)
+		}
+		salt := new([32]byte)
+		if v, ok := raw[checksumSaltName]; !ok {
+			if _, err := rand.Read(salt[:]); err != nil {
+				return nil, fmt.Errorf("zfs: random checksum salt: %w", err)
+			}
+		} else if len(v) > len(salt) {
+			return nil, fmt.Errorf("zfs: pool checksum salt is %d bytes, at most %d allowed", len(v), len(salt))
+		} else {
+			copy(salt[:], v)
+		}
+		sl.setChecksumSalt(salt)
 	}
 	currentDirObjNum, ok := poolDirEntries[dmuPoolRootDataset]
 	if !ok {

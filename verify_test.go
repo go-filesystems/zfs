@@ -56,11 +56,94 @@ func TestVerifyBlockChecksum_RefusesMismatch(t *testing.T) {
 	}
 }
 
-// A checksum type the driver cannot compute is not verified (and not refused).
-func TestVerifyBlockChecksum_UnsupportedTypeReads(t *testing.T) {
-	const blake3 = 14
-	if err := checkedBlock(t, blake3, []byte("x"), func(bp *blkptr) { bp.cksum = [4]uint64{1, 2, 3, 4} }); err != nil {
-		t.Fatalf("an unsupported checksum type must read as before: %v", err)
+// A salted checksum type of a pool whose salt is unknown is not verified (and
+// not refused).
+func TestVerifyBlockChecksum_SaltedWithoutSaltReads(t *testing.T) {
+	for _, ct := range []uint8{zioChecksumSkein, zioChecksumEdonR, zioChecksumBlake3} {
+		if err := checkedBlock(t, ct, []byte("x"), func(bp *blkptr) { bp.cksum = [4]uint64{1, 2, 3, 4} }); err != nil {
+			t.Fatalf("type %d without a salt must read as before: %v", ct, err)
+		}
+	}
+}
+
+// saltedReader is checkedReader plus a pool checksum salt.
+type saltedReader struct {
+	checkedReader
+	salt *[32]byte
+}
+
+func (s saltedReader) checksumSalt() *[32]byte   { return s.salt }
+func (s saltedReader) setChecksumSalt(*[32]byte) {}
+
+func testSalt() *[32]byte {
+	var s [32]byte
+	for i := range s {
+		s[i] = byte(0xA0 + i)
+	}
+	return &s
+}
+
+// Skein, Edon-R and BLAKE3 are keyed with the pool salt: a matching block reads,
+// every flipped bit of every checksum word is refused, a different salt is refused.
+func TestVerifyBlockChecksum_Salted(t *testing.T) {
+	buf := make([]byte, 512)
+	copy(buf, "salted block")
+	for _, ct := range []uint8{zioChecksumSkein, zioChecksumEdonR, zioChecksumBlake3} {
+		bp := makeBlkptrCksum(0, 512, 512, zcompressOff, dmotPlainFileContents, 0, 1, ct)
+		bp.cksum = saltedChecksum(ct, buf, testSalt())
+		if err := verifyBlockChecksum(bp, buf, testSalt()); err != nil {
+			t.Fatalf("type %d: matching block refused: %v", ct, err)
+		}
+		for w := 0; w < 4; w++ {
+			bad := bp
+			bad.cksum[w] ^= 1
+			if err := verifyBlockChecksum(bad, buf, testSalt()); !errors.Is(err, ErrChecksum) {
+				t.Fatalf("type %d word %d: %v", ct, w, err)
+			}
+		}
+		other := *testSalt()
+		other[0] ^= 1
+		if err := verifyBlockChecksum(bp, buf, &other); !errors.Is(err, ErrChecksum) {
+			t.Fatalf("type %d: another pool's salt accepted: %v", ct, err)
+		}
+		// through readBlock, with the reader carrying the salt
+		rd := saltedReader{checkedReader{bytes.NewReader(buf)}, testSalt()}
+		if _, err := readBlock(rd, 0, bp); err != nil {
+			t.Fatalf("type %d: readBlock: %v", ct, err)
+		}
+		buf[3] ^= 1
+		if _, err := readBlock(rd, 0, bp); !errors.Is(err, ErrChecksum) {
+			t.Fatalf("type %d: damaged block read: %v", ct, err)
+		}
+		buf[3] ^= 1
+	}
+}
+
+// Encrypted non-objset blocks: Edon-R (salted, no DEDUP flag) folds like
+// fletcher, Skein and BLAKE3 (DEDUP) do not (zio_checksum.c:187-207, 514-525).
+func TestVerifyBlockChecksum_SaltedCrypt(t *testing.T) {
+	buf := make([]byte, 512)
+	copy(buf, "ciphertext")
+	for _, tc := range []struct {
+		ct   uint8
+		fold bool
+	}{{zioChecksumSkein, false}, {zioChecksumBlake3, false}, {zioChecksumEdonR, true}} {
+		got := saltedChecksum(tc.ct, buf, testSalt())
+		bp := makeBlkptrCksum(0, 512, 512, zcompressOff, dmotPlainFileContents, 0, 1, tc.ct)
+		bp.prop |= blkPropCryptBit
+		right := [4]uint64{got[0], got[1], 0xdead, 0xbeef}
+		wrong := [4]uint64{got[0] ^ got[2], got[1] ^ got[3], 0, 0}
+		if tc.fold {
+			right, wrong = wrong, right
+		}
+		bp.cksum = right
+		if err := verifyBlockChecksum(bp, buf, testSalt()); err != nil {
+			t.Fatalf("type %d: correct truncation refused: %v", tc.ct, err)
+		}
+		bp.cksum = wrong
+		if err := verifyBlockChecksum(bp, buf, testSalt()); !errors.Is(err, ErrChecksum) {
+			t.Fatalf("type %d: wrong truncation accepted: %v", tc.ct, err)
+		}
 	}
 }
 
@@ -83,17 +166,17 @@ func TestVerifyBlockChecksum_CryptTruncation(t *testing.T) {
 	bp := makeBlkptrCksum(0, 512, 512, zcompressOff, dmotPlainFileContents, 0, 1, zioChecksumFletch4)
 	bp.prop |= blkPropCryptBit
 	bp.cksum = [4]uint64{got[0] ^ got[2], got[1] ^ got[3], 0xdead, 0xbeef} // MAC words are not compared
-	if err := verifyBlockChecksum(bp, buf); err != nil {
+	if err := verifyBlockChecksum(bp, buf, nil); err != nil {
 		t.Fatalf("encrypted block with a correct truncated checksum was refused: %v", err)
 	}
 	bp.cksum[0] ^= 1
-	if err := verifyBlockChecksum(bp, buf); !errors.Is(err, ErrChecksum) {
+	if err := verifyBlockChecksum(bp, buf, nil); !errors.Is(err, ErrChecksum) {
 		t.Fatalf("encrypted block with a wrong truncated checksum: %v", err)
 	}
 	obj := makeBlkptrCksum(0, 512, 512, zcompressOff, dmotObjset, 0, 1, zioChecksumFletch4)
 	obj.prop |= blkPropCryptBit
 	obj.cksum = [4]uint64{got[0] ^ got[2], got[1] ^ got[3], 0, 0}
-	if err := verifyBlockChecksum(obj, buf); !errors.Is(err, ErrChecksum) {
+	if err := verifyBlockChecksum(obj, buf, nil); !errors.Is(err, ErrChecksum) {
 		t.Fatalf("an objset block compares all four words: %v", err)
 	}
 }
@@ -218,11 +301,11 @@ func TestVerifyBlockChecksum_CryptDedupTypesDoNotFold(t *testing.T) {
 		bp := makeBlkptrCksum(0, 512, 512, zcompressOff, dmotPlainFileContents, 0, 1, tc.ctype)
 		bp.prop |= blkPropCryptBit
 		bp.cksum = [4]uint64{got[0], got[1], 0xdead, 0xbeef} // unfolded, MAC words ignored
-		if err := verifyBlockChecksum(bp, buf); err != nil {
+		if err := verifyBlockChecksum(bp, buf, nil); err != nil {
 			t.Fatalf("type %d: an unfolded truncated checksum was refused: %v", tc.ctype, err)
 		}
 		bp.cksum = [4]uint64{got[0] ^ got[2], got[1] ^ got[3], 0, 0} // the fletcher fold is wrong here
-		if err := verifyBlockChecksum(bp, buf); !errors.Is(err, ErrChecksum) {
+		if err := verifyBlockChecksum(bp, buf, nil); !errors.Is(err, ErrChecksum) {
 			t.Fatalf("type %d: a folded checksum was accepted: %v", tc.ctype, err)
 		}
 	}

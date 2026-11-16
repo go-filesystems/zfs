@@ -38,6 +38,9 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/go-compressions/blake3"
+	"github.com/go-compressions/edonr"
+	"github.com/go-compressions/skein"
 	simdfletcher4 "github.com/go-simd/adler32/fletcher4"
 )
 
@@ -54,7 +57,42 @@ const (
 	zioChecksumFletch4 = 7
 	zioChecksumSHA256  = 8
 	zioChecksumSHA512  = 11 // SHA-512/256 (sha2_zfs.c: SHA2Init(SHA512_256))
+	zioChecksumSkein   = 12 // Skein-512-256 keyed with the pool salt (skein_zfs.c)
+	zioChecksumEdonR   = 13 // Edon-R 512 keyed with the pool salt (edonr_zfs.c)
+	zioChecksumBlake3  = 14 // BLAKE3 keyed with the pool salt (blake3_zfs.c)
 )
+
+// checksumSaltName is the MOS object directory entry holding the pool's
+// 32-byte checksum salt (DMU_POOL_CHECKSUM_SALT, dmu.h:388; read by spa.c:4679-4683).
+const checksumSaltName = "org.illumos:checksum_salt"
+
+// saltedChecksum computes the keyed checksums of OpenZFS: Skein-512-256
+// (abd_checksum_skein_tmpl_init, skein_zfs.c:84), Edon-R with the double-hashed
+// salt block (edonr_zfs.c:78-104) and BLAKE3 in keyed mode (blake3_zfs.c:104).
+// Each digest is stored as its raw bytes, so on a little-endian pool the words
+// are the little-endian readings of the digest (skein_zfs.c:53, blake3_zfs.c:61).
+func saltedChecksum(ctype uint8, buf []byte, salt *[32]byte) [4]uint64 {
+	var sum []byte
+	switch ctype {
+	case zioChecksumSkein:
+		d := skein.New(256, salt[:])
+		d.Write(buf)
+		sum = d.Sum(nil)
+	case zioChecksumEdonR:
+		d := edonr.NewKeyed(salt[:])
+		d.Write(buf)
+		sum = d.Sum(nil)[:32]
+	default:
+		h := blake3.NewKeyed(*salt)
+		h.Write(buf)
+		sum = h.Sum(nil)
+	}
+	var c [4]uint64
+	for i := range c {
+		c[i] = binary.LittleEndian.Uint64(sum[i*8:])
+	}
+	return c
+}
 
 // fletcher4 computes the ZFS fletcher4 checksum over buf and returns the
 // four 64-bit accumulators (a, b, c, d), exactly as
@@ -116,18 +154,26 @@ var ErrChecksum = errors.New("zfs: block checksum mismatch")
 // verifyBlockChecksum checks the physical bytes `phys` of the block `bp` points
 // to against bp.cksum, as zio_checksum_verify does on every read.
 //
-// Verified: fletcher4, fletcher2, SHA-256 and SHA-512/256 on little-endian block
-// pointers. Not verified: Skein, Edon-R and BLAKE3, which OpenZFS keys with the
-// pool's checksum salt (the MOS object directory entry
-// "org.illumos:checksum_salt", spa.c:4679-4683, dmu.h:388) that this driver does
-// not read yet, and a big-endian pool: those blocks are returned as before.
+// Verified: fletcher4, fletcher2, SHA-256, SHA-512/256 and, keyed with the pool's
+// checksum salt (MOS object directory entry "org.illumos:checksum_salt",
+// spa.c:4679-4683, dmu.h:388, read when the dataset is opened), Skein, Edon-R and
+// BLAKE3, on little-endian block pointers. Not verified: a big-endian pool. A
+// pool whose directory carries no salt gets a random one, as in the kernel, so its
+// salted blocks fail; a nil salt (a reader that carries none) skips them.
 // OFF and embedded block pointers carry no checksum.
-func verifyBlockChecksum(bp blkptr, phys []byte) error {
+func verifyBlockChecksum(bp blkptr, phys []byte, salt *[32]byte) error {
 	if bp.isEmbedded() || bp.prop&bpLEBit == 0 {
 		return nil
 	}
 	var got [4]uint64
 	switch bp.checksumType() {
+	case zioChecksumSkein, zioChecksumEdonR, zioChecksumBlake3:
+		if salt == nil {
+			// The reader carries no salt (not a pool reader, or the dataset
+			// is still being opened): nothing to key with, unverified.
+			return nil
+		}
+		got = saltedChecksum(bp.checksumType(), phys, salt)
 	case zioChecksumFletch4:
 		got = fletcher4(phys)
 	case zioChecksumFletch2:
@@ -144,9 +190,12 @@ func verifyBlockChecksum(bp blkptr, phys []byte) error {
 		// zio_checksum_error_impl (zio_checksum.c:514-525, OpenZFS 2.3.0): the
 		// stored checksum is the 128-bit truncation (w0^w2, w1^w3), the last two
 		// words hold the MAC and are not compared. Objset blocks keep all four.
-		// Types with ZCHECKSUM_FLAG_DEDUP (SHA-256, SHA-512/256) skip the fold
-		// (zio_checksum.c:516) and only drop the MAC words.
-		if bp.checksumType() == zioChecksumFletch4 || bp.checksumType() == zioChecksumFletch2 {
+		// Types with ZCHECKSUM_FLAG_DEDUP (SHA-256, SHA-512/256, Skein, BLAKE3:
+		// zio_checksum.c:187-207) skip the fold (zio_checksum.c:516) and only
+		// drop the MAC words; fletcher2/4 and Edon-R (salted but not DEDUP,
+		// zio_checksum.c:202) fold.
+		switch bp.checksumType() {
+		case zioChecksumFletch4, zioChecksumFletch2, zioChecksumEdonR:
 			got[0] ^= got[2]
 			got[1] ^= got[3]
 		}
