@@ -157,8 +157,9 @@ var ErrChecksum = errors.New("zfs: block checksum mismatch")
 // Verified: fletcher4, fletcher2, SHA-256, SHA-512/256 and, keyed with the pool's
 // checksum salt (MOS object directory entry "org.illumos:checksum_salt",
 // spa.c:4679-4683, dmu.h:388, read when the dataset is opened), Skein, Edon-R and
-// BLAKE3, on little-endian block pointers. Not verified: a big-endian pool, and
-// the salted types of a pool whose directory carries no salt.
+// BLAKE3, on little-endian block pointers. Not verified: a big-endian pool. A
+// pool whose directory carries no salt gets a random one, as in the kernel, so its
+// salted blocks fail; a nil salt (a reader that carries none) skips them.
 // OFF and embedded block pointers carry no checksum.
 func verifyBlockChecksum(bp blkptr, phys []byte, salt *[32]byte) error {
 	if bp.isEmbedded() || bp.prop&bpLEBit == 0 {
@@ -168,8 +169,8 @@ func verifyBlockChecksum(bp blkptr, phys []byte, salt *[32]byte) error {
 	switch bp.checksumType() {
 	case zioChecksumSkein, zioChecksumEdonR, zioChecksumBlake3:
 		if salt == nil {
-			// The pool has no checksum salt entry (or it is not read yet):
-			// nothing to key with, the block is returned unverified.
+			// The reader carries no salt (not a pool reader, or the dataset
+			// is still being opened): nothing to key with, unverified.
 			return nil
 		}
 		got = saltedChecksum(bp.checksumType(), phys, salt)
