@@ -43,6 +43,21 @@ func rpRun(args ...string) (string, error) {
 	return string(out), err
 }
 
+// rpExport exports the pool, retrying while the kernel still says it is busy
+// (a just-closed file or the unmount can lag by a moment, more so on a busy host).
+func rpExport(t *testing.T) {
+	t.Helper()
+	var out string
+	var err error
+	for range 10 {
+		if out, err = rpRun("zpool", "export", rpPool); err == nil {
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	t.Fatalf("zpool export: %v\n%s", err, out)
+}
+
 func rpMust(t *testing.T, args ...string) {
 	t.Helper()
 	if out, err := rpRun(args...); err != nil {
@@ -155,7 +170,7 @@ func TestKernelJudgeReadPath(t *testing.T) {
 				t.Fatal(err)
 			}
 			f.Close()
-			rpMust(t, "zpool", "export", rpPool)
+			rpExport(t)
 			defer rpRun("zpool", "export", rpPool)
 			imp := func() { rpMust(t, "zpool", "import", "-d", dir, "-o", "readonly=on", rpPool) }
 			dropCaches := func() { os.WriteFile("/proc/sys/vm/drop_caches", []byte("3"), 0) }
@@ -188,7 +203,7 @@ func TestKernelJudgeReadPath(t *testing.T) {
 						t.Fatalf("kernel read %d: %v", n, err)
 					}
 					add(&seq[kernel], float64(n)/(1<<20)/el.Seconds())
-					rpMust(t, "zpool", "export", rpPool)
+					rpExport(t)
 					imp()
 					fk, _ := os.Open(filepath.Join(mnt, "large.bin"))
 					rd := func(p []byte, off int64) error {
@@ -207,7 +222,7 @@ func TestKernelJudgeReadPath(t *testing.T) {
 					rpRandom(rd)
 					add(&warm[kernel], rpReads/time.Since(start).Seconds())
 					fk.Close()
-					rpMust(t, "zpool", "export", rpPool)
+					rpExport(t)
 
 					for _, w := range []int{par, serial} {
 						workers := 0
