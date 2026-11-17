@@ -256,6 +256,14 @@ type indirectCache struct {
 		bp   blkptr
 		data []byte
 	}
+	// shared, when set, is the pool's decoded-record cache: every indirect block
+	// read is left in it, keyed by its block pointer, so a random walk over an
+	// object with several indirect blocks at one level (a 256 MiB file of 128 KiB
+	// records has two L1 blocks of 1024 pointers) reads and verifies each once
+	// instead of every time the walk changes block. This is the kernel's dbuf
+	// cache of indirect blocks (module/zfs/dbuf.c, dbuf_findbp: the parent comes
+	// from dbuf_hold_impl, which looks in the dbuf hash first).
+	shared *dataCache
 }
 
 const indirectCacheMax = 1 << 20
@@ -268,9 +276,18 @@ func (c *indirectCache) read(r io.ReaderAt, partOff int64, bp blkptr, level int)
 	if e := &c.ent[level]; e.ok && e.bp == bp {
 		return e.data, nil
 	}
+	if c.shared != nil {
+		if data, ok := c.shared.Get(bp); ok {
+			c.ent[level].ok, c.ent[level].bp, c.ent[level].data = true, bp, data
+			return data, nil
+		}
+	}
 	data, err := readBlock(r, partOff, bp)
 	if err != nil {
 		return nil, err
+	}
+	if c.shared != nil {
+		c.shared.Put(bp, data) // verified by readBlock: the cache never holds an unverified body
 	}
 	if len(data) <= indirectCacheMax {
 		c.ent[level].ok, c.ent[level].bp, c.ent[level].data = true, bp, data
