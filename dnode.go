@@ -397,6 +397,12 @@ const DefaultMaxReadSize int64 = 1 << 30
 // readDnodeDataMax is readDnodeData with an explicit ceiling in bytes
 // (max <= 0 means DefaultMaxReadSize; it never exceeds maxDnodeDataBytes).
 func readDnodeDataMax(r io.ReaderAt, partOff int64, dn *dnode, max int64) ([]byte, error) {
+	return readDnodeDataWorkers(r, partOff, dn, max, 1)
+}
+
+// readDnodeDataWorkers is readDnodeDataMax decoding the records on up to
+// workers goroutines (parread.go); workers <= 1 is the serial walk.
+func readDnodeDataWorkers(r io.ReaderAt, partOff int64, dn *dnode, max int64, workers int) ([]byte, error) {
 	if dn.maxblkid == 0 && dn.blkptrAt(0).isNull() {
 		return nil, nil
 	}
@@ -441,19 +447,39 @@ func readDnodeDataMax(r io.ReaderAt, partOff int64, dn *dnode, max int64) ([]byt
 	// read (and failed): at most a few blocks are reserved.
 	data := make([]byte, 0, int(min(total, 4*int64(blkSz))))
 	var cache indirectCache
-	for i := uint64(0); i < n; i++ {
-		blk, err := readDataBlockCached(r, partOff, dn, i, &cache)
+	// Records are resolved and decoded a window at a time (one record when
+	// serial); the window bounds the decoded records held at once.
+	window := uint64(1)
+	if workers > 1 {
+		window = uint64(workers) * windowPerWorker
+	}
+	var jobs []recordJob
+	for i := uint64(0); i < n; {
+		cnt := min(window, n-i)
+		jobs = jobs[:0]
+		for k := uint64(0); k < cnt; k++ {
+			bp, err := recordBP(r, partOff, dn, i+k, &cache)
+			if err != nil {
+				return nil, err
+			}
+			jobs = append(jobs, recordJob{i + k, bp})
+		}
+		err := decodeRecords(r, partOff, jobs, blkSz, workers, len(jobs), func(k int, blk []byte) error {
+			// A block pointer's lsize is its own (up to 16 MiB) and need not
+			// match the dnode's block size, so n blocks could append n x 16 MiB
+			// to a result sized for n x blkSz. Keep the result inside the
+			// ceiling whatever the pointers say; the walk stops as soon as it
+			// is crossed.
+			if int64(len(data))+int64(len(blk)) > max {
+				return fmt.Errorf("zfs: dnode data block %d takes the object past the ceiling %d: %w", jobs[k].blk, max, safeio.ErrTooLarge)
+			}
+			data = append(data, blk...)
+			return nil
+		})
 		if err != nil {
 			return nil, err
 		}
-		// A block pointer's lsize is its own (up to 16 MiB) and need not match
-		// the dnode's block size, so n blocks could append n x 16 MiB to a
-		// result sized for n x blkSz. Keep the result inside the ceiling
-		// whatever the pointers say; the walk stops as soon as it is crossed.
-		if int64(len(data))+int64(len(blk)) > max {
-			return nil, fmt.Errorf("zfs: dnode data block %d takes the object past the ceiling %d: %w", i, max, safeio.ErrTooLarge)
-		}
-		data = append(data, blk...)
+		i += cnt
 	}
 	return data, nil
 }

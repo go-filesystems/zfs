@@ -61,6 +61,10 @@ type zfsFile struct {
 	size  uint64
 	blkSz int
 	cache indirectCache // guarded by fs.mu
+	// gen is the pool's write count when cache was filled; lastEnd is where the
+	// previous ReadAt ended, to tell a sequential reader (both guarded by fs.mu).
+	gen     uint64
+	lastEnd uint64
 }
 
 func (f *zfsFile) Size() int64 { return int64(f.size) }
@@ -95,22 +99,13 @@ func (f *zfsFile) fill(dst []byte, off uint64) error {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
 	defer f.fs.verifyReads()()
-	bs := uint64(f.blkSz)
-	hi := off + uint64(len(dst))
-	for blk := off / bs; blk*bs < hi; blk++ {
-		if blk > f.dn.maxblkid { // past the last block the dnode has: zeros
-			break
-		}
-		data, err := readDataBlockCached(f.fs.f, f.fs.partOffset, f.dn, blk, &f.cache)
-		if err != nil {
-			return err
-		}
-		start := blk * bs
-		lo, top := max(start, off), min(start+uint64(len(data)), hi)
-		if top <= lo {
-			continue
-		}
-		copy(dst[lo-off:top-off], data[lo-start:top-start])
+	if len(dst) == 0 {
+		return nil
 	}
-	return nil
+	if g := f.fs.writeGen(); g != f.gen { // the pool was written since the indirect blocks were read
+		f.cache, f.gen = indirectCache{}, g
+	}
+	sequential := f.lastEnd == off && off > 0
+	f.lastEnd = off + uint64(len(dst))
+	return f.fillRecords(dst, off, sequential)
 }

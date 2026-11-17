@@ -12,10 +12,12 @@ github.com/go-encryptions/ccm v0.1.0 h1:kVq0WlU0U+CZIy/pa64MXgBWuJrv/0jot0H8HJAJ
 github.com/go-encryptions/ccm v0.1.0/go.mod h1:N6dSqzbwzd+65hl2B8C/8S0avlWhGCbfY1DdAXSm0vo=
 github.com/go-encryptions/zfscrypt v0.0.0-20261110170137-b5b9a4ee0567 h1:ICnZaXwrFo7A9eA1MMtrnK3SdzP2dxdJVCEAIrIRl3Q=
 github.com/go-encryptions/zfscrypt v0.0.0-20261110170137-b5b9a4ee0567/go.mod h1:Ddo9Pu/LLHSUsEpADOOv1UuI04XIW4pqV1tiuYZiiQM=
+github.com/go-filesystems/inflight v0.5.0 h1:JmkGgkT8/DKGLivRxUJkQUJAkOa8TLyB5W3LGIS0fxs=
+github.com/go-filesystems/inflight v0.5.0/go.mod h1:RA1/w2Hbza3HvTw+ZfABSw8lh6zmixEUPsulzbeaarA=
 github.com/go-filesystems/interface v0.6.0 h1:+7nA5FHgs/B03rZ9p81bkm0+6ew9fEntTFK8L5Uu6pk=
 github.com/go-filesystems/interface v0.6.0/go.mod h1:u9v8mvapNV8djzObwCECdyd2g6JBU6HNTR4EAqxOn6U=
-github.com/go-filesystems/kerneljudge v0.3.0 h1:PBsqm0gmsLcy+zFLBLwxAcQ5/EdmNt4rZveWryUaTs0=
-github.com/go-filesystems/kerneljudge v0.3.0/go.mod h1:SK6ri2WMRBATCd+RUhsOn+gLCy+F41a1VGebjQECZgs=
+github.com/go-filesystems/kerneljudge v0.4.0 h1:XQE80TkRErFQv2xu+A8oXeQNeTd63TLgeP9lN0oAonc=
+github.com/go-filesystems/kerneljudge v0.4.0/go.mod h1:SK6ri2WMRBATCd+RUhsOn+gLCy+F41a1VGebjQECZgs=
 github.com/go-simd/adler32 v0.2.0 h1:7TNKGmsKamPotnkEJXDtxZZ7Q1KU7g5/O/N05vNdwXk=
 github.com/go-simd/adler32 v0.2.0/go.mod h1:h27t3xEONs9mT8C4LJbGaR2srIk3i5gxNwnEXuEqpHI=
 github.com/go-simd/matchlen v0.5.0 h1:PNEUL78U0nbp5uUUNYo9O6qEPUrPP8xQLYISh+jIUeo=

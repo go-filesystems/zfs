@@ -20,6 +20,19 @@ type verifyBackend struct {
 	blockBackend
 	on   atomic.Bool
 	salt atomic.Pointer[[32]byte] // the pool checksum salt, once read
+	// writes counts the writes and truncations that went through this backend:
+	// a record decoded before one may be stale after it (see records()).
+	writes atomic.Uint64
+}
+
+func (v *verifyBackend) WriteAt(p []byte, off int64) (int, error) {
+	v.writes.Add(1)
+	return v.blockBackend.WriteAt(p, off)
+}
+
+func (v *verifyBackend) Truncate(size int64) error {
+	v.writes.Add(1)
+	return v.blockBackend.Truncate(size)
 }
 
 // verifier is what readBlock asks of its reader.
