@@ -214,20 +214,20 @@ func TestKernelJudgeReadPath(t *testing.T) {
 						if w == serial {
 							workers = 1
 						}
-						open := func() (parFS, filesystem.File) {
+						open := func() (filesystem.Filesystem, filesystem.File) {
 							ifs, err := Open(img, -1)
 							if err != nil {
 								t.Fatal(err)
 							}
-							p := ifs.(parFS)
-							if workers > 0 {
-								p.SetReadParallelism(workers)
+							// The same file measures a build without the setter (before v0.8.0).
+							if s, ok := ifs.(interface{ SetReadParallelism(int) }); ok && workers > 0 {
+								s.SetReadParallelism(workers)
 							}
-							of, err := p.OpenFile("/large.bin")
+							of, err := ifs.(filesystem.Opener).OpenFile("/large.bin")
 							if err != nil {
 								t.Fatal(err)
 							}
-							return p, of
+							return ifs, of
 						}
 						dropCaches()
 						start := time.Now()

@@ -323,3 +323,30 @@ func TestConcurrentParallelReaders(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// BenchmarkRandomRead4KWarm is the warm random 4 KiB read of the judge's table:
+// every record is cached after the first pass.
+func BenchmarkRandomRead4KWarm(b *testing.B) {
+	const size = 32 << 20
+	ifs, _ := bigZFS(b, size)
+	f, err := ifs.(filesystem.Opener).OpenFile("/big")
+	if err != nil {
+		b.Fatal(err)
+	}
+	r := rand.New(rand.NewPCG(9, 9))
+	offs := make([]int64, 4096)
+	for i := range offs {
+		offs[i] = int64(r.IntN(size/4096)) * 4096
+	}
+	buf := make([]byte, 4096)
+	for _, o := range offs {
+		f.ReadAt(buf, o)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := f.ReadAt(buf, offs[i%len(offs)]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
