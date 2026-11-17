@@ -18,6 +18,7 @@ create, inspect, and modify ZFS filesystems programmatically.
 | Format | ✅ | Creates new pool images via `Format` |
 | ReadFile / WriteFile | ✅ | Basic file I/O supported (ZPL dataset) |
 | OpenFile (`filesystem.Opener`) | ✅ | Positional reads: each `ReadAt` reads only the data blocks of its window (the indirect blocks are cached per handle); holes read as zeros. A 1 MiB read at 66 MiB of a 72 MiB file allocates 1.1 MB through it and 538 MB through `ReadFile` |
+| Parallel reads | ✅ v0.8.0 | The records of a `ReadFile`, of a large or sequential `ReadAt`, are read, checksum-verified (a damaged copy falls back to the block's other DVAs) and decompressed on up to `min(GOMAXPROCS, 8)` goroutines (`inflight.Ordered`); `ReadAt` keeps decoded records in a bounded adaptive cache (`inflight.Cache`). See [Parallel reads](#parallel-reads) |
 | MkDir / Delete / Rename | ✅ | Directory operations supported |
 | Snapshots | ✅ | Create via `FS.Snapshot`, read via `OpenSnapshot`, remove via `FS.DestroySnapshot` |
 | Clones | ✅ | Create writable dataset from a snapshot via `FS.Clone`; `FS.Origin` reports the origin; dependent-clone tracking blocks snapshot destroy |
@@ -206,6 +207,68 @@ Fuzz targets: `FuzzDecompressBlock`, `FuzzReadEmbedded`, `FuzzNVList`,
 `FuzzZAPLeaf`, `FuzzDnodeWalk`, `FuzzVdevLabel` (allocation stays proportional
 to the input), plus the existing `FuzzParseFatZAPLeaf`, `FuzzParseFatZAP`,
 `FuzzReadDnodeData`, `FuzzPartitionOffset` and `FuzzOpen`.
+
+## Parallel reads
+
+Records are independent once their block pointers are known, so a read resolves
+the pointers of a window of records (serial, through the indirect-block cache) and
+hands them to `inflight.Ordered`, which runs `readBlock` on up to
+`min(GOMAXPROCS, 8)` goroutines and returns the records in file order, at most
+that many in flight. `readBlock` does all the work of a record: device read,
+checksum verification (fletcher4 SIMD, SHA-256/512, BLAKE3, Skein, Edon-R), the
+fall-back to another DVA when a copy fails its checksum, decryption, decompression.
+Nothing is skipped to go faster, and the first error in file order is the one
+returned. `ReadFile` decodes a window of 16 records per worker at a time. `ReadAt`
+decodes the records it spans in parallel, and, when it continues the previous
+`ReadAt` (a sequential reader), the next 2 x workers records into a cache shared by
+the pool's open files: `inflight.Cache`, the adaptive cache of squashfs v0.9.0, 8
+MiB to start, growing (to 256 MiB) only when a record it evicted is asked for
+again; any write to the pool empties it. Knobs, by type assertion on the
+`filesystem.Filesystem`: `SetReadParallelism(n)` (n <= 1 decodes serially; default
+`min(GOMAXPROCS, 8)`) and `SetMaxDataCache(bytes)`. A `BlockBackend` you supply
+must allow concurrent `ReadAt` calls, as `io.ReaderAt` asks.
+
+Measured 2026-11-17 in the kerneljudge VM (4 vCPUs, Apple M4 Max host, `chcpu` to
+1 CPU for the 1-CPU rows), one 256 MiB file of word-like text, medians of 5
+interleaved rounds, caches dropped and the pool exported and imported between
+measurements. Every round is bracketed by `kerneljudge.Calibrate`: the 1-CPU runs
+read 650-700 Mops/s and the 4-CPU runs 2550-2600, uniform in every series shown
+(a series that was not is re-measured, not printed). Kernel = OpenZFS 2.4.1
+module. v0.7.3 is the previous release, same harness
+(`readpath_perf_test.go`, `kerneljudge run --perf --test-run KernelJudgeReadPath`).
+
+Sequential read, 1 MiB `ReadAt`, MiB/s:
+
+| data | CPUs | kernel | v0.7.3 | v0.8.0 |
+|---|---:|---:|---:|---:|
+| off, fletcher4 | 1 | 2532 | 4567 | 4459 |
+| off, fletcher4 | 4 | 3865 | 4297 | 5199 |
+| lz4 | 1 | 1694 | 2061 | 2153 |
+| lz4 | 4 | 2072 | 1895 | 3361 |
+| zstd | 1 | 924 | 796 | 795 |
+| zstd | 4 | 1000 | 743 | 1876 |
+
+Random 4 KiB reads, reads/s, cold (first pass after open or import) / warm (second
+pass over the same offsets):
+
+| data | CPUs | kernel | v0.7.3 | v0.8.0 |
+|---|---:|---:|---:|---:|
+| off, fletcher4 | 1 | 121 k / 154 k | 27.5 k / 30.2 k | 51.9 k / 88.1 k |
+| off, fletcher4 | 4 | 90.5 k / 167 k | 25.0 k / 25.8 k | 53.0 k / 96.2 k |
+| lz4 | 1 | 26.1 k / 27.2 k | 14.4 k / 15.2 k | 45.7 k / 88.5 k |
+| lz4 | 4 | 24.2 k / 27.9 k | 13.7 k / 14.3 k | 44.2 k / 93.2 k |
+| zstd | 1 | 9.9 k / 9.9 k | 5.9 k / 5.9 k | 30.2 k / 85.6 k |
+| zstd | 4 | 9.6 k / 10.0 k | 5.3 k / 5.4 k | 30.7 k / 92.7 k |
+
+Reading it: at 1 CPU the sequential figures are unchanged (one worker is the old
+serial walk); at 4 CPUs lz4 is 1.6 x the kernel and zstd 1.9 x. The random-read
+gains come from the record cache (v0.7.3 decoded a whole 128 KiB record for every
+4 KiB read): compressed data is now 1.8 to 3.2 x the kernel cold and 3.3 to 9.2 x
+warm. Still behind the kernel, open: sequential zstd at 1 CPU (795 against 924
+MiB/s) and random reads of uncompressed data (cold 0.43 x, warm 0.57 x at 1 CPU).
+The kernel's own rows differ by up to 9 % between the two runs (3865 against 4254
+MiB/s, uncompressed 4 CPUs, sequential), so differences of that size between two
+columns are not a result; `kerneljudge compare` refuses runs from different regimes.
 
 ## Judged by
 
