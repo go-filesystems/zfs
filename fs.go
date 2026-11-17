@@ -40,6 +40,13 @@ type fsFields struct {
 	// maxRead is the ceiling on a materialised object (0 = DefaultMaxReadSize);
 	// accessed atomically.
 	maxRead int64
+	// Parallel record decoding (parread.go): the worker count (0 = default),
+	// the decoded-record cache with the write count it was filled at (guarded
+	// by mu), and its ceiling.
+	workers atomic.Int32
+	dc      atomic.Pointer[dataCache]
+	dcGen   uint64
+	dcMax   atomic.Int64
 }
 
 // SetMaxReadSize sets the largest object ReadFile / ReadLink will materialise,
@@ -68,7 +75,7 @@ var ErrTooLarge = safeio.ErrTooLarge
 
 // readData reads all data bytes of dn under this filesystem's read limit.
 func (fs *zfsFS) readData(dn *dnode) ([]byte, error) {
-	return readDnodeDataMax(fs.f, fs.partOffset, dn, atomic.LoadInt64(&fs.maxRead))
+	return readDnodeDataWorkers(fs.f, fs.partOffset, dn, atomic.LoadInt64(&fs.maxRead), fs.readWorkers())
 }
 
 // ── Stat ─────────────────────────────────────────────────────────────────────

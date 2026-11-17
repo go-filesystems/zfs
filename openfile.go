@@ -61,6 +61,10 @@ type zfsFile struct {
 	size  uint64
 	blkSz int
 	cache indirectCache // guarded by fs.mu
+	// gen is the pool's write count when cache was filled; lastEnd is where the
+	// previous ReadAt ended, to tell a sequential reader (both guarded by fs.mu).
+	gen     uint64
+	lastEnd uint64
 }
 
 func (f *zfsFile) Size() int64 { return int64(f.size) }
@@ -95,22 +99,26 @@ func (f *zfsFile) fill(dst []byte, off uint64) error {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
 	defer f.fs.verifyReads()()
+	if len(dst) == 0 {
+		return nil
+	}
+	if g := f.fs.writeGen(); g != f.gen { // the pool was written since the indirect blocks were read
+		f.cache, f.gen = indirectCache{}, g
+	}
+	sequential := f.lastEnd == off && off > 0
+	f.lastEnd = off + uint64(len(dst))
+	// A huge read is served window by window, so that the pointers and the
+	// decoded records held at once stay bounded by the worker count, not by the
+	// size of the request; the read-ahead belongs to the last window only.
 	bs := uint64(f.blkSz)
+	span := bs * windowPerWorker * uint64(f.fs.readWorkers())
 	hi := off + uint64(len(dst))
-	for blk := off / bs; blk*bs < hi; blk++ {
-		if blk > f.dn.maxblkid { // past the last block the dnode has: zeros
-			break
-		}
-		data, err := readDataBlockCached(f.fs.f, f.fs.partOffset, f.dn, blk, &f.cache)
-		if err != nil {
+	for pos := off; pos < hi; {
+		end := min(hi, pos/bs*bs+span) // windows end on a record boundary
+		if err := f.fillRecords(dst[pos-off:end-off], pos, sequential && end == hi); err != nil {
 			return err
 		}
-		start := blk * bs
-		lo, top := max(start, off), min(start+uint64(len(data)), hi)
-		if top <= lo {
-			continue
-		}
-		copy(dst[lo-off:top-off], data[lo-start:top-start])
+		pos = end
 	}
 	return nil
 }
