@@ -226,7 +226,16 @@ MiB to start, growing (to 256 MiB) only when a record it evicted is asked for
 again; any write to the pool empties it. Knobs, by type assertion on the
 `filesystem.Filesystem`: `SetReadParallelism(n)` (n <= 1 decodes serially; default
 `min(GOMAXPROCS, 8)`) and `SetMaxDataCache(bytes)`. A `BlockBackend` you supply
-must allow concurrent `ReadAt` calls, as `io.ReaderAt` asks.
+must allow concurrent `ReadAt` calls, as `io.ReaderAt` asks (before v0.8.0 the
+calls were serialised). Bounds and caveats: a read is served a window of 16 x
+workers records at a time; up to that many decoded records (16 MiB each at most)
+are in flight beyond `SetMaxReadSize`'s ceiling, which is checked as records
+arrive; the record cache is per pool handle, up to 256 MiB, and is emptied by a
+write made through the same handle only: a second handle on the same device that
+rewrites a block in place (reachable with `checksum=off`) is not seen, so do not
+read through one handle while another writes the same pool, or call
+`SetMaxDataCache` low. With several workers a damaged record and a damaged
+indirect block in one window report the indirect block's error first.
 
 Measured 2026-11-17 in the kerneljudge VM (4 vCPUs, Apple M4 Max host, `chcpu` to
 1 CPU for the 1-CPU rows), one 256 MiB file of word-like text, medians of 5

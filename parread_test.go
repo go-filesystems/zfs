@@ -350,3 +350,23 @@ func BenchmarkRandomRead4KWarm(b *testing.B) {
 		}
 	}
 }
+
+// SetMaxDataCache(0) means the default, before and after the cache is rebuilt by a write.
+func TestSetMaxDataCacheZeroIsTheDefault(t *testing.T) {
+	ifs, _ := bigZFS(t, 1<<20)
+	fs := ifs.(*zfsFS)
+	f, _ := fs.OpenFile("/big")
+	buf := make([]byte, 4096)
+	f.ReadAt(buf, 0)
+	fs.SetMaxDataCache(0)
+	if err := fs.WriteFile("/w", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.ReadAt(buf, 0) // rebuilds the cache under the setting
+	if got := fs.dcMax.Load(); got != DefaultMaxDataCacheBytes {
+		t.Errorf("dcMax = %d, want the default %d", got, DefaultMaxDataCacheBytes)
+	}
+	if c := fs.dc.Load(); c == nil || c.Len() == 0 {
+		t.Fatal("the rebuilt cache holds nothing")
+	}
+}

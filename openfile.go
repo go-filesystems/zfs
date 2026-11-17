@@ -107,5 +107,18 @@ func (f *zfsFile) fill(dst []byte, off uint64) error {
 	}
 	sequential := f.lastEnd == off && off > 0
 	f.lastEnd = off + uint64(len(dst))
-	return f.fillRecords(dst, off, sequential)
+	// A huge read is served window by window, so that the pointers and the
+	// decoded records held at once stay bounded by the worker count, not by the
+	// size of the request; the read-ahead belongs to the last window only.
+	bs := uint64(f.blkSz)
+	span := bs * windowPerWorker * uint64(f.fs.readWorkers())
+	hi := off + uint64(len(dst))
+	for pos := off; pos < hi; {
+		end := min(hi, pos/bs*bs+span) // windows end on a record boundary
+		if err := f.fillRecords(dst[pos-off:end-off], pos, sequential && end == hi); err != nil {
+			return err
+		}
+		pos = end
+	}
+	return nil
 }

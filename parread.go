@@ -69,6 +69,9 @@ func (fs *zfsFS) readWorkers() int {
 // most (default DefaultMaxDataCacheBytes); n below the starting 8 MiB means 8
 // MiB. A cache already above it shrinks at once.
 func (fs *zfsFS) SetMaxDataCache(n int64) {
+	if n <= 0 { // zero is the default, always, not "the start size" until the next write
+		n = DefaultMaxDataCacheBytes
+	}
 	fs.dcMax.Store(n)
 	if c := fs.dc.Load(); c != nil {
 		c.SetMax(n)
@@ -182,7 +185,9 @@ func (f *zfsFile) fillRecords(dst []byte, off uint64, sequential bool) error {
 	cache := fs.records()
 	copyOut := func(blk uint64, data []byte) {
 		start := blk * bs
-		lo, top := max(start, off), min(start+uint64(len(data)), hi)
+		// A record never covers more than its slot, whatever lsize a hostile
+		// pointer claims: its overflow must not land on a neighbour.
+		lo, top := max(start, off), min(start+uint64(min(len(data), f.blkSz)), hi)
 		if top > lo {
 			copy(dst[lo-off:top-off], data[lo-start:top-start])
 		}
