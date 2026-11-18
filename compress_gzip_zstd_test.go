@@ -163,6 +163,33 @@ func TestZstdDecompress_WrongSize(t *testing.T) {
 	}
 }
 
+// TestZstdDecompress_OverAllocNeverLeaks: the destination is allocated with
+// zstdOverAlloc bytes of slack for the decoder's fast loop. A record whose
+// frame holds up to that many bytes more or less than the block's logical size
+// must still be refused, and the result must not expose the slack.
+func TestZstdDecompress_OverAllocNeverLeaks(t *testing.T) {
+	payload := bytes.Repeat([]byte("zstandard compresses ZFS data blocks well. "), 3000) // 129 000 bytes
+	big := bytes.Repeat(payload, 3)                                                      // 387 000 bytes: a multi-block frame
+	for _, p := range [][]byte{payload, big} {
+		src := makeZFSZstd(t, p, 3)
+		got, err := zstdDecompress(src, len(p))
+		if err != nil || !bytes.Equal(got, p) {
+			t.Fatalf("size %d: %v", len(p), err)
+		}
+		if cap(got) != len(got) {
+			t.Fatalf("size %d: result capacity %d exposes slack past %d", len(p), cap(got), len(got))
+		}
+		for d := 1; d <= zstdOverAlloc+1; d++ {
+			if _, err := zstdDecompress(src, len(p)-d); err == nil {
+				t.Fatalf("size %d: a block %d bytes smaller than its frame was accepted", len(p), d)
+			}
+			if _, err := zstdDecompress(src, len(p)+d); err == nil {
+				t.Fatalf("size %d: a block %d bytes larger than its frame was accepted", len(p), d)
+			}
+		}
+	}
+}
+
 // TestZstdDecompress_RealOpenZFSBlock asserts zstdDecompress against the EXACT
 // on-disk physical (psize) bytes of an L0 EMBEDDED blkptr captured from a real
 // OpenZFS pool (zfs-2.3.2, compression=zstd). Capture procedure:
