@@ -273,8 +273,10 @@ Reading it: at 1 CPU the sequential figures are unchanged (one worker is the old
 serial walk); at 4 CPUs lz4 is 1.6 x the kernel and zstd 1.9 x. The random-read
 gains come from the record cache (v0.7.3 decoded a whole 128 KiB record for every
 4 KiB read): compressed data is now 1.8 to 3.2 x the kernel cold and 3.3 to 9.2 x
-warm. Still behind the kernel, open: sequential zstd at 1 CPU (795 against 924
-MiB/s). The kernel's own rows differ by up to 9 % between the two runs (3865 against
+warm. Sequential zstd at 1 CPU was behind the kernel at v0.8.0 (795 against 924
+MiB/s); re-measured at v0.8.3 on 2026-11-18 (same VM and harness, host 1-minute
+load 5, calibration 684 Mops/s uniform) it reads 1086 MiB/s against the kernel's
+943 (rounds 1058 to 1091 against 865 to 968), 1.15 x. The kernel's own rows differ by up to 9 % between the two runs (3865 against
 4254 MiB/s, uncompressed 4 CPUs, sequential), so differences of that size between
 two columns are not a result; `kerneljudge compare` refuses runs from different
 regimes.
