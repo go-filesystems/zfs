@@ -278,7 +278,9 @@ func (c *indirectCache) read(r io.ReaderAt, partOff int64, bp blkptr, level int)
 	}
 	if c.shared != nil {
 		if data, ok := c.shared.Get(bp); ok {
-			c.ent[level].ok, c.ent[level].bp, c.ent[level].data = true, bp, data
+			if len(data) <= indirectCacheMax {
+				c.ent[level].ok, c.ent[level].bp, c.ent[level].data = true, bp, data
+			}
 			return data, nil
 		}
 	}

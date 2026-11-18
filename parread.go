@@ -76,6 +76,9 @@ func (fs *zfsFS) SetMaxDataCache(n int64) {
 	if c := fs.dc.Load(); c != nil {
 		c.SetMax(n)
 	}
+	if c := fs.ic.Load(); c != nil {
+		c.SetMax(min(n, maxIndirectCacheBytes))
+	}
 }
 
 type dataCache = inflight.Cache[blkptr, []byte]

@@ -299,12 +299,12 @@ the pairs shown), one 256 MiB file:
 
 | data | CPUs | kernel | v0.8.0 | v0.8.1 |
 |---|---:|---:|---:|---:|
-| off, fletcher4 | 1 | 128 k / 176 k | 54 k / 92 k | 143 k / 1.62 M |
+| off, fletcher4 | 1 | 131 k / 183 k | 55 k / 92 k | 145 k / 1.79 M |
 | lz4 | 1 | 27.6 k / 29 k | 48 k / 91 k | 102 k / 1.80 M |
 | zstd | 1 | 10.5 k / 10.6 k | 32 k / 90 k | 51 k / 1.85 M |
 
 At 4 CPUs the same: uncompressed 136-142 k cold, 1.8 M warm. Uncompressed random
-reads are now at or above the kernel (1.1 x cold, 9 x warm: the warm path is a
+reads are now at or above the kernel (1.1 x cold, about 10 x warm: the warm path is a
 lookup and a 4 KiB copy against the kernel's page cache and ARC path). Sequential
 reads were measured in the same pairs; in a harness that runs the random phases
 first in the same process they read 5 to 25 % lower with v0.8.1 while the kernel
