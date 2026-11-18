@@ -238,6 +238,11 @@ const zstdHeaderSize = 8
 // reconstruct an equivalent standard frame before decoding.
 var zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
 
+// zstdOverAlloc is the slack klauspost/compress asks for past the end of the
+// output so that its fast sequence loop may copy whole strides
+// (compressedBlockOverAlloc in the library, 32).
+const zstdOverAlloc = 32
+
 // zstdDecoder is a shared, stateless zstd decoder. klauspost's decoder is safe
 // for concurrent use across goroutines via DecodeAll.
 var zstdDecoder = func() *zstd.Decoder {
@@ -307,12 +312,19 @@ func zstdDecompress(src []byte, dstSize int) ([]byte, error) {
 		return nil, err
 	}
 
-	dst, err := zstdDecoder.DecodeAll(frame, make([]byte, 0, dstSize))
+	// The decoder's fast sequence loop copies in 16-byte strides and needs
+	// zstdOverAlloc bytes of slack past the block's end in the destination; with
+	// a destination of exactly dstSize bytes every record of one block took its
+	// bounds-exact loop (83 % of the time of a 128 KiB record, CPU profile of
+	// BenchmarkZstdRecordGo). The slack is never part of the result: the output
+	// is still limited to the capacity and checked against dstSize, and it is
+	// cut back to dstSize below.
+	dst, err := zstdDecoder.DecodeAll(frame, make([]byte, 0, dstSize+zstdOverAlloc))
 	if err != nil {
 		return nil, fmt.Errorf("zfs: zstd: %w", err)
 	}
 	if len(dst) != dstSize {
 		return nil, fmt.Errorf("zfs: zstd: decompressed %d bytes, want %d", len(dst), dstSize)
 	}
-	return dst, nil
+	return dst[:dstSize:dstSize], nil
 }
