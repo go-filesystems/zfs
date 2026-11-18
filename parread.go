@@ -203,14 +203,18 @@ func (f *zfsFile) fillRecords(dst []byte, off uint64, sequential bool) error {
 		}
 	}
 	// Resolve the pointers; serve what is cached; queue the rest.
+	// A failing pointer does not end the pass at once: the records before it
+	// are decoded first and their error, if any, is the one reported, as the
+	// serial walk would (#71).
 	var jobs []recordJob
+	var ptrErr error
 	for blk := first; blk <= want; blk++ {
 		bp, err := recordBP(fs.f, fs.partOffset, f.dn, blk, &f.cache)
 		if err != nil {
-			if blk > last {
-				break // a pointer past the request: the reader meets it, and its error, when it gets there
-			}
-			return err
+			if blk <= last {
+				ptrErr = err
+			} // else a pointer past the request: the reader meets it, and its error, when it gets there
+			break
 		}
 		if bp.isNull() {
 			continue // a hole: dst is zero already
@@ -224,7 +228,7 @@ func (f *zfsFile) fillRecords(dst []byte, off uint64, sequential bool) error {
 		jobs = append(jobs, recordJob{blk, bp})
 	}
 	if len(jobs) == 0 {
-		return nil
+		return ptrErr
 	}
 	// A read-ahead alone waits for a full batch: when the reader's own records
 	// are all cached and fewer than w are missing, decoding them now would only
@@ -239,7 +243,7 @@ func (f *zfsFile) fillRecords(dst []byte, off uint64, sequential bool) error {
 	if soft == 0 && len(jobs) < w {
 		return nil
 	}
-	return decodeRecords(fs.f, fs.partOffset, jobs, f.blkSz, w, soft, func(k int, data []byte) error {
+	if err := decodeRecords(fs.f, fs.partOffset, jobs, f.blkSz, w, soft, func(k int, data []byte) error {
 		if data == nil {
 			return nil // a read-ahead record that failed: it fails again, in order, when read
 		}
@@ -248,5 +252,8 @@ func (f *zfsFile) fillRecords(dst []byte, off uint64, sequential bool) error {
 			copyOut(jobs[k].blk, data)
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	return ptrErr
 }

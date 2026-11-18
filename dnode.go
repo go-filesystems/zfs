@@ -476,10 +476,14 @@ func readDnodeDataWorkers(r io.ReaderAt, partOff int64, dn *dnode, max int64, wo
 	for i := uint64(0); i < n; {
 		cnt := min(window, n-i)
 		jobs = jobs[:0]
+		// A failing pointer ends the pass, but the records before it are
+		// decoded first and their error wins, as in the serial walk (#71).
+		var ptrErr error
 		for k := uint64(0); k < cnt; k++ {
 			bp, err := recordBP(r, partOff, dn, i+k, &cache)
 			if err != nil {
-				return nil, err
+				ptrErr = err
+				break
 			}
 			jobs = append(jobs, recordJob{i + k, bp})
 		}
@@ -497,6 +501,9 @@ func readDnodeDataWorkers(r io.ReaderAt, partOff int64, dn *dnode, max int64, wo
 		})
 		if err != nil {
 			return nil, err
+		}
+		if ptrErr != nil {
+			return nil, ptrErr
 		}
 		i += cnt
 	}

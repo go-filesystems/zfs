@@ -3,9 +3,12 @@ package filesystem_zfs
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -368,5 +371,93 @@ func TestSetMaxDataCacheZeroIsTheDefault(t *testing.T) {
 	}
 	if c := fs.dc.Load(); c == nil || c.Len() == 0 {
 		t.Fatal("the rebuilt cache holds nothing")
+	}
+}
+
+// A pointer error must not be reported before an earlier record's own error
+// (#71): the serial walk resolves and decodes record by record, so with a
+// damaged record 1010 and a damaged indirect block that holds the pointers of
+// records 1024 and up, it reports record 1010's ErrChecksum. Every worker count
+// and GOMAXPROCS must report that same error. The indirect-block boundary at
+// record 1024 falls inside a ReadFile window for the worker counts whose window
+// (16 x workers) is not a divisor of 1024, hence 3, 5, 6 and 7.
+func TestFirstErrorInFileOrderAcrossPointerAndRecord(t *testing.T) {
+	const nrec, victim, rec = 1040, 1010, 128 << 10
+	img := filepath.Join(t.TempDir(), "pool.img")
+	ifs, err := Format(img, nrec*rec*2+64<<20, FormatConfig{PoolName: "errord"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := offsetPattern(nrec * rec)
+	if err := ifs.WriteFile("/big", want, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fs := ifs.(*zfsFS)
+	obj, err := fs.zplDS.lookupPath(fs.f, fs.partOffset, "/big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dn, err := fs.zplDS.zplOS.readObject(obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dn.nlevels != 3 || dn.nblkptr != 1 {
+		t.Fatalf("geometry nlevels %d nblkptr %d: want 3 levels, 1 root pointer", dn.nlevels, dn.nblkptr)
+	}
+	l2, err := readBlock(fs.f, fs.partOffset, dn.blkptrAt(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ind1 := parseBlkptr(l2[blkptrSize : 2*blkptrSize]) // the L1 block of records 1024..2047
+	bp, err := recordBP(fs.f, fs.partOffset, dn, victim, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recOff := fs.partOffset + bp.dvaOffset(0)
+	indOff := fs.partOffset + ind1.dvaOffset(0)
+	if err := fs.Close(); err != nil {
+		t.Fatal(err)
+	}
+	flipByteAt(t, img, recOff+5)
+	flipByteAt(t, img, indOff+5)
+
+	check := func(t *testing.T, label string, err, serial error) {
+		t.Helper()
+		if !errors.Is(err, ErrChecksum) || err.Error() != serial.Error() {
+			t.Errorf("%s: error %q, want the serial one %q", label, err, serial)
+		}
+	}
+	read := func(w int) (readFile, readAt error) {
+		bad, err := Open(img, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bad.Close()
+		p := asPar(t, bad)
+		p.SetReadParallelism(w)
+		_, readFile = p.ReadFile("/big")
+		f, err := p.OpenFile("/big")
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 31*rec)
+		_, readAt = f.ReadAt(buf, 1000*rec)
+		return
+	}
+	sf, sa := read(1)
+	if !errors.Is(sf, ErrChecksum) || !errors.Is(sa, ErrChecksum) {
+		t.Fatalf("serial: ReadFile %v, ReadAt %v: want ErrChecksum", sf, sa)
+	}
+	if strings.Contains(sf.Error(), "indirect") || strings.Contains(sa.Error(), "indirect") {
+		t.Fatalf("serial reported the pointer error: %v / %v", sf, sa)
+	}
+	for _, procs := range []int{1, 2, 8} {
+		old := runtime.GOMAXPROCS(procs)
+		for _, w := range []int{2, 3, 4, 5, 6, 7, 8} {
+			rf, ra := read(w)
+			check(t, fmt.Sprintf("GOMAXPROCS %d workers %d ReadFile", procs, w), rf, sf)
+			check(t, fmt.Sprintf("GOMAXPROCS %d workers %d ReadAt", procs, w), ra, sa)
+		}
+		runtime.GOMAXPROCS(old)
 	}
 }
