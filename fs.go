@@ -45,6 +45,7 @@ type fsFields struct {
 	// by mu), and its ceiling.
 	workers atomic.Int32
 	dc      atomic.Pointer[dataCache]
+	ic      atomic.Pointer[dataCache] // verified indirect blocks, emptied with dc
 	dcGen   uint64
 	dcMax   atomic.Int64
 }

@@ -76,6 +76,9 @@ func (fs *zfsFS) SetMaxDataCache(n int64) {
 	if c := fs.dc.Load(); c != nil {
 		c.SetMax(n)
 	}
+	if c := fs.ic.Load(); c != nil {
+		c.SetMax(min(n, maxIndirectCacheBytes))
+	}
 }
 
 type dataCache = inflight.Cache[blkptr, []byte]
@@ -95,9 +98,15 @@ func (fs *zfsFS) records() *dataCache {
 			mx = DefaultMaxDataCacheBytes
 		}
 		fs.dc.Store(inflight.NewCache[blkptr, []byte](startDataCacheBytes, mx, recordCost))
+		fs.ic.Store(inflight.NewCache[blkptr, []byte](startDataCacheBytes, min(mx, maxIndirectCacheBytes), recordCost))
 	}
 	return fs.dc.Load()
 }
+
+// maxIndirectCacheBytes bounds the verified indirect blocks a pool keeps: 64
+// MiB is 512 blocks of 128 KiB, each addressing 1024 records, so 64 GiB of file
+// at the default record size before one is evicted.
+const maxIndirectCacheBytes = 64 << 20
 
 // writeGen is the number of writes made through the pool's backend so far.
 func (fs *zfsFS) writeGen() uint64 {
@@ -183,6 +192,7 @@ func (f *zfsFile) fillRecords(dst []byte, off uint64, sequential bool) error {
 		want = min(last+uint64(readAheadFactor*w), f.dn.maxblkid)
 	}
 	cache := fs.records()
+	f.cache.shared = fs.ic.Load()
 	copyOut := func(blk uint64, data []byte) {
 		start := blk * bs
 		// A record never covers more than its slot, whatever lsize a hostile
