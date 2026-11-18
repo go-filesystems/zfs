@@ -274,10 +274,46 @@ serial walk); at 4 CPUs lz4 is 1.6 x the kernel and zstd 1.9 x. The random-read
 gains come from the record cache (v0.7.3 decoded a whole 128 KiB record for every
 4 KiB read): compressed data is now 1.8 to 3.2 x the kernel cold and 3.3 to 9.2 x
 warm. Still behind the kernel, open: sequential zstd at 1 CPU (795 against 924
-MiB/s) and random reads of uncompressed data (cold 0.43 x, warm 0.57 x at 1 CPU).
-The kernel's own rows differ by up to 9 % between the two runs (3865 against 4254
-MiB/s, uncompressed 4 CPUs, sequential), so differences of that size between two
-columns are not a result; `kerneljudge compare` refuses runs from different regimes.
+MiB/s). The kernel's own rows differ by up to 9 % between the two runs (3865 against
+4254 MiB/s, uncompressed 4 CPUs, sequential), so differences of that size between
+two columns are not a result; `kerneljudge compare` refuses runs from different
+regimes.
+
+### Indirect blocks stay cached (v0.8.1)
+
+A random read has to name its record first, and that walks the object's indirect
+blocks. The per-handle cache held one indirect block per level, so on a file of
+more than 128 MiB at the default record size (two or more level-1 blocks of 1024
+pointers) a random read changed block about every other time and read the 128 KiB
+indirect block from the device and verified it again. The kernel looks the parent up
+in the dbuf hash first (`module/zfs/dbuf.c`, `dbuf_findbp` calls `dbuf_hold_impl`,
+which calls `dbuf_find`) and verifies a block once, when it is read into the ARC
+(`module/zfs/zio.c`, `zio_checksum_verify`; an ARC hit is not verified again, `arc.c`
+`arc_read`), as this driver does for records: verification is unchanged. Verified
+indirect blocks now also go to a bounded cache of the pool (8 to 64 MiB, emptied by a
+write exactly as the record cache is), keyed by block pointer.
+
+Random 4 KiB reads, reads/s, cold / warm, medians of 5 interleaved rounds, v0.8.0
+against v0.8.1 in the same session, regimes uniform (`kerneljudge compare` accepted
+the pairs shown), one 256 MiB file:
+
+| data | CPUs | kernel | v0.8.0 | v0.8.1 |
+|---|---:|---:|---:|---:|
+| off, fletcher4 | 1 | 128 k / 176 k | 54 k / 92 k | 143 k / 1.62 M |
+| lz4 | 1 | 27.6 k / 29 k | 48 k / 91 k | 102 k / 1.80 M |
+| zstd | 1 | 10.5 k / 10.6 k | 32 k / 90 k | 51 k / 1.85 M |
+
+At 4 CPUs the same: uncompressed 136-142 k cold, 1.8 M warm. Uncompressed random
+reads are now at or above the kernel (1.1 x cold, 9 x warm: the warm path is a
+lookup and a 4 KiB copy against the kernel's page cache and ARC path). Sequential
+reads were measured in the same pairs; in a harness that runs the random phases
+first in the same process they read 5 to 25 % lower with v0.8.1 while the kernel
+column did not move, and with the random phases left out of both builds they are
+within 4 % (a comparable pair: uncompressed 1 CPU 4642 against 4531 MiB/s), on the
+host with and without a random phase first no difference either. The change touches
+no sequential code path (one cache lookup per 1024 records); the coupling between
+the random phase and the next sequential figure is in the harness, not measured
+further.
 
 ## Judged by
 
