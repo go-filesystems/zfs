@@ -241,7 +241,7 @@ func TestDecodeRecordsFallsBackAndReportsInOrder(t *testing.T) {
 		bp := makeBlkptrCksum(int64(base), rec, rec, zcompressOff, dmotPlainFileContents, 0, 1, zioChecksumFletch4)
 		bp.dva[1] = makeDVA(int64(base+rec), rec)
 		setBPChecksum(&bp, goods[i])
-		jobs[i] = recordJob{uint64(i), bp}
+		jobs[i] = recordJob{blk: uint64(i), bp: bp}
 	}
 	r := checkedReader{bytes.NewReader(img)}
 	for _, w := range []int{1, 2, 4, 8} {

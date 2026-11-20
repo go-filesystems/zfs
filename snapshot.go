@@ -552,6 +552,11 @@ func (fs *zfsFS) walkBlockTreeExtents(bp blkptr, objsetRoot bool, visit func(blk
 		return
 	}
 	visit(bp)
+	// A data block (level 0, not an object set) points at nothing: reading it
+	// would decode every byte of every file of the pool at Open (zfs#73).
+	if bp.level() == 0 && !(objsetRoot && bp.dmuType() == dmotObjset) {
+		return
+	}
 	raw, err := readBlock(fs.f, fs.partOffset, bp)
 	if err != nil {
 		return

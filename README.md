@@ -312,10 +312,19 @@ reads were measured in the same pairs; in a harness that runs the random phases
 first in the same process they read 5 to 25 % lower with v0.8.1 while the kernel
 column did not move, and with the random phases left out of both builds they are
 within 4 % (a comparable pair: uncompressed 1 CPU 4642 against 4531 MiB/s), on the
-host with and without a random phase first no difference either. The change touches
-no sequential code path (one cache lookup per 1024 records); the coupling between
-the random phase and the next sequential figure is in the harness, not measured
-further.
+host with and without a random phase first no difference either. The coupling was
+allocation (zfs#73): `ReadAt` decoded each record into a fresh buffer and copied
+it out, so a sequential pass allocated its own size, and in the 1-CPU guest the
+GC and page faults a random phase leaves behind cost it 10 to 27 %. Records
+stored as they are (no compression, no encryption) of a request of a record or
+more are now read, verified, straight into the caller's buffer the first time
+they are read, and cached only on their second read (admission on second touch,
+`inflight.Cache.Seen`, inflight v0.6.0), so a stream read once allocates nothing and
+a region read again is cached as before (warm whole-record re-read: parity with
+v0.8.3). `Open` no longer decodes the pool's data blocks while looking for the
+allocator's high-water mark. In the VM (one comparable pair, regime 469 Mops/s,
+uncompressed, against v0.8.3) a sequential pass after a random phase went from 3256
+to 4668 MiB/s at 1 CPU and from 3641 to 5349 at 4 CPUs.
 
 ## Judged by
 

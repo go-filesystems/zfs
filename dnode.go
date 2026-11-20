@@ -485,7 +485,7 @@ func readDnodeDataWorkers(r io.ReaderAt, partOff int64, dn *dnode, max int64, wo
 				ptrErr = err
 				break
 			}
-			jobs = append(jobs, recordJob{i + k, bp})
+			jobs = append(jobs, recordJob{blk: i + k, bp: bp})
 		}
 		err := decodeRecords(r, partOff, jobs, blkSz, workers, len(jobs), func(k int, blk []byte) error {
 			// A block pointer's lsize is its own (up to 16 MiB) and need not

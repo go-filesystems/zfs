@@ -8,7 +8,7 @@ require (
 	github.com/go-compressions/lz4 v0.5.1
 	github.com/go-compressions/skein v0.1.0
 	github.com/go-encryptions/zfscrypt v0.1.0
-	github.com/go-filesystems/inflight v0.5.0
+	github.com/go-filesystems/inflight v0.6.0
 	github.com/go-filesystems/interface v0.6.0
 	github.com/go-filesystems/kerneljudge v0.4.0
 	github.com/go-simd/adler32 v0.2.0
