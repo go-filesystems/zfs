@@ -120,6 +120,10 @@ func (fs *zfsFS) writeGen() uint64 {
 type recordJob struct {
 	blk uint64
 	bp  blkptr
+	// into, when set, is the part of the caller's buffer this record fills
+	// whole: a record stored as it is is read straight into it (readBlockInto)
+	// and neither allocated nor cached.
+	into []byte
 }
 
 // decodeRecord is readBlock, with a hole (a null pointer) read as blkSz zeros.
@@ -136,6 +140,11 @@ func decodeRecord(r io.ReaderAt, partOff int64, bp blkptr, blkSz int) ([]byte, e
 // soft on are best effort: their error is swallowed and emit gets nil data.
 func decodeRecords(r io.ReaderAt, partOff int64, jobs []recordJob, blkSz, w, soft int, emit func(k int, data []byte) error) error {
 	one := func(k int) ([]byte, error) {
+		if into := jobs[k].into; into != nil {
+			if ok, err := readBlockInto(r, partOff, jobs[k].bp, into); ok {
+				return nil, err // the bytes are in place: nothing to emit
+			}
+		}
 		data, err := decodeRecord(r, partOff, jobs[k].bp, blkSz)
 		if err != nil && k >= soft {
 			return nil, nil
@@ -219,13 +228,24 @@ func (f *zfsFile) fillRecords(dst []byte, off uint64, sequential bool) error {
 		if bp.isNull() {
 			continue // a hole: dst is zero already
 		}
+		if blk > last && len(dst) >= f.blkSz && storedAsIs(bp) {
+			// A request of a record or more is read straight into its buffer, one
+			// record per worker; nothing to decode ahead (the device read is the
+			// whole cost), and a read-ahead record would be a buffer allocated
+			// only to be copied from. A smaller request still reads ahead.
+			break
+		}
 		if data, ok := cache.Get(bp); ok {
 			if blk <= last {
 				copyOut(blk, data)
 			}
 			continue
 		}
-		jobs = append(jobs, recordJob{blk, bp})
+		job := recordJob{blk: blk, bp: bp}
+		if start := blk * bs; blk <= last && start >= off && start+bs <= hi {
+			job.into = dst[start-off : start-off+bs]
+		}
+		jobs = append(jobs, job)
 	}
 	if len(jobs) == 0 {
 		return ptrErr

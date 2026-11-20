@@ -361,17 +361,21 @@ func (fs *zfsFS) snapshotFullName(snapObj uint64) (string, error) {
 			}
 		}
 	}
-	return fs.poolName() + "@" + name, nil
+	pool, err := fs.poolName()
+	if err != nil {
+		return "", fmt.Errorf("zfs: Origin: read pool label: %w", err)
+	}
+	return pool + "@" + name, nil
 }
 
-// poolName returns the pool's name from its vdev label, or "" if it cannot be
-// read (Origin falls back to a bare "@<snap>" in that case).
-func (fs *zfsFS) poolName() string {
+// poolName returns the pool's name from its vdev label; a label that cannot be
+// read is an error, not a bare "@<snap>" origin.
+func (fs *zfsFS) poolName() (string, error) {
 	li, err := ProbeLabel(fs.f, fs.labelOffset)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return li.PoolName
+	return li.PoolName, nil
 }
 
 // DestroySnapshot removes snapshot snapName of the pool's root dataset. It

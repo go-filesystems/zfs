@@ -319,6 +319,47 @@ func readAtGrowing(r io.ReaderAt, off, n int64) ([]byte, error) {
 	return raw, nil
 }
 
+// storedAsIs is true for a block whose bytes on the device are its content: not
+// null, embedded, gang or encrypted, and neither compressed nor padded.
+func storedAsIs(bp blkptr) bool {
+	if bp.isNull() || bp.isEmbedded() || bp.dvaGang(0) || bpIsEncrypted(bp) || verifyBlkptrSizes(bp) != nil {
+		return false
+	}
+	return bp.psize() == bp.lsize() && bp.lsize() <= firstReadChunk
+}
+
+// readBlockInto is readBlock for a block that is stored as it is (no
+// encryption, no compression, not embedded, not gang): it reads the record
+// straight into dst, which must be exactly lsize bytes, instead of into a
+// buffer of its own, so that a long sequential read allocates nothing per
+// record and does not depend on the state of the Go heap (zfs#73: in a guest
+// where a fresh page costs a hypervisor fault, a pass that allocates its whole
+// size ran 10 % slower after a random phase). It verifies and falls back to the
+// block's other copies exactly as readBlock does. It reports false, having
+// read nothing, when the block does not qualify: the caller uses readBlock.
+func readBlockInto(r io.ReaderAt, partOff int64, bp blkptr, dst []byte) (bool, error) {
+	if !storedAsIs(bp) || int64(len(dst)) != bp.lsize() {
+		return false, nil
+	}
+	psize := bp.psize()
+	for i := 0; ; i++ {
+		offset := partOff + bp.dvaOffset(i)
+		if _, err := r.ReadAt(dst, offset); err != nil {
+			return true, fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
+		}
+		if !readerVerifies(r) {
+			return true, nil
+		}
+		verr := verifyBlockChecksum(bp, dst, readerSalt(r))
+		if verr == nil {
+			return true, nil
+		}
+		if i+1 >= 3 || bp.dva[i+1][0]&0xFFFFFF == 0 || bp.dvaGang(i+1) {
+			return true, verr
+		}
+	}
+}
+
 // readBlock reads the logical content of a block pointer from r.
 // r is the underlying device file, partOff is the partition byte offset.
 // Returns the decompressed lsize bytes.
