@@ -342,22 +342,31 @@ func readBlockInto(r io.ReaderAt, partOff int64, bp blkptr, dst []byte) (bool, e
 		return false, nil
 	}
 	psize := bp.psize()
-	for i := 0; ; i++ {
+	var first error
+	for i := 0; i < 3; i++ {
 		offset := partOff + bp.dvaOffset(i)
-		if _, err := r.ReadAt(dst, offset); err != nil {
-			return true, fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
-		}
-		if !readerVerifies(r) {
+		_, err := r.ReadAt(dst, offset)
+		if err != nil {
+			err = fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
+		} else if !readerVerifies(r) {
+			return true, nil
+		} else if err = verifyBlockChecksum(bp, dst, readerSalt(r)); err == nil {
 			return true, nil
 		}
-		verr := verifyBlockChecksum(bp, dst, readerSalt(r))
-		if verr == nil {
-			return true, nil
+		if first == nil {
+			first = err
 		}
-		if i+1 >= 3 || bp.dva[i+1][0]&0xFFFFFF == 0 || bp.dvaGang(i+1) {
-			return true, verr
+		if !hasNextCopy(bp, i) {
+			break
 		}
 	}
+	return true, first
+}
+
+// hasNextCopy reports whether the block has a copy after DVA i to try:
+// populated and not a gang header, within the three DVAs of a block pointer.
+func hasNextCopy(bp blkptr, i int) bool {
+	return i+1 < 3 && bp.dva[i+1][0]&0xFFFFFF != 0 && !bp.dvaGang(i+1)
 }
 
 // readBlock reads the logical content of a block pointer from r.
@@ -392,25 +401,33 @@ func readBlock(r io.ReaderAt, partOff int64, bp blkptr) ([]byte, error) {
 	// DVAs: ditto blocks, copies=N) before giving up with EIO; so do we, before
 	// the bytes are decrypted, decompressed or returned. Without verification
 	// only the first copy is ever read, as before.
+	// A device read error on a copy counts like a checksum failure on it; when
+	// every copy failed the first error in DVA order is reported.
 	var raw []byte
-	for i := 0; ; i++ {
+	var first error
+	read := false
+	for i := 0; i < 3 && !read; i++ {
 		offset := partOff + bp.dvaOffset(i)
 		var err error
 		raw, err = readAtGrowing(r, offset, psize)
 		if err != nil {
-			return nil, fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
+			err = fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
+		} else if !readerVerifies(r) {
+			read = true
+			continue
+		} else if err = verifyBlockChecksum(bp, raw, readerSalt(r)); err == nil {
+			read = true
+			continue
 		}
-		if !readerVerifies(r) {
+		if first == nil {
+			first = err
+		}
+		if !hasNextCopy(bp, i) {
 			break
 		}
-		verr := verifyBlockChecksum(bp, raw, readerSalt(r))
-		if verr == nil {
-			break
-		}
-		// Another copy to try: populated, not a gang header.
-		if i+1 >= 3 || bp.dva[i+1][0]&0xFFFFFF == 0 || bp.dvaGang(i+1) {
-			return nil, verr
-		}
+	}
+	if !read {
+		return nil, first
 	}
 
 	// Only genuinely-encrypted blocks (BP_IS_ENCRYPTED) are decrypted.
