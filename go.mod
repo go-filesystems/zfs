@@ -14,7 +14,7 @@ require (
 	github.com/go-simd/adler32 v0.2.0
 	github.com/go-volumes/gpt v0.3.0
 	github.com/go-volumes/safeio v0.0.0-20261101001828-0e1734761f39
-	github.com/klauspost/compress v1.20.4
+	github.com/klauspost/compress v1.20.5
 )
 
 require (
