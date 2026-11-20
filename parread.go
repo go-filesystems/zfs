@@ -142,6 +142,9 @@ func decodeRecords(r io.ReaderAt, partOff int64, jobs []recordJob, blkSz, w, sof
 	one := func(k int) ([]byte, error) {
 		if into := jobs[k].into; into != nil {
 			if ok, err := readBlockInto(r, partOff, jobs[k].bp, into); ok {
+				if err != nil {
+					clear(into) // a failed read leaves zeros, not the last bad copy
+				}
 				return nil, err // the bytes are in place: nothing to emit
 			}
 		}

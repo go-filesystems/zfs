@@ -312,10 +312,15 @@ reads were measured in the same pairs; in a harness that runs the random phases
 first in the same process they read 5 to 25 % lower with v0.8.1 while the kernel
 column did not move, and with the random phases left out of both builds they are
 within 4 % (a comparable pair: uncompressed 1 CPU 4642 against 4531 MiB/s), on the
-host with and without a random phase first no difference either. The change touches
-no sequential code path (one cache lookup per 1024 records); the coupling between
-the random phase and the next sequential figure is in the harness, not measured
-further.
+host with and without a random phase first no difference either. The coupling was
+allocation (zfs#73): `ReadAt` decoded each record into a fresh buffer and copied
+it out, so a sequential pass allocated its own size, and in the 1-CPU guest the
+GC and page faults a random phase leaves behind cost it 10 to 27 %. Records
+stored as they are (no compression, no encryption) of a request of a record or
+more are now read, verified, straight into the caller's buffer, and `Open` no
+longer decodes the pool's data blocks while looking for the allocator's high-water
+mark. In the VM (1 CPU, uncompressed, after a random phase) a pass went from 3320
+to 5332 MiB/s, against 5090 without a random phase before.
 
 ## Judged by
 
