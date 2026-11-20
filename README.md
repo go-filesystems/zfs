@@ -216,7 +216,9 @@ hands them to `inflight.Ordered`, which runs `readBlock` on up to
 `min(GOMAXPROCS, 8)` goroutines and returns the records in file order, at most
 that many in flight. `readBlock` does all the work of a record: device read,
 checksum verification (fletcher4 SIMD, SHA-256/512, BLAKE3, Skein, Edon-R), the
-fall-back to another DVA when a copy fails its checksum, decryption, decompression.
+fall-back to another DVA when a copy fails its checksum or its device read fails
+(an error is reported only when every copy failed: the first one in DVA order),
+decryption, decompression.
 Nothing is skipped to go faster, and the first error in file order is the one
 returned. `ReadFile` decodes a window of 16 records per worker at a time. `ReadAt`
 decodes the records it spans in parallel, and, when it continues the previous
