@@ -245,7 +245,11 @@ func (f *zfsFile) fillRecords(dst []byte, off uint64, sequential bool) error {
 			continue
 		}
 		job := recordJob{blk: blk, bp: bp}
-		if start := blk * bs; blk <= last && start >= off && start+bs <= hi {
+		// Admission on second touch: the first read of a record whole in the
+		// request goes straight into the buffer and only remembers its key; the
+		// second decodes, caches and copies, so a stream read once allocates
+		// nothing and a region read again is cached (#73).
+		if start := blk * bs; blk <= last && start >= off && start+bs <= hi && storedAsIs(bp) && !cache.Seen(bp) {
 			job.into = dst[start-off : start-off+bs]
 		}
 		jobs = append(jobs, job)

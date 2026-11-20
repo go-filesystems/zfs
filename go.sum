@@ -14,6 +14,8 @@ github.com/go-encryptions/zfscrypt v0.0.0-20261110170137-b5b9a4ee0567 h1:ICnZaXw
 github.com/go-encryptions/zfscrypt v0.0.0-20261110170137-b5b9a4ee0567/go.mod h1:Ddo9Pu/LLHSUsEpADOOv1UuI04XIW4pqV1tiuYZiiQM=
 github.com/go-filesystems/inflight v0.5.0 h1:JmkGgkT8/DKGLivRxUJkQUJAkOa8TLyB5W3LGIS0fxs=
 github.com/go-filesystems/inflight v0.5.0/go.mod h1:RA1/w2Hbza3HvTw+ZfABSw8lh6zmixEUPsulzbeaarA=
+github.com/go-filesystems/inflight v0.6.0 h1:6JoAXtIJD5X2ewj/wf7ZuIrTgoab01VTRXgo6wlpk5o=
+github.com/go-filesystems/inflight v0.6.0/go.mod h1:S8CMMqsFJit6z/rNukkiJ6Pyz1i7SNkXnyNZGmv6BEo=
 github.com/go-filesystems/interface v0.6.0 h1:+7nA5FHgs/B03rZ9p81bkm0+6ew9fEntTFK8L5Uu6pk=
 github.com/go-filesystems/interface v0.6.0/go.mod h1:u9v8mvapNV8djzObwCECdyd2g6JBU6HNTR4EAqxOn6U=
 github.com/go-filesystems/kerneljudge v0.4.0 h1:XQE80TkRErFQv2xu+A8oXeQNeTd63TLgeP9lN0oAonc=

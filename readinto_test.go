@@ -60,6 +60,18 @@ func TestWholeRecordReadsBypassTheCache(t *testing.T) {
 	if n := fs.dc.Load().Len(); n != 0 {
 		t.Errorf("whole-record reads cached %d records, want 0", n)
 	}
+	// Admission on second touch: the same region read again is cached, and a
+	// third pass is served from the cache.
+	for pass := 2; pass <= 3; pass++ {
+		for off := int64(0); off < 4<<20; off += 1 << 20 {
+			if n, err := f.ReadAt(got, off); err != nil || n != len(got) || !bytes.Equal(got, want[off:off+int64(n)]) {
+				t.Fatalf("pass %d at %d: n=%d err=%v", pass, off, n, err)
+			}
+		}
+		if n := fs.dc.Load().Len(); n != 32 {
+			t.Errorf("after pass %d the cache holds %d records, want 32", pass, n)
+		}
+	}
 }
 
 // A primary copy that fails its checksum falls back to the ditto copy on the

@@ -101,6 +101,12 @@ func TestSeq73VM(t *testing.T) {
 	if os.Getenv("FS_KERNEL_JUDGE_PERF") != "1" {
 		t.Skip("FS_KERNEL_JUDGE_PERF=1 to measure")
 	}
+	for _, n := range []int{1, 4} {
+		t.Run(fmt.Sprintf("cpus%d", n), func(t *testing.T) { seq73VM(t, n) })
+	}
+}
+
+func seq73VM(t *testing.T, ncpu int) {
 	rounds := 5
 	if v, err := strconv.Atoi(os.Getenv("FS_KERNEL_JUDGE_ROUNDS")); err == nil && v > 0 {
 		rounds = v
@@ -127,7 +133,7 @@ func TestSeq73VM(t *testing.T) {
 	rpExport(t)
 	defer rpRun("zpool", "export", rpPool)
 	dropCaches := func() { os.WriteFile("/proc/sys/vm/drop_caches", []byte("3"), 0) }
-	rpOnline(t, 1)
+	rpOnline(t, ncpu)
 	for i := 0; i < 24 && rpLoad1() > 1.0; i++ {
 		time.Sleep(5 * time.Second)
 	}
@@ -291,5 +297,13 @@ func TestSeq73VM(t *testing.T) {
 	}
 	for i, rg := range regimes {
 		t.Logf("regime round %d: %s", i, rg.Label())
+	}
+	// PERF lines, so that `kerneljudge compare` refuses runs of different regimes.
+	for _, v := range variants {
+		s := rpSeries{regimes: regimes}
+		for _, x := range res[v.name] {
+			s.vals = append(s.vals, x.mibs)
+		}
+		s.line(t, fmt.Sprintf("seq73-cpus%d", ncpu), v.name, "ours", "MiB/s")
 	}
 }
