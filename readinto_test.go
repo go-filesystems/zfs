@@ -156,3 +156,54 @@ func BenchmarkWarmWholeRecordReread(b *testing.B) {
 		}
 	}
 }
+
+// A reader that does not verify reads a damaged block as it is, as readBlock
+// does: readBlockInto does not refuse it.
+func TestReadBlockIntoWithoutVerification(t *testing.T) {
+	buf := make([]byte, 512)
+	copy(buf, "unverified")
+	bp := makeBlkptrCksum(0, 512, 512, zcompressOff, dmotPlainFileContents, 0, 1, zioChecksumFletch4)
+	setBPChecksum(&bp, buf)
+	bp.cksum[0] ^= 1
+	dst := make([]byte, 512)
+	if ok, err := readBlockInto(bytes.NewReader(buf), 0, bp, dst); !ok || err != nil || !bytes.Equal(dst, buf) {
+		t.Fatalf("non-verifying reader: ok=%v err=%v", ok, err)
+	}
+}
+
+// walkCountBackend counts the device reads of a walk.
+type walkCountBackend struct {
+	blockBackend
+	reads int
+}
+
+func (c *walkCountBackend) ReadAt(p []byte, off int64) (int, error) {
+	c.reads++
+	return len(p), nil
+}
+
+// The extent walk reports a data block and does not read it (zfs#73: it used
+// to decode every data block of the pool at Open); an indirect block and an
+// object-set block it does read.
+func TestWalkBlockTreeExtentsDoesNotReadDataBlocks(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		bp        blkptr
+		objsetRoo bool
+		wantReads int
+	}{
+		{"data block", makeBlkptr(0x10000, 512, 512, zcompressOff, dmotPlainFileContents, 0, 1), false, 0},
+		{"data block, objsetRoot", makeBlkptr(0x10000, 512, 512, zcompressOff, dmotPlainFileContents, 0, 1), true, 0},
+		{"indirect block", makeBlkptr(0x10000, 512, 512, zcompressOff, dmotPlainFileContents, 1, 1), false, 1},
+		{"object set", makeBlkptr(0x10000, 1<<14, 1<<14, zcompressOff, dmotObjset, 0, 1), true, 1},
+		{"object set, not the root", makeBlkptr(0x10000, 1<<14, 1<<14, zcompressOff, dmotObjset, 0, 1), false, 0},
+	} {
+		cb := &walkCountBackend{}
+		fs := &zfsFS{f: cb}
+		visited := 0
+		fs.walkBlockTreeExtents(c.bp, c.objsetRoo, func(blkptr) { visited++ })
+		if visited < 1 || cb.reads != c.wantReads {
+			t.Errorf("%s: visited %d, %d device reads, want >= 1 and %d", c.name, visited, cb.reads, c.wantReads)
+		}
+	}
+}
