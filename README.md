@@ -317,10 +317,14 @@ allocation (zfs#73): `ReadAt` decoded each record into a fresh buffer and copied
 it out, so a sequential pass allocated its own size, and in the 1-CPU guest the
 GC and page faults a random phase leaves behind cost it 10 to 27 %. Records
 stored as they are (no compression, no encryption) of a request of a record or
-more are now read, verified, straight into the caller's buffer, and `Open` no
-longer decodes the pool's data blocks while looking for the allocator's high-water
-mark. In the VM (1 CPU, uncompressed, after a random phase) a pass went from 3320
-to 5332 MiB/s, against 5090 without a random phase before.
+more are now read, verified, straight into the caller's buffer the first time
+they are read, and cached only on their second read (admission on second touch,
+`inflight.Cache.Seen`, inflight v0.6.0), so a stream read once allocates nothing and
+a region read again is cached as before (warm whole-record re-read: parity with
+v0.8.3). `Open` no longer decodes the pool's data blocks while looking for the
+allocator's high-water mark. In the VM (one comparable pair, regime 469 Mops/s,
+uncompressed, against v0.8.3) a sequential pass after a random phase went from 3256
+to 4668 MiB/s at 1 CPU and from 3641 to 5349 at 4 CPUs.
 
 ## Judged by
 
