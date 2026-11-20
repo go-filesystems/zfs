@@ -88,3 +88,43 @@ func TestDittoFallbackOnDeviceReadError(t *testing.T) {
 		}
 	}
 }
+
+// countingDevice counts the reads made of it.
+type countingDevice struct {
+	checkedReader
+	reads *int
+}
+
+func (c countingDevice) ReadAt(p []byte, off int64) (int, error) {
+	*c.reads++
+	return c.checkedReader.ReadAt(p, off)
+}
+
+// A block is tried on exactly its populated copies, no more: one DVA is one
+// read, two are two, three are three, on both paths, when all of them fail.
+func TestDittoFallbackStopsAfterTheLastCopy(t *testing.T) {
+	const rec = 512
+	good := make([]byte, rec)
+	copy(good, "good copy of the record")
+	img := bytes.Repeat([]byte{0xAA}, 4*rec)
+	for ncopies := 1; ncopies <= 3; ncopies++ {
+		bp := makeBlkptrCksum(0, rec, rec, zcompressOff, dmotPlainFileContents, 0, 1, zioChecksumFletch4)
+		setBPChecksum(&bp, good)
+		for c := 1; c < ncopies; c++ {
+			bp.dva[c] = makeDVA(int64(c)*rec, rec)
+		}
+		for _, direct := range []bool{true, false} {
+			reads := 0
+			rd := countingDevice{checkedReader{bytes.NewReader(img)}, &reads}
+			var err error
+			if direct {
+				_, err = readBlockInto(rd, 0, bp, make([]byte, rec))
+			} else {
+				_, err = readBlock(rd, 0, bp)
+			}
+			if !errors.Is(err, ErrChecksum) || reads != ncopies {
+				t.Errorf("%d copies, direct=%v: %d reads, err=%v; want %d reads and ErrChecksum", ncopies, direct, reads, err, ncopies)
+			}
+		}
+	}
+}

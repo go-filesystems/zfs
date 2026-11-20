@@ -343,7 +343,7 @@ func readBlockInto(r io.ReaderAt, partOff int64, bp blkptr, dst []byte) (bool, e
 	}
 	psize := bp.psize()
 	var first error
-	for i := 0; ; i++ {
+	for i := 0; i < 3; i++ {
 		offset := partOff + bp.dvaOffset(i)
 		_, err := r.ReadAt(dst, offset)
 		if err != nil {
@@ -357,9 +357,10 @@ func readBlockInto(r io.ReaderAt, partOff int64, bp blkptr, dst []byte) (bool, e
 			first = err
 		}
 		if !hasNextCopy(bp, i) {
-			return true, first
+			break
 		}
 	}
+	return true, first
 }
 
 // hasNextCopy reports whether the block has a copy after DVA i to try:
@@ -404,23 +405,29 @@ func readBlock(r io.ReaderAt, partOff int64, bp blkptr) ([]byte, error) {
 	// every copy failed the first error in DVA order is reported.
 	var raw []byte
 	var first error
-	for i := 0; ; i++ {
+	read := false
+	for i := 0; i < 3 && !read; i++ {
 		offset := partOff + bp.dvaOffset(i)
 		var err error
 		raw, err = readAtGrowing(r, offset, psize)
 		if err != nil {
 			err = fmt.Errorf("zfs: readBlock at 0x%X psize=%d: %w", offset, psize, err)
 		} else if !readerVerifies(r) {
-			break
+			read = true
+			continue
 		} else if err = verifyBlockChecksum(bp, raw, readerSalt(r)); err == nil {
-			break
+			read = true
+			continue
 		}
 		if first == nil {
 			first = err
 		}
 		if !hasNextCopy(bp, i) {
-			return nil, first
+			break
 		}
+	}
+	if !read {
+		return nil, first
 	}
 
 	// Only genuinely-encrypted blocks (BP_IS_ENCRYPTED) are decrypted.
