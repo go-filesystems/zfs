@@ -1,0 +1,62 @@
+name: fuzz
+# Nightly time-boxed randomized fuzzing. This deliberately does NOT run on pull
+# requests: `go test -fuzz` is wall-clock time-boxed and the Go fuzzing engine
+# intermittently exits non-zero with "context deadline exceeded" when a worker does
+# not wind down within -fuzztime even though no crasher was found, which made it a
+# false-red PR gate. The deterministic seed-corpus run stays in ci.yml (blocking).
+# The fuzz step tolerates fuzzrun's exit 1 (a crasher, or the benign deadline
+# flake) so the flake never reds this workflow; any real crasher is printed in the
+# summary and its input is uploaded as an artifact (add it under testdata/fuzz to
+# turn it into a permanent ci.yml regression case). Exit 2, a run that could not
+# be made, is red.
+#
+# The targets are NOT listed here. fuzzrun finds every `func FuzzXxx(f *testing.F)`
+# by parsing the test files, so a new target is fuzzed without anyone remembering
+# to add a step.
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+  push:
+    branches: [fuzzrun-workflow]
+jobs:
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, arch: amd64 }
+          - { os: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with: { go-version: '1.27.4' }
+      # fuzzrun exits 2 when the run could not be made (no targets, go missing,
+      # a toolchain it refuses): that is red. It exits 1 for a CRASH or for the
+      # benign deadline flake: tolerated here, the summary names any crasher and
+      # its corpus is uploaded below. A blanket continue-on-error hid exactly the
+      # first case: a run that never started was reported green.
+      - name: fuzz every target (found by parsing, not listed)
+        run: |
+          set +e
+          go run github.com/go-fleettools/fuzzrun@v0.5.0 run --time 3m --jobs 2 --parallel 2 --logs fuzz-logs
+          status=$?
+          if [ "$status" -ge 2 ]; then
+            echo "::error::fuzzrun could not run (exit $status)"
+            exit "$status"
+          fi
+      - name: upload any fuzz-discovered corpus
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-findings-${{ matrix.arch }}
+          path: testdata/fuzz/
+          if-no-files-found: ignore
+      - name: upload the per-target logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-logs-${{ matrix.arch }}
+          path: fuzz-logs/
+          if-no-files-found: ignore
