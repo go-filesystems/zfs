@@ -188,6 +188,20 @@ func parseDnode(b []byte) (*dnode, error) {
 	if len(b) < size {
 		size = len(b)
 	}
+	// OpenZFS sys/dnode.h: dn_blkptr[] starts at DNODE_CORE_SIZE (64) and
+	// DN_MAX_NBLKPTR = (DNODE_MIN_SIZE - DNODE_CORE_SIZE) >> SPA_BLKPTRSHIFT,
+	// i.e. 3 for a 512-byte dnode; the bonus buffer follows the pointers
+	// and, with DNODE_FLAG_SPILL_BLKPTR, the last 128 bytes of the dnode are
+	// the spill pointer. A header whose dn_nblkptr overruns the slot is
+	// corrupt: refuse it here so blkptrAt/bonusData never slice out of range.
+	ptrEnd := dnodeHdrSize + int(dn.nblkptr)*blkptrSize
+	if dn.flags&dnodeFlagSpillBlkptr != 0 {
+		ptrEnd += blkptrSize
+	}
+	if ptrEnd > size {
+		return nil, fmt.Errorf("zfs: dnode nblkptr %d (spill=%v) does not fit a %d-byte dnode",
+			dn.nblkptr, dn.flags&dnodeFlagSpillBlkptr != 0, size)
+	}
 	dn.raw = make([]byte, size)
 	copy(dn.raw, b[:size])
 	return dn, nil
