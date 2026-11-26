@@ -26,8 +26,8 @@ github.com/go-simd/matchlen v0.5.0 h1:PNEUL78U0nbp5uUUNYo9O6qEPUrPP8xQLYISh+jIUe
 github.com/go-simd/matchlen v0.5.0/go.mod h1:VU2nigACIuhFKuK2ZyWUIlQLLPzkzAxSz6L+VH7aIL8=
 github.com/go-volumes/gpt v0.3.0 h1:ZA33VVlmlkA47fFY+BkFylsufqq1TBoASIuBmri+xsw=
 github.com/go-volumes/gpt v0.3.0/go.mod h1:Dha6JL5/mGyDai8tWvZOPYn6pqe75NOtMRYGm3N4Qv8=
-github.com/go-volumes/safeio v0.1.0 h1:pICfqzHoxCocQrEeV4Ii3qbKh/8XdPt5fg054CoydT8=
-github.com/go-volumes/safeio v0.1.0/go.mod h1:Xitv1BsPmFxrxxlkHNBZ4PIA+5lbf3F6N/+7ecsHFnY=
+github.com/go-volumes/safeio v0.1.1 h1:BT53dga6elF3A8QXxzZcz/Xclbb3FrpPfKjyL7k1X0E=
+github.com/go-volumes/safeio v0.1.1/go.mod h1:Xitv1BsPmFxrxxlkHNBZ4PIA+5lbf3F6N/+7ecsHFnY=
 github.com/klauspost/compress v1.20.5 h1:rJj5VjH4xQxbnLphg6eqUcDxRFCw1jpMdDY9qXlrwSs=
 github.com/klauspost/compress v1.20.5/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
 github.com/pierrec/lz4/v4 v4.1.33 h1:GjG1TJ1V4IzKP8L96muuuDNpTwd7D+l2ccXrjAbe014=
