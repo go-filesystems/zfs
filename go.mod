@@ -5,7 +5,7 @@ go 1.27.4
 require (
 	github.com/go-compressions/blake3 v0.7.2
 	github.com/go-compressions/edonr v0.3.2
-	github.com/go-compressions/lz4 v0.6.0
+	github.com/go-compressions/lz4 v0.7.0
 	github.com/go-compressions/skein v0.1.0
 	github.com/go-encryptions/zfscrypt v0.2.0
 	github.com/go-filesystems/inflight v0.7.0
