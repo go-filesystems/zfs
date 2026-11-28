@@ -4,8 +4,8 @@ github.com/go-compressions/blake3 v0.7.2 h1:D3bz1hXya7LfRZpyzma1z2cKyrFTF2EghjW9
 github.com/go-compressions/blake3 v0.7.2/go.mod h1:a5G2zZfGJuwUcIAUaNq7WU8+1cb9/1swCzlXO9GDS3k=
 github.com/go-compressions/edonr v0.3.2 h1:YpeJ46jbHRKXJ7YJ1alCR/uIHpWUf2kai9Y+afqt5Kk=
 github.com/go-compressions/edonr v0.3.2/go.mod h1:ASHQeBHa0g+2EM1pgr3W74u5gka6JIc6LUg+tL3ZqHE=
-github.com/go-compressions/lz4 v0.6.0 h1:nk9f/GSikRFIBRNMNi7qGXTVHdhFOBBj2XaSvlCofuc=
-github.com/go-compressions/lz4 v0.6.0/go.mod h1:/SiFQqIBd2i+rm4zVmLUI1PEDYR9mG/iyVtMb6EZHhc=
+github.com/go-compressions/lz4 v0.7.0 h1:N0KE8YTwLxe9pmIX9HyuE0CHkI5Xl7b4t/kjQf9KheI=
+github.com/go-compressions/lz4 v0.7.0/go.mod h1:Gk90OGIAS2CG3XBfHB7YAVE6rKtlBzEP0PAf1UYYk/0=
 github.com/go-compressions/skein v0.1.0 h1:XKb1YI0ZK4ph/AxZmlZE+SL/lLoFKgYZFZcUq9u+96c=
 github.com/go-compressions/skein v0.1.0/go.mod h1:D5vsfprmF6P2xIodVajdZVRRlQErI2Y9wSCLMtB/wCo=
 github.com/go-encryptions/ccm v0.1.1 h1:bKwCdV0VESujynPXchslrB83CBPmTo/g2IqBKS77gS0=
@@ -30,7 +30,7 @@ github.com/go-volumes/safeio v0.1.1 h1:BT53dga6elF3A8QXxzZcz/Xclbb3FrpPfKjyL7k1X
 github.com/go-volumes/safeio v0.1.1/go.mod h1:Xitv1BsPmFxrxxlkHNBZ4PIA+5lbf3F6N/+7ecsHFnY=
 github.com/klauspost/compress v1.20.5 h1:rJj5VjH4xQxbnLphg6eqUcDxRFCw1jpMdDY9qXlrwSs=
 github.com/klauspost/compress v1.20.5/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
-github.com/pierrec/lz4/v4 v4.1.33 h1:GjG1TJ1V4IzKP8L96muuuDNpTwd7D+l2ccXrjAbe014=
-github.com/pierrec/lz4/v4 v4.1.33/go.mod h1:7SE9MC2STkNtL4PIwGhjmyVwvILaGI9/COYQNBhKM/c=
+github.com/pierrec/lz4/v4 v4.1.34 h1:5cPY8+z/ffHDpF6Pvv5FffjtZOJJQEiG75267Ol3QtU=
+github.com/pierrec/lz4/v4 v4.1.34/go.mod h1:R7aiqKav9M7+k1JW19D7y7rcavDvw9Te/YTdFJyNXBs=
 golang.org/x/sys v0.50.0 h1:dkKZEFTEKaLr1sjhs0WiKqoi8Jj5nHbS3Njmx1UoMJs=
 golang.org/x/sys v0.50.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
